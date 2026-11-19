@@ -7,16 +7,26 @@ were never fetched. After the TTL, those spans are gone and are fetched
 again.
 
 1m minutes inside a fetched span with no candle become flagged synthetic
-flat bars once a real close exists in that span. Minutes before that close
-stay missing. Higher timeframes are native GeckoTerminal aggregates. They
-are not built from 1m bars. Rejected candles stay rejected and are not
-repaired.
+flat bars once a real close exists in that span, at any length. A long quiet
+run stays synthetic and is flagged when it is longer than the threshold
+(default 120 minutes). It is not a gap. A page is empty only when the
+provider returned no candles at all. Older candles on a quiet page are the
+prior close, and the quiet range stays synthetic. Minutes before the first
+close in the span are a leading gap when history starts inside the window
+or a short page does not reach back past the window start. An empty page is
+a gap, and a prior close does not cross it. The prior close is seeded from
+the fetched span even when that close sits before the current window, and
+it does not cross an unfetched hole. Higher timeframes are native
+GeckoTerminal aggregates. They are not built from 1m bars. A missing native
+bucket after history has started in the merged span is a no-trade count,
+not a gap range. Rejected candles stay rejected and are not repaired.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -30,7 +40,7 @@ from app.ohlcv.adapters import open_source
 from app.ohlcv.adapters.geckoterminal import PUBLIC_HISTORY_DAYS, PUBLIC_HISTORY_MESSAGE
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, StoreError
-from app.ohlcv.gaps import GapRange, SeriesReport, series_report, unfetched_spans
+from app.ohlcv.gaps import GapRange, LongNoTrade, SeriesReport, series_report, unfetched_spans
 from app.ohlcv.registry import MAJORS, Asset, require_assets
 from app.ohlcv.source import FetchPage, OhlcvSource, iter_pages
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, BarStore, SqliteBarStore
@@ -76,6 +86,7 @@ def run_backfill(
     user_id: str,
     generated_at: int,
     progress: Callable[[str], None] | None = None,
+    long_no_trade_minutes: int = 120,
 ) -> dict[str, object]:
     """Fetch uncached native candles and return the gap report document."""
     ordered = _timeframes(timeframes)
@@ -92,19 +103,27 @@ def run_backfill(
                 user_id=user_id,
                 progress=progress,
             )
-            stored = store.load(
-                user_id=user_id,
-                mint=asset.mint,
-                timeframe=timeframe,
-                start=start,
-                end=end,
-            )
             fetched = store.fetched_ranges(
                 user_id=user_id,
                 mint=asset.mint,
                 timeframe=timeframe,
                 start=start,
                 end=end,
+            )
+            empty = store.empty_ranges(
+                user_id=user_id,
+                mint=asset.mint,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+            )
+            span_lo, span_hi = _coverage_bounds(fetched, start, end)
+            covered_bars = store.load(
+                user_id=user_id,
+                mint=asset.mint,
+                timeframe=timeframe,
+                start=span_lo,
+                end=span_hi,
             )
             sections.append(
                 series_report(
@@ -113,10 +132,12 @@ def run_backfill(
                     timeframe=timeframe,
                     start=start,
                     end=end,
-                    real={bar.open_time for bar in stored if not bar.synthetic},
-                    synthetic={bar.open_time for bar in stored if bar.synthetic},
+                    real={bar.open_time for bar in covered_bars if not bar.synthetic},
+                    synthetic={bar.open_time for bar in covered_bars if bar.synthetic},
                     rejected=tuple(rejected),
                     fetched=fetched,
+                    empty=empty,
+                    long_no_trade_minutes=long_no_trade_minutes,
                 )
             )
     return _document(
@@ -168,6 +189,8 @@ def _fill_timeframe(
                 end=page.end,
                 window_start=start,
                 window_end=end,
+                provider_empty=page.provider_empty,
+                seed=_seed_bar(page, asset, timeframe),
             )
             page_number += 1
             _say(
@@ -186,6 +209,24 @@ def _fill_timeframe(
 def _say(progress: Callable[[str], None] | None, message: str) -> None:
     if progress is not None:
         progress(message)
+
+
+def _seed_bar(page: FetchPage, asset: Asset, timeframe: str) -> Bar | None:
+    """The latest older candle, when it is a real bar this series can store."""
+    if page.provider_empty:
+        return None
+    seed = page.seed
+    if seed is None:
+        return None
+    if seed.mint != asset.mint or seed.timeframe != timeframe or seed.synthetic:
+        return None
+    if isinstance(seed.open_time, bool) or not isinstance(seed.open_time, int):
+        return None
+    if seed.open_time >= page.start:
+        return None
+    if validate_bar(seed):
+        return None
+    return seed
 
 
 def _split_page(
@@ -251,6 +292,16 @@ def _document(
     }
 
 
+def _coverage_bounds(fetched: Sequence[tuple[int, int]], start: int, end: int) -> tuple[int, int]:
+    """Window plus any fetched span that sticks out of it, so a prior real is visible."""
+    lo = start
+    hi = end
+    for span_lo, span_hi in fetched:
+        lo = min(lo, span_lo)
+        hi = max(hi, span_hi)
+    return lo, hi
+
+
 def _section(section: SeriesReport) -> dict[str, object]:
     return {
         "symbol": section.symbol,
@@ -265,6 +316,10 @@ def _section(section: SeriesReport) -> dict[str, object]:
         "missing": section.missing,
         "coverage_pct": section.coverage_pct,
         "unfetched": section.unfetched,
+        "no_trade": section.no_trade,
+        "long_no_trade_minutes": section.long_no_trade_minutes,
+        "long_no_trade": [_long_no_trade(item) for item in section.long_no_trade],
+        "suspect_outage": section.suspect_outage,
         "gaps": [_gap(gap) for gap in section.gaps],
         "rejected": [
             {
@@ -280,12 +335,25 @@ def _gap(gap: GapRange) -> dict[str, object]:
     return {"start": _iso(gap.start), "end": _iso(gap.end), "missing": gap.missing}
 
 
+def _long_no_trade(item: LongNoTrade) -> dict[str, object]:
+    return {"start": _iso(item.start), "end": _iso(item.end), "minutes": item.minutes}
+
+
 def _iso(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class _Parser(argparse.ArgumentParser):
+    """Usage errors exit 1, the same code as every other CLI failure."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="python -m app.ohlcv.backfill",
         description="Fetch native OHLCV for SOL and majors into a 24-hour cache.",
     )
@@ -317,6 +385,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long cached bars are kept, in hours (maximum 24)",
     )
     parser.add_argument("--provider", default="geckoterminal", help="OHLCV source name")
+    parser.add_argument(
+        "--long-no-trade-minutes",
+        type=int,
+        default=120,
+        help="flag a quiet run longer than this many minutes (default 120); it stays synthetic",
+    )
     return parser
 
 
@@ -339,6 +413,7 @@ def main(
         return 1
     try:
         ttl_seconds = _ttl_seconds(args.cache_ttl_hours)
+        long_no_trade_minutes = _long_threshold(args.long_no_trade_minutes)
     except ValueError as exc:
         print(_one_line(exc), file=sys.stderr)
         return 1
@@ -346,12 +421,18 @@ def main(
     active: OhlcvSource | None = None
     owns_source = source is None
     try:
+        if args.report is not None:
+            _prepare_report_path(Path(args.report))
         assets = require_assets(symbols)
         timeframes = tuple(part.strip() for part in args.timeframes.split(",") if part.strip())
         clock = int(time.time()) if now is None else now
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
-        store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+        try:
+            store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+        except OSError as exc:
+            print(_data_dir_line(data_dir, exc), file=sys.stderr)
+            return 1
         active = open_source(args.provider) if source is None else source
         report = run_backfill(
             source=active,
@@ -360,16 +441,17 @@ def main(
             start=start,
             end=end,
             timeframes=timeframes,
-                user_id=LOCAL_USER_ID,
-                generated_at=clock,
-                progress=_progress,
-            )
+            user_id=LOCAL_USER_ID,
+            generated_at=clock,
+            progress=_progress,
+            long_no_trade_minutes=long_no_trade_minutes,
+        )
         text = json.dumps(report, indent=2) + "\n"
         if args.report is not None:
-            destination = Path(args.report)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
+            Path(args.report).write_text(text, encoding="utf-8")
         sys.stdout.write(text)
+    except KeyboardInterrupt:
+        return 130
     except (SourceError, StoreError, ValueError, OSError, sqlite3.Error) as exc:
         print(_one_line(exc), file=sys.stderr)
         return 1
@@ -383,8 +465,18 @@ def main(
     return 0
 
 
+_TTL_ERROR = (
+    "cache TTL must be a finite number of hours, greater than 0 and at most 24 hours; "
+    "the CoinGecko API terms do not allow a longer store"
+)
+
+
 def _ttl_seconds(hours: float | None) -> int:
-    """Resolve the cache TTL. Above 24 hours is an error, not a silent clamp."""
+    """Resolve the cache TTL. Above 24 hours is an error, not a silent clamp.
+
+    ``nan`` and ``inf`` are rejected with the same one-line message. They are
+    not clamped and they are not turned into a zero TTL.
+    """
     if hours is None:
         raw = os.environ.get("OHLCV_CACHE_TTL_HOURS")
         if raw is None or raw.strip() == "":
@@ -392,27 +484,68 @@ def _ttl_seconds(hours: float | None) -> int:
         try:
             hours = float(raw)
         except ValueError as exc:
-            raise ValueError(
-                "OHLCV_CACHE_TTL_HOURS must be a number of hours, at most 24"
-            ) from exc
-    if hours <= 0 or hours > 24:
-        raise ValueError(
-            "cache TTL must be greater than 0 and at most 24 hours; "
-            "the CoinGecko API terms do not allow a longer store"
-        )
+            raise ValueError(_TTL_ERROR) from exc
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)):
+        raise ValueError(_TTL_ERROR)
+    if not math.isfinite(hours) or hours <= 0 or hours > 24:
+        raise ValueError(_TTL_ERROR)
     seconds = int(hours * 3600)
     if seconds < 1:
         seconds = 1
     if seconds > MAX_CACHE_TTL_SECONDS:
-        raise ValueError(
-            "cache TTL must be greater than 0 and at most 24 hours; "
-            "the CoinGecko API terms do not allow a longer store"
-        )
+        raise ValueError(_TTL_ERROR)
     return seconds
+
+
+def _long_threshold(minutes: int) -> int:
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+        raise ValueError("long no-trade threshold must be a whole number of minutes, at least 1")
+    return minutes
+
+
+def _writable(path: Path) -> bool:
+    """True when ``path`` has a write bit and this process may write it.
+
+    A mode with no write bit at all is read-only even for root, which is
+    the case a ``chmod`` test uses. ``os.access`` still applies for a
+    directory this user does not own.
+    """
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return False
+    if mode & 0o222 == 0:
+        return False
+    return os.access(path, os.W_OK)
+
+
+def _prepare_report_path(path: Path) -> None:
+    """Fail before any fetch when the report cannot be written."""
+    if path.exists() and path.is_dir():
+        raise ValueError(f"report path {path} is a directory")
+    parent = path.parent
+    if parent.exists() and not parent.is_dir():
+        raise ValueError(f"report directory {parent} is not a directory")
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+    if not _writable(parent):
+        raise ValueError(f"report directory {parent} is not writable")
+    if path.exists() and not _writable(path):
+        raise ValueError(f"report path {path} is not writable")
 
 
 def _progress(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def _data_dir_line(path: Path, exc: OSError) -> str:
+    """One clean line for a data directory that cannot hold the cache."""
+    if isinstance(exc, PermissionError):
+        return f"data directory {path} is not writable"
+    if isinstance(exc, (FileExistsError, NotADirectoryError)):
+        return f"data directory {path} is not a directory"
+    text = str(exc).strip().splitlines()
+    return text[0] if text else f"data directory {path} is not usable"
 
 
 def _one_line(exc: BaseException) -> str:

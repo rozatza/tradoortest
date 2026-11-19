@@ -235,19 +235,48 @@ def test_repeated_5xx_stops_without_the_body() -> None:
     assert sleeps == [1.0, 2.0, 4.0, 8.0]
 
 
-def test_connect_error_is_a_source_error_and_is_not_retried() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError],
+)
+def test_transport_errors_retry_then_fail(error: type[Exception]) -> None:
+    sleeps, _clock_state, sleep, monotonic = _clock()
     calls = {"n": 0}
 
     def handler(_request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        raise httpx.ConnectError("dns lookup failed")
+        raise error("dns lookup failed")
 
-    source = GeckoTerminalSource(_client(handler), min_interval=0, sleep=lambda _seconds: None)
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleep,  # type: ignore[arg-type]
+        monotonic=monotonic,  # type: ignore[arg-type]
+    )
     with pytest.raises(SourceError, match="request failed") as caught:
         source.fetch_bars(SOL_MINT, "1m", 1_700_000_040, 1_700_000_100)
-    assert calls["n"] == 1
+    assert calls["n"] == 5
+    assert sleeps == [1.0, 2.0, 4.0, 8.0]
     assert "dns" not in str(caught.value)
     assert "Traceback" not in str(caught.value)
+
+
+def test_a_connect_error_that_clears_is_retried() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"ohlcv_list": [[1_700_000_040, 1, 1, 1, 1, 1]]}}},
+        )
+
+    source = GeckoTerminalSource(_client(handler), min_interval=0, sleep=lambda _seconds: None)
+    result = source.fetch_bars(SOL_MINT, "1m", 1_700_000_040, 1_700_000_100)
+    assert len(result.bars) == 1
+    assert calls["n"] == 2
 
 
 def test_a_timeout_that_persists_is_a_source_error() -> None:
@@ -303,7 +332,7 @@ def test_a_failed_later_page_keeps_the_page_already_parsed() -> None:
     assert pages[0].start == start + 60
     assert pages[0].end == start + 180
     assert [bar.open_time for bar in pages[0].bars] == [start + 60, start + 120]
-    assert calls["n"] == 2
+    assert calls["n"] == 6
 
 
 def test_non_json_body_does_not_echo_the_payload() -> None:

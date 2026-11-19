@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import random
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from app.ohlcv.errors import SourceError, StoreError
 from app.ohlcv.registry import MAJORS, SOL_MINT
 from app.ohlcv.source import FetchPage, FetchResult
 from app.ohlcv.store import SqliteBarStore
+from app.ohlcv.synthetic import synthetic_minutes
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
 _MINT = SOL_MINT
@@ -130,6 +133,10 @@ def test_gaps_stay_gaps_and_bad_bars_are_excluded(tmp_path: Path) -> None:
             "missing": 1,
             "coverage_pct": 40.0,
             "unfetched": 0,
+            "no_trade": 2,
+            "long_no_trade_minutes": 120,
+            "long_no_trade": [],
+            "suspect_outage": False,
             "gaps": [],
             "rejected": [
                 {
@@ -334,7 +341,17 @@ def test_sparse_window_is_one_call_and_a_rerun_does_not_refetch(tmp_path: Path) 
         assert section["unfetched"] == 0
         assert section["real"] == 2
         assert section["synthetic"] == 1438
+        assert section["missing"] == 0
+        assert section["no_trade"] == 1438
         assert section["gaps"] == []
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
+            {
+                "start": "2026-01-01T00:02:00Z",
+                "end": "2026-01-02T00:00:00Z",
+                "minutes": 1438,
+            }
+        ]
         assert section["coverage_pct"] == round(100.0 * 2 / 1440, 2)
         run_backfill(
             source=source,
@@ -451,13 +468,16 @@ def test_cli_rejects_a_user_id_flag(tmp_path: Path) -> None:
             source=MemorySource([]),
             now=_START + 86400,
         )
-    assert caught.value.code != 0
+    assert caught.value.code == 1
 
 
 def test_dns_failure_through_the_cli_is_one_line(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    calls = {"n": 0}
+
     def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
         raise httpx.ConnectError("dns lookup failed")
 
     source = GeckoTerminalSource(
@@ -471,6 +491,7 @@ def test_dns_failure_through_the_cli_is_one_line(
         now=_START + 86400,
     )
     assert code == 1
+    assert calls["n"] == 5
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert _cli_errors(err) == ["GeckoTerminal request failed"]
@@ -518,6 +539,7 @@ def test_bad_paths_and_sqlite_errors_are_one_line(
 
     report_parent = tmp_path / "report-parent"
     report_parent.write_text("x", encoding="utf-8")
+    report_source = MemorySource([_minute(0)])
     bad_report = main(
         [
             *args,
@@ -526,9 +548,10 @@ def test_bad_paths_and_sqlite_errors_are_one_line(
             "--report",
             str(report_parent / "gap.json"),
         ],
-        source=MemorySource([_minute(0)]),
+        source=report_source,
         now=now,
     )
+    assert report_source.calls == []
     report_err = capsys.readouterr().err
     assert bad_report == 1
     assert "Traceback" not in report_err
@@ -576,7 +599,7 @@ def test_unwritable_data_dir_is_one_line(
     )
     assert code == 1
     err = capsys.readouterr().err
-    assert err.strip() == "[Errno 13] Permission denied"
+    assert err.strip() == f"data directory {tmp_path / 'unwritable'} is not writable"
     assert "Traceback" not in err
 
 
@@ -621,7 +644,7 @@ def test_cache_ttl_above_24_hours_is_rejected(
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert _cli_errors(err) == [
-        "cache TTL must be greater than 0 and at most 24 hours; "
+        "cache TTL must be a finite number of hours, greater than 0 and at most 24 hours; "
         "the CoinGecko API terms do not allow a longer store"
     ]
     monkeypatch.setenv("OHLCV_CACHE_TTL_HOURS", "25")
@@ -732,5 +755,750 @@ def test_prior_close_does_not_cross_an_unfetched_hole(tmp_path: Path) -> None:
         assert by_time[_START + 300].synthetic
         assert by_time[_START + 300].close == 3.0
         assert by_time[_START + 300].volume == 0.0
+    finally:
+        store.close()
+
+
+def test_synthetic_run_keeps_a_prior_close_at_any_length() -> None:
+    real_time = _START
+    seeded = synthetic_minutes(
+        mint=_MINT,
+        real={real_time: (2.5, 10)},
+        rejected=set(),
+        covered=[(real_time, real_time + 180)],
+        start=real_time + 60,
+        end=real_time + 180,
+    )
+    assert [bar.open_time for bar, _stored in seeded] == [real_time + 60, real_time + 120]
+    assert all(bar.synthetic and bar.close == 2.5 and bar.volume == 0.0 for bar, _stored in seeded)
+    long = synthetic_minutes(
+        mint=_MINT,
+        real={real_time: (1.0, 1)},
+        rejected=set(),
+        covered=[(real_time, real_time + 17 * 60)],
+        start=real_time,
+        end=real_time + 17 * 60,
+    )
+    assert len(long) == 16
+    assert all(bar.synthetic and bar.close == 1.0 for bar, _stored in long)
+
+
+def test_a_long_quiet_run_stays_synthetic_and_is_not_a_gap(tmp_path: Path) -> None:
+    end = _START + 21 * 60
+    later = _minute(20 * 60, high=4.0, close=3.0)
+    source = MemorySource([_minute(0), later])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        synthetic = [bar for bar in stored if bar.synthetic]
+        assert len(synthetic) == 19
+        assert all(bar.close == 1.5 and bar.volume == 0.0 for bar in synthetic)
+        section = report["series"][0]
+        assert section["synthetic"] == 19
+        assert section["no_trade"] == 19
+        assert section["unfetched"] == 0
+        assert section["gaps"] == []
+        assert section["long_no_trade"] == []
+        assert section["suspect_outage"] is False
+    finally:
+        store.close()
+
+
+def test_shifted_windows_store_the_same_series_in_either_order(tmp_path: Path) -> None:
+    later = Bar(_MINT, "1m", _START + 300, 3.0, 5.0, 2.0, 4.0, 1.0)
+    windows = [(_START, _START + 300), (_START + 120, _START + 480)]
+
+    def series(name: str, order: list[tuple[int, int]]) -> list[tuple[int, float, bool]]:
+        source = MemorySource([_minute(0), later])
+        store = SqliteBarStore(tmp_path / name / "ohlcv.sqlite")
+        try:
+            for start, end in order:
+                run_backfill(
+                    source=source,
+                    store=store,
+                    assets=(MAJORS[0],),
+                    start=start,
+                    end=end,
+                    timeframes=("1m",),
+                    user_id=LOCAL_USER_ID,
+                    generated_at=end,
+                )
+            stored = store.load(
+                user_id=LOCAL_USER_ID,
+                mint=_MINT,
+                timeframe="1m",
+                start=_START,
+                end=_START + 480,
+            )
+            return [(bar.open_time, bar.close, bar.synthetic) for bar in stored]
+        finally:
+            store.close()
+
+    forward = series("forward", windows)
+    backward = series("backward", list(reversed(windows)))
+    assert forward == backward
+    by_time = {open_time: (close, synthetic) for open_time, close, synthetic in forward}
+    assert by_time[_START + 120] == (1.5, True)
+    assert by_time[_START + 240] == (1.5, True)
+    assert by_time[_START + 300] == (4.0, False)
+    assert by_time[_START + 360] == (4.0, True)
+
+
+def test_short_page_before_the_window_start_is_a_leading_gap(tmp_path: Path) -> None:
+    end = _START + 600
+    candles = [
+        [_START + 540, 1.0, 2.0, 0.5, 1.5, 1.0],
+        [_START + 480, 1.0, 2.0, 0.5, 1.5, 1.0],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "include_empty_intervals" not in request.url.params
+        before = int(request.url.params["before_timestamp"])
+        limit = int(request.url.params["limit"])
+        page = sorted((row for row in candles if row[0] <= before), reverse=True)[:limit]
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, page_limit=2, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 2
+        assert section["synthetic"] == 0
+        assert section["unfetched"] == 0
+        assert section["gaps"] == [
+            {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:08:00Z", "missing": 8}
+        ]
+    finally:
+        store.close()
+        client.close()
+
+
+def test_history_that_starts_mid_window_is_a_leading_gap(tmp_path: Path) -> None:
+    # One short page. The adapter records coverage from the window start,
+    # and the minutes before the first candle are a gap.
+    end = _START + 600
+    candle = [_START + 300, 1.0, 2.0, 0.5, 1.5, 1.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": [candle]}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 1
+        assert section["unfetched"] == 0
+        assert section["gaps"][0] == {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:05:00Z",
+            "missing": 5,
+        }
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert stored[0].open_time == _START + 300
+        assert stored[0].synthetic is False
+        assert any(bar.synthetic for bar in stored)
+    finally:
+        store.close()
+        client.close()
+
+
+def test_ctrl_c_exits_130_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Interrupt:
+        name = "memory"
+
+        def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+            raise KeyboardInterrupt
+
+    code = main(
+        ["--days", "1", "--symbols", "SOL", "--timeframes", "1m", "--data-dir", str(tmp_path)],
+        source=Interrupt(),
+        now=_START + 86400,
+    )
+    assert code == 130
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+
+def test_nan_and_inf_ttl_are_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = MemorySource([_minute(0)])
+    code = main(
+        [
+            "--days",
+            "1",
+            "--symbols",
+            "SOL",
+            "--timeframes",
+            "1m",
+            "--data-dir",
+            str(tmp_path),
+            "--cache-ttl-hours",
+            "nan",
+        ],
+        source=source,
+        now=_START + 86400,
+    )
+    assert code == 1
+    assert source.calls == []
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert err.strip().count("\n") == 0
+    assert "finite" in err
+    monkeypatch.setenv("OHLCV_CACHE_TTL_HOURS", "inf")
+    again = main(
+        ["--days", "1", "--symbols", "SOL", "--timeframes", "1m", "--data-dir", str(tmp_path)],
+        source=source,
+        now=_START + 86400,
+    )
+    assert again == 1
+    assert source.calls == []
+    assert "finite" in capsys.readouterr().err
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_quiet_series_has_no_gaps_and_flags_the_long_run(tmp_path: Path) -> None:
+    # Sparse on purpose: short quiet runs stay synthetic, one run over 120
+    # minutes is flagged, and none of it is a gap. Not a live series.
+    end = _START + 200 * 60
+    source = MemorySource([_minute(0), _minute(40 * 60), _minute(191 * 60, high=4.0, close=3.0)])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == []
+        assert section["unfetched"] == 0
+        assert section["real"] == 3
+        assert section["synthetic"] == 197
+        assert section["no_trade"] == 197
+        assert section["present"] == 200
+        assert section["missing"] == 0
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
+            {
+                "start": "2026-01-01T00:41:00Z",
+                "end": "2026-01-01T03:11:00Z",
+                "minutes": 150,
+            }
+        ]
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert sum(1 for bar in stored if bar.synthetic) == 197
+    finally:
+        store.close()
+
+
+def test_a_mid_history_quiet_stretch_is_a_suspect_outage(tmp_path: Path) -> None:
+    # GeckoTerminal answers a mid-history hole with the older candles. The
+    # quiet minutes stay synthetic and the long run is flagged. An empty
+    # page is only a response that contained no candles at all.
+    quiet_end = _START + 30 * 60
+    later_at = quiet_end + 3 * 3600
+    end = later_at + 60
+    candles = [
+        [_START, 1.0, 2.0, 0.5, 1.5, 1.0],
+        [later_at, 1.0, 4.0, 0.5, 3.0, 1.0],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        before = int(request.url.params["before_timestamp"])
+        page = sorted((row for row in candles if row[0] <= before), reverse=True)
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == []
+        assert section["unfetched"] == 0
+        assert section["real"] == 2
+        assert section["synthetic"] == 209
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
+            {
+                "start": "2026-01-01T00:01:00Z",
+                "end": "2026-01-01T03:30:00Z",
+                "minutes": 209,
+            }
+        ]
+    finally:
+        store.close()
+        client.close()
+
+
+def test_missing_native_buckets_are_a_count_not_gap_ranges(tmp_path: Path) -> None:
+    end = _START + 31 * 300
+    native = Bar(_MINT, "5m", _START, 1.0, 2.0, 0.5, 1.5, 9.0)
+    source = MemorySource([native])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 1
+        assert section["expected"] == 31
+        assert section["no_trade"] == 30
+        assert section["missing"] == 30
+        assert section["gaps"] == []
+        assert section["coverage_pct"] == round(100.0 / 31, 2)
+        assert section["long_no_trade"] == [
+            {"start": "2026-01-01T00:05:00Z", "end": "2026-01-01T02:35:00Z", "minutes": 150}
+        ]
+    finally:
+        store.close()
+
+
+def test_read_only_report_dir_is_rejected_before_fetch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    report_dir.chmod(0o555)
+    source = MemorySource([_minute(0)])
+    try:
+        code = main(
+            [
+                "--days",
+                "1",
+                "--symbols",
+                "SOL",
+                "--timeframes",
+                "1m",
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--report",
+                str(report_dir / "gap-report.json"),
+            ],
+            source=source,
+            now=_START + 86400,
+        )
+        assert code == 1
+        assert source.calls == []
+        err = capsys.readouterr().err
+        assert "not writable" in err
+        assert "Traceback" not in err
+    finally:
+        report_dir.chmod(0o755)
+
+
+def _candle(open_time: int, close: float = 1.5) -> list[float]:
+    return [open_time, 1.0, 2.0, 0.5, close, 1.0]
+
+
+def _gt(candles: list[list[float]]) -> tuple[GeckoTerminalSource, httpx.Client]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        before = int(request.url.params["before_timestamp"])
+        limit = int(request.url.params["limit"])
+        page = sorted((row for row in candles if row[0] <= before), reverse=True)[:limit]
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, min_interval=0, sleep=lambda _seconds: None)
+    return source, client
+
+
+def _stored_series(
+    path: Path,
+    candles: list[list[float]],
+    windows: list[tuple[int, int]],
+    *,
+    timeframe: str = "1m",
+    load_start: int,
+    load_end: int,
+) -> list[tuple[int, float, bool]]:
+    source, client = _gt(candles)
+    store = SqliteBarStore(path)
+    try:
+        for start, end in windows:
+            run_backfill(
+                source=source,
+                store=store,
+                assets=(MAJORS[0],),
+                start=start,
+                end=end,
+                timeframes=(timeframe,),
+                user_id=LOCAL_USER_ID,
+                generated_at=end,
+            )
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe=timeframe,
+            start=load_start,
+            end=load_end,
+        )
+        return [(bar.open_time, bar.close, bar.synthetic) for bar in stored]
+    finally:
+        store.close()
+        client.close()
+
+
+def test_a_quiet_window_fetched_on_its_own_stays_synthetic(tmp_path: Path) -> None:
+    # One trade at the open. [T1, T2) has no candle of its own. Fetching that
+    # window alone, or after the earlier window, stores the same 30 flats.
+    t1 = _START + 30 * 60
+    t2 = t1 + 30 * 60
+    candles = [_candle(_START, 1.5)]
+    one = _stored_series(
+        tmp_path / "one.sqlite",
+        candles,
+        [(_START, t2)],
+        load_start=_START,
+        load_end=t2,
+    )
+    stepped = _stored_series(
+        tmp_path / "step.sqlite",
+        candles,
+        [(_START, t1), (t1, t2)],
+        load_start=_START,
+        load_end=t2,
+    )
+    alone = _stored_series(
+        tmp_path / "alone.sqlite", candles, [(t1, t2)], load_start=_START, load_end=t2
+    )
+    assert one == stepped == alone
+    quiet = [row for row in alone if t1 <= row[0] < t2]
+    assert len(quiet) == 30
+    assert all(close == 1.5 and synthetic for _open_time, close, synthetic in quiet)
+    source, client = _gt(candles)
+    store = SqliteBarStore(tmp_path / "report.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=t1,
+            end=t2,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=t2,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == []
+        assert section["real"] == 0
+        assert section["synthetic"] == 30
+        assert section["present"] == 30
+    finally:
+        store.close()
+        client.close()
+
+
+def test_seeded_window_order_stores_one_series(tmp_path: Path) -> None:
+    rng = random.Random(21)
+    minutes = sorted(rng.sample(range(0, 90), 8))
+    candles = [_candle(_START + minute * 60, 1.0 + minute / 100) for minute in minutes]
+    full_end = _START + 150 * 60
+    windows = [
+        (_START, _START + 60 * 60),
+        (_START + 40 * 60, _START + 100 * 60),
+        (_START + 90 * 60, full_end),
+    ]
+    expected = _stored_series(
+        tmp_path / "full.sqlite",
+        candles,
+        [(_START, full_end)],
+        load_start=_START,
+        load_end=full_end,
+    )
+    quiet_tail = [
+        row for row in expected if row[0] >= _START + 90 * 60 and row[2]
+    ]
+    assert quiet_tail
+    assert any(not synthetic for _open_time, _close, synthetic in expected)
+    for index, order in enumerate(itertools.permutations(windows)):
+        got = _stored_series(
+            tmp_path / f"order-{index}.sqlite",
+            candles,
+            list(order),
+            load_start=_START,
+            load_end=full_end,
+        )
+        assert got == expected
+
+
+def test_an_older_5m_close_is_no_trade_not_a_leading_gap(tmp_path: Path) -> None:
+    step = 300
+    start = _START + step
+    end = start + 5 * step
+    candles = [_candle(_START, 1.5)]
+    source, client = _gt(candles)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=start,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == []
+        assert section["real"] == 0
+        assert section["no_trade"] == 5
+        assert section["unfetched"] == 0
+    finally:
+        store.close()
+        client.close()
+
+
+def test_a_rerun_does_not_open_a_seam_gap(tmp_path: Path) -> None:
+    step = 300
+    end = _START + 11 * step
+    mid = _START + 6 * step
+    bars = [
+        Bar(_MINT, "5m", _START, 1.0, 2.0, 0.5, 1.5, 9.0),
+        Bar(_MINT, "5m", _START + 10 * step, 1.0, 4.0, 0.5, 3.0, 9.0),
+    ]
+    source = MemorySource(bars)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        first = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=mid,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=mid,
+        )
+        # The second request overlaps the first span, then fetches only the tail.
+        # The quiet buckets at the start of that tail are not a new leading gap.
+        second = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START + 3 * step,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        whole = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        assert first["series"][0]["gaps"] == []
+        assert second["series"][0]["gaps"] == []
+        assert second["series"][0]["no_trade"] == 7
+        assert second["series"][0]["real"] == 1
+        assert whole["series"][0]["gaps"] == []
+        assert whole["series"][0]["no_trade"] == 9
+        assert source.calls == [
+            (_MINT, "5m", _START, mid),
+            (_MINT, "5m", mid, end),
+        ]
+    finally:
+        store.close()
+
+
+def test_prior_close_does_not_cross_an_empty_page(tmp_path: Path) -> None:
+    quiet_end = _START + 30 * 60
+    outage_end = quiet_end + 3 * 3600
+    real_at = outage_end + 5 * 60
+    end = real_at + 60
+    later = _minute(real_at - _START, high=4.0, close=3.0)
+    pages = [
+        FetchPage([_minute(0)], [], _START, quiet_end),
+        FetchPage([], [], quiet_end, outage_end, True),
+        FetchPage([later], [], outage_end, end),
+    ]
+    source = _PagingSource(pages, fail_on=None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        crossed = [
+            bar
+            for bar in stored
+            if bar.synthetic and bar.close == 1.5 and bar.open_time >= outage_end
+        ]
+        before = [
+            bar
+            for bar in stored
+            if bar.synthetic and bar.open_time < quiet_end and bar.close == 1.5
+        ]
+        assert not any(quiet_end <= bar.open_time < real_at for bar in stored)
+        assert before
+        assert crossed == []
+        section = report["series"][0]
+        assert section["gaps"] == [
+            {
+                "start": "2026-01-01T00:30:00Z",
+                "end": "2026-01-01T03:35:00Z",
+                "missing": 185,
+            }
+        ]
+    finally:
+        store.close()
+
+
+def test_a_5m_history_start_is_a_leading_gap(tmp_path: Path) -> None:
+    step = 300
+    end = _START + 10 * step
+    bar = Bar(_MINT, "5m", _START + 6 * step, 1.0, 2.0, 0.5, 1.5, 9.0)
+    source = MemorySource([bar])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == [
+            {
+                "start": "2026-01-01T00:00:00Z",
+                "end": "2026-01-01T00:30:00Z",
+                "missing": 6,
+            }
+        ]
+        assert section["no_trade"] == 3
+        assert section["real"] == 1
+        assert section["missing"] == 9
+    finally:
+        store.close()
+
+
+def test_a_quiet_run_at_the_threshold_is_not_flagged(tmp_path: Path) -> None:
+    end = _START + 121 * 60
+    source = MemorySource([_minute(0)])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["synthetic"] == 120
+        assert section["long_no_trade"] == []
+        assert section["suspect_outage"] is False
+    finally:
+        store.close()
+
+
+def test_a_quiet_run_one_minute_past_the_threshold_is_flagged(tmp_path: Path) -> None:
+    end = _START + 122 * 60
+    source = MemorySource([_minute(0)])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["synthetic"] == 121
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
+            {
+                "start": "2026-01-01T00:01:00Z",
+                "end": "2026-01-01T02:02:00Z",
+                "minutes": 121,
+            }
+        ]
     finally:
         store.close()

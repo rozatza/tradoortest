@@ -5,9 +5,10 @@ documents about 5 calls per minute for the keyless pool, 1000 candles per
 call, and about six months of history on the free tier. This client spaces
 calls 12 seconds apart and never sends ``include_empty_intervals`` (that
 flag copies the previous close forward). Empty minutes stay missing.
-HTTP 429, HTTP 5xx, and timeouts retry with a bounded backoff. A connect
-or DNS failure is a ``SourceError`` and is not retried. The public API
-only serves about 180 days; a 401 is reported as that limit.
+HTTP 429, HTTP 5xx, timeouts, and transport errors (connect, read, write,
+and protocol) retry with a bounded backoff. After five attempts the call
+is a ``SourceError``. The public API only serves about 180 days; a 401 is
+reported as that limit.
 
 Every timeframe is a native aggregate: minute 1/5/15, hour 1/4, and day.
 Higher timeframes are not built from 1m bars.
@@ -167,14 +168,29 @@ class GeckoTerminalSource:
             candles = _ohlcv_list(payload)
             pages += 1
             if not candles:
-                yield FetchPage([], [], start, page_hi)
+                # No candles at all. This is provider-missing, not a quiet market.
+                yield FetchPage([], [], start, page_hi, True)
                 return
             parsed = _parse_page(candles, mint, timeframe)
             if parsed.oldest is None:
                 raise SourceError("GeckoTerminal page has no candle timestamps")
             finished = parsed.oldest <= start or len(candles) < self._page_limit
             cover_lo = start if finished else parsed.oldest
-            yield _page_in_range(parsed, cover_lo, page_hi)
+            page = _page_in_range(parsed, cover_lo, page_hi)
+            if finished and parsed.oldest < start:
+                # The page reached before the window. The latest older candle
+                # is the prior close. Dropping it made a quiet window look empty.
+                prior_time = max((stamp for stamp in parsed.bars if stamp < start), default=None)
+                if prior_time is not None:
+                    page = FetchPage(
+                        page.bars,
+                        page.rejected,
+                        page.start,
+                        page.end,
+                        False,
+                        parsed.bars[prior_time],
+                    )
+            yield page
             if finished:
                 return
             nxt = parsed.oldest - 1
@@ -204,6 +220,14 @@ class GeckoTerminalSource:
             except httpx.TimeoutException as exc:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request timed out") from exc
+                self._sleep(backoff)
+                backoff = min(backoff * 2, 120.0)
+                continue
+            except httpx.TransportError as exc:
+                # ConnectError, ReadError, WriteError, RemoteProtocolError.
+                # One blip used to abort a 90-day run. Same bound as timeouts.
+                if attempt == _ATTEMPTS - 1:
+                    raise SourceError("GeckoTerminal request failed") from exc
                 self._sleep(backoff)
                 backoff = min(backoff * 2, 120.0)
                 continue

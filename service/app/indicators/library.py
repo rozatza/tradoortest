@@ -128,7 +128,10 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
     the running averages.
 
     The strategy schema requires a period of at least 2. Period 1 is defined
-    here: one change, then each new bar replaces the averages.
+    here: the averages are that one change. A flat bar sets both to 0, so
+    RSI is NaN and the call emits ``IndicatorLint``. Period 1 does not hold
+    the previous value. Period 2 and above still hold, because a flat step
+    scales by ``(period - 1) / period`` instead of clearing the averages.
     """
     period = _period(period, "period")
     data = _series(values, "values")
@@ -154,7 +157,14 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
             gain = change if change > 0.0 else 0.0
             loss = -change if change < 0.0 else 0.0
             if gain == 0.0 and loss == 0.0:
-                avg_gain, avg_loss = _hold_if_subnormal(avg_gain, avg_loss, period)
+                # Period 1's scale is exactly 0, so a flat bar clears the
+                # averages. That is a fully flat window (NaN + lint), not an
+                # underflow. Holding here used to keep the previous RSI.
+                if period == 1:
+                    avg_gain = 0.0
+                    avg_loss = 0.0
+                else:
+                    avg_gain, avg_loss = _hold_if_subnormal(avg_gain, avg_loss, period)
             else:
                 avg_gain = (avg_gain * (period - 1) + gain) / period
                 avg_loss = (avg_loss * (period - 1) + loss) / period

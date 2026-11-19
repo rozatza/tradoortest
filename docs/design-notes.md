@@ -42,6 +42,6 @@ When multi-user auth exists, replace the body of `get_current_user`. Rows alread
 
 - Accounts, sessions, invites, or access-control lists.
 - Wallets, private keys, signing, transaction building, swaps, or order routing.
-- A backtester. Indicator math is `service/app/indicators` (`docs/dsl-spec.md`). Historical bars are ingested by `service/app/ohlcv` (`docs/ohlcv.md`) into a local store keyed with `user_id`. Strategy files are parsed by `service/app/dsl`. Expression text is parsed by `service/app/expr`. A saved file uses the envelope in `docs/save-format.md`; `user_id` stays on the row and is not part of that envelope.
+- A live order route. The backtest in `service/app/backtest` (`docs/backtest.md`) only simulates fills. Indicator math is `service/app/indicators` (`docs/dsl-spec.md`). Historical bars are ingested by `service/app/ohlcv` (`docs/ohlcv.md`) into a local store keyed with `user_id`. Strategy files are parsed by `service/app/dsl`. Expression text is parsed by `service/app/expr`. A saved file uses the envelope in `docs/save-format.md`; `user_id` stays on the row and is not part of that envelope.
 
 `.env.example` has no values. Do not commit secrets.

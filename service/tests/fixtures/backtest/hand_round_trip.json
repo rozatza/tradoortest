@@ -1,0 +1,19 @@
+{
+  "synthetic": true,
+  "note": "Hand-built bars for one round trip. Not market data and not a GeckoTerminal response. The cent arithmetic is in test_backtest.py and docs/backtest.md.",
+  "bars": [
+    {"offset": 0, "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+    {"offset": 60, "open": 100, "high": 110, "low": 90, "close": 100, "volume": 1},
+    {"offset": 120, "open": 100, "high": 140, "low": 90, "close": 130, "volume": 1}
+  ],
+  "expected": {
+    "buy_price": "100.05",
+    "buy_notional": "4995.00",
+    "buy_commission": "5.00",
+    "equity_after_buy": "9992.50",
+    "sell_price": "129.935",
+    "sell_notional": "6487.01",
+    "sell_commission": "6.49",
+    "final_equity": "11480.52"
+  }
+}
