@@ -1,16 +1,32 @@
 """Backtest metrics. Formulas and edge cases are in ``docs/metrics.md``.
 
-Ratios are half-even to 1e-10 inside a local 50-digit context. A ratio the
-definition leaves undefined is ``None``, and ``undefined`` names the reason.
-A defined zero stays 0. Nothing here is NaN or infinite, and a ratio that
-the 1e-10 quantize cannot hold does not raise.
+Ratios are half-even to 1e-10 inside a local 50-digit context. That context
+clears the caller's ``Inexact`` trap, so trapping ``Inexact`` does not blank
+a ratio. A ratio the definition leaves undefined is ``None``, and
+``undefined`` names the reason. A defined zero stays 0. Nothing here is NaN
+or infinite, and a ratio that the 1e-10 quantize cannot hold does not raise.
+
+``annualization_overflow`` is only the annualized return and Calmar. A net
+return, Sharpe, Sortino, win rate, or payoff that will not quantize is
+``overflow``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
+from decimal import (
+    ROUND_HALF_EVEN,
+    Clamped,
+    Decimal,
+    DecimalException,
+    Inexact,
+    Rounded,
+    Subnormal,
+    Underflow,
+    localcontext,
+)
 from fractions import Fraction
 from types import MappingProxyType
 
@@ -103,6 +119,26 @@ def bars_per_year(bar_seconds: int) -> int:
     return _SECONDS_PER_YEAR // bar_seconds
 
 
+@contextmanager
+def _local_ratio() -> Iterator[None]:
+    """50-digit half-even context that does not inherit an ``Inexact`` trap.
+
+    ``localcontext`` copies the caller's traps. A caller trapping ``Inexact``
+    would otherwise turn every quantize into an exception, and the overflow
+    handler would report a null ratio for an ordinary number. Informational
+    traps stay off. ``InvalidOperation`` still raises and becomes a null ratio.
+    """
+    with localcontext() as ctx:
+        ctx.prec = 50
+        ctx.rounding = ROUND_HALF_EVEN
+        ctx.traps[Inexact] = False
+        ctx.traps[Rounded] = False
+        ctx.traps[Subnormal] = False
+        ctx.traps[Underflow] = False
+        ctx.traps[Clamped] = False
+        yield
+
+
 def compute_metrics(
     *,
     initial: Decimal,
@@ -116,11 +152,10 @@ def compute_metrics(
     """Ratios from the cent equity curve and the closed-trade pnl, in exit order.
 
     The arithmetic runs in a local 50-digit context, so the caller's precision
-    does not change a ratio. An overflow becomes a null ratio. It does not raise.
+    and ``Inexact`` trap do not change a ratio. An overflow becomes a null
+    ratio. It does not raise.
     """
-    with localcontext() as ctx:
-        ctx.prec = 50
-        ctx.rounding = ROUND_HALF_EVEN
+    with _local_ratio():
         return _compute(
             initial=initial,
             curve=curve,
@@ -243,7 +278,7 @@ def _net(
         return None, blank
     value = _ratio_fraction(_net_fraction(initial, final))
     if value is None:
-        return None, "annualization_overflow"
+        return None, "overflow"
     return value, None
 
 
@@ -277,12 +312,12 @@ def _risk_ratios(
         mean_dec = _decimal(mean)
         scale = _sqrt(Fraction(per_year))
     except DecimalException:
-        return None, "annualization_overflow", None, "annualization_overflow"
+        return None, "overflow", None, "overflow"
     if variance == 0:
         sharpe, sharpe_reason = None, "zero_variance"
     else:
         sharpe = _scale(mean_dec, variance / (count - 1), scale)
-        sharpe_reason = None if sharpe is not None else "annualization_overflow"
+        sharpe_reason = None if sharpe is not None else "overflow"
     if downside == 0:
         sortino, sortino_reason = None, "no_downside"
     else:
@@ -290,15 +325,13 @@ def _risk_ratios(
         # The divisor is N - 1, the same sample divisor as Sharpe, not the
         # count of negative returns and not N.
         sortino = _scale(mean_dec, downside / (count - 1), scale)
-        sortino_reason = None if sortino is not None else "annualization_overflow"
+        sortino_reason = None if sortino is not None else "overflow"
     return sharpe, sharpe_reason, sortino, sortino_reason
 
 
 def _scale(mean: Decimal, second: Fraction, per_year_sqrt: Decimal) -> Decimal | None:
     try:
-        with localcontext() as ctx:
-            ctx.prec = 50
-            ctx.rounding = ROUND_HALF_EVEN
+        with _local_ratio():
             deviation = _sqrt(second)
             if deviation == 0:
                 return None
@@ -319,17 +352,15 @@ def _annualized(
         return None, blank
     if periods * bar_seconds < _DAY:
         return None, "too_short"
-    if net_reason == "annualization_overflow":
-        return None, "annualization_overflow"
+    if net_reason == "overflow":
+        return None, "overflow"
     if net == 0:
         return _ratio(_ZERO), None
     base = 1 + net
     if base <= 0:
         return _ratio(Decimal(-1)), None
     try:
-        with localcontext() as ctx:
-            ctx.prec = 50
-            ctx.rounding = ROUND_HALF_EVEN
+        with _local_ratio():
             grown = _decimal(base) ** (Decimal(per_year) / Decimal(periods))
             value = _ratio(grown - 1)
     except DecimalException:
@@ -347,9 +378,7 @@ def _calmar(
     if drawdown == 0:
         return None, "no_drawdown"
     try:
-        with localcontext() as ctx:
-            ctx.prec = 50
-            ctx.rounding = ROUND_HALF_EVEN
+        with _local_ratio():
             value = _ratio(annualized / drawdown)
     except DecimalException:
         value = None
@@ -373,7 +402,7 @@ def _payoff(
         return None, "no_losses"
     value = _ratio_fraction(average_win / average_loss)
     if value is None:
-        return None, "annualization_overflow"
+        return None, "overflow"
     return value, None
 
 
@@ -399,21 +428,17 @@ def _rate(numerator: int, denominator: int) -> tuple[Decimal | None, str | None]
         return None, "no_closed_trades"
     value = _ratio_fraction(Fraction(numerator, denominator))
     if value is None:
-        return None, "annualization_overflow"
+        return None, "overflow"
     return value, None
 
 
 def _sqrt(amount: Fraction) -> Decimal:
-    with localcontext() as ctx:
-        ctx.prec = 50
-        ctx.rounding = ROUND_HALF_EVEN
+    with _local_ratio():
         return _decimal(amount).sqrt()
 
 
 def _decimal(amount: Fraction) -> Decimal:
-    with localcontext() as ctx:
-        ctx.prec = 50
-        ctx.rounding = ROUND_HALF_EVEN
+    with _local_ratio():
         return Decimal(amount.numerator) / Decimal(amount.denominator)
 
 
@@ -425,7 +450,5 @@ def _ratio_fraction(amount: Fraction) -> Decimal | None:
 
 
 def _ratio(amount: Decimal) -> Decimal | None:
-    with localcontext() as ctx:
-        ctx.prec = 50
-        ctx.rounding = ROUND_HALF_EVEN
+    with _local_ratio():
         return amount.quantize(_RATIO, rounding=ROUND_HALF_EVEN)

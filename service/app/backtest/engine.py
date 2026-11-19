@@ -631,11 +631,9 @@ def _walk(
         OpenPosition(asset_id, decimal_ratio(position.qty), position.entry_price)
         for asset_id, position in book.positions.items()
     )
-    trades = _tie_open_pnl(
-        _trades(closed_acc, open_acc, marks, flags, grid, step),
-        initial,
-        final_equity,
-    )
+    _require_exact_pnl(closed_acc, open_acc, book, marks, initial)
+    reported, exact_unrealized = _trades(closed_acc, open_acc, marks, flags, grid, step)
+    trades = _spread_remainder(reported, exact_unrealized, initial, final_equity)
     quality = QualityCounts(
         grid_bars=len(grid),
         missing_bars=missing_bars,
@@ -1088,9 +1086,10 @@ def _trades(
     flags: Mapping[str, AssetFlags],
     grid: Sequence[int],
     step: int,
-) -> tuple[Trade, ...]:
+) -> tuple[tuple[Trade, ...], tuple[Fraction, ...]]:
     ordered = [*closed_acc, *open_acc.values()]
     trades: list[Trade] = []
+    exact_unrealized: list[Fraction] = []
     for number, acc in enumerate(ordered, start=1):
         end = grid[-1] if acc.exit_time is None else acc.exit_time
         synthetic, missing, outage = _span(flags[acc.asset_id], grid, acc.entry_time, end)
@@ -1130,7 +1129,11 @@ def _trades(
                 suspect_outage_minutes=minutes,
             )
         )
-    return tuple(trades)
+        if status == "open":
+            exact_unrealized.append(_exact_unrealized(acc, marks.get(acc.asset_id)))
+        else:
+            exact_unrealized.append(Fraction(0))
+    return tuple(trades), tuple(exact_unrealized)
 
 
 def _pnl(acc: _Acc, mark: Decimal | None) -> tuple[Decimal, Decimal]:
@@ -1152,32 +1155,96 @@ def _pnl(acc: _Acc, mark: Decimal | None) -> tuple[Decimal, Decimal]:
     return realized, unrealized
 
 
-def _tie_open_pnl(
-    trades: tuple[Trade, ...], initial: Decimal, final: Decimal
-) -> tuple[Trade, ...]:
-    """Absorb a one-cent remainder so the open book matches the equity change.
+def _book_pnl(
+    closed_acc: Sequence[_Acc], open_acc: Mapping[str, _Acc], marks: Mapping[str, Decimal]
+) -> Fraction:
+    """Exact realized plus open mark-to-basis, before any cent rounding."""
+    total = Fraction(0)
+    for acc in (*closed_acc, *open_acc.values()):
+        total += acc.realized_exact
+        if acc.qty != 0:
+            total += _exact_unrealized(acc, marks.get(acc.asset_id))
+    return total
 
-    Realized plus unrealized equals ``final - initial`` when the parts are
-    exact. Rounding each trade to the cent can leave one cent over. That
-    cent is added to the last open trade. A larger gap is left in place.
+
+def _unrounded_equity(book: _Book, marks: Mapping[str, Decimal]) -> Fraction:
+    total = Fraction(book.cash)
+    for asset_id, position in book.positions.items():
+        price = marks.get(asset_id)
+        if price is None:
+            continue
+        total += position.qty * Fraction(price)
+    return total
+
+
+def _exact_unrealized(acc: _Acc, mark: Decimal | None) -> Fraction:
+    if acc.qty == 0 or mark is None:
+        return Fraction(0)
+    return acc.qty * Fraction(mark) - acc.basis
+
+
+def _require_exact_pnl(
+    closed_acc: Sequence[_Acc],
+    open_acc: Mapping[str, _Acc],
+    book: _Book,
+    marks: Mapping[str, Decimal],
+    initial: Decimal,
+) -> None:
+    """The booked fraction must equal unrounded equity minus initial.
+
+    This runs before cent rounding. A sub-cent miss is a real accounting
+    error, and it raises instead of being absorbed by the cent plug.
     """
-    if not trades:
-        return trades
+    exact = _book_pnl(closed_acc, open_acc, marks)
+    if exact != _unrounded_equity(book, marks) - Fraction(initial):
+        raise BacktestError("realized and unrealized pnl do not match the equity change")
+
+
+def _spread_remainder(
+    trades: tuple[Trade, ...],
+    exact_unrealized: Sequence[Fraction],
+    initial: Decimal,
+    final: Decimal,
+) -> tuple[Trade, ...]:
+    """Give the cent gap to open trades by largest remainder.
+
+    The exact identity has already held. Each open trade's realized and
+    unrealized pnl are then half-even cents, and ``final`` is already a
+    cent. The gap ``final - initial - sum(cents)`` is at most one cent per
+    open trade. Each whole cent of that gap is added to, or taken from, one
+    open trade's unrealized pnl: the trade whose unrounded unrealized pnl
+    sits farthest from its rounded cent in the direction of the gap. A tie
+    goes to the earlier open trade, the smaller trade id. No trade moves by
+    more than one cent. Closed trades are left as rounded.
+    """
     total = sum((trade.realized_pnl + trade.unrealized_pnl for trade in trades), Decimal("0.00"))
     delta = final - initial - total
     if delta == 0:
         return trades
-    last = None
-    open_count = 0
+    open_indexes = [index for index, trade in enumerate(trades) if trade.status == "open"]
+    scaled = delta * 100
+    if scaled != scaled.to_integral_value() or not open_indexes:
+        raise BacktestError("realized and unrealized pnl do not match the equity change")
+    cents = int(scaled)
+    if abs(cents) > len(open_indexes):
+        raise BacktestError("realized and unrealized pnl do not match the equity change")
+    sign = 1 if cents > 0 else -1
+
+    def _rank(index: int) -> tuple[Fraction, int]:
+        remainder = exact_unrealized[index] - Fraction(trades[index].unrealized_pnl)
+        # A positive gap fills the trades rounded down the most. A negative
+        # gap takes the cent back from the trades rounded up the most.
+        return (-sign * remainder, index)
+
+    chosen = set(sorted(open_indexes, key=_rank)[: abs(cents)])
+    step = Decimal("0.01") * sign
+    patched: list[Trade] = []
     for index, trade in enumerate(trades):
-        if trade.status == "open":
-            last = index
-            open_count += 1
-    if last is None or abs(delta) > Decimal("0.01") * open_count:
-        return trades
-    chosen = trades[last]
-    patched = replace(chosen, unrealized_pnl=chosen.unrealized_pnl + delta)
-    return tuple(patched if index == last else trade for index, trade in enumerate(trades))
+        if index in chosen:
+            patched.append(replace(trade, unrealized_pnl=trade.unrealized_pnl + step))
+        else:
+            patched.append(trade)
+    return tuple(patched)
 
 
 def _span(

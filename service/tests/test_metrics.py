@@ -13,21 +13,23 @@ import os
 import random
 import subprocess
 import sys
-from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import ROUND_HALF_EVEN, Decimal, Inexact, localcontext
 from fractions import Fraction
 
 from app.backtest import (
     METRIC_COLUMNS,
     TRADE_COLUMNS,
+    BacktestError,
     metrics_csv,
     metrics_json,
     run_backtest,
     trade_log_csv,
     trade_log_json,
 )
+from app.backtest.engine import _spread_remainder
 from app.backtest.log import METRICS_SCHEMA, SCHEMA
-from app.backtest.metrics import compute_metrics
-from app.backtest.money import quantize_cents
+from app.backtest.metrics import Trade, compute_metrics
+from app.backtest.money import decimal_ratio, quantize_cents
 from app.backtest.quality import QualityCounts
 from app.ohlcv.bars import Bar
 from test_backtest import (
@@ -1145,14 +1147,14 @@ def test_a_later_add_does_not_reprice_a_partial_sale() -> None:
 
 
 def test_realized_plus_unrealized_matches_the_equity_change() -> None:
-    """Seeded books with adds, partial sells, and commission."""
+    """Seeded books with adds, partial sells, and commission.
+
+    The replay is the exact basis, before cent rounding. The reported cents
+    may differ from that replay by at most one cent on each open trade.
+    """
     for seed in (617, *range(30)):
-        result = _random_book(seed)
-        total = sum(
-            (trade.realized_pnl + trade.unrealized_pnl for trade in result.trades),
-            Decimal("0.00"),
-        )
-        assert total == result.final_equity - result.metrics.initial_equity
+        result, bars = _random_book(seed)
+        _assert_exact_pnl_and_plug(result, bars)
 
 
 def _random_book(seed: int):
@@ -1240,7 +1242,7 @@ def _random_book(seed: int):
         else:
             price = rng.uniform(90, 100)
         bars.append(_bar(60 * index, round(price, 4)))
-    return run_backtest(document, {"sol": bars})
+    return run_backtest(document, {"sol": bars}), bars
 
 
 def test_a_long_one_minute_hole_is_not_quiet() -> None:
@@ -1360,3 +1362,467 @@ def test_synthetic_bars_do_not_set_the_outage_flag_on_their_own() -> None:
     trade = result.trades[0]
     assert trade.synthetic_bars == 2
     assert trade.overlaps_suspect_outage is False
+
+
+def _assert_exact_pnl_and_plug(result, bars: list[Bar]) -> None:
+    """Replay each fill's basis. Slippage on these books is zero.
+
+    Buy quantity is notional / price. A sell is the whole open quantity or
+    half of it, which is what the 50% and 100% actions do. The exact sum has
+    to match unrounded equity before any cent plug.
+    """
+    state = {"qty": Fraction(0), "basis": Fraction(0), "realized": Fraction(0)}
+    closed_exact: list[Fraction] = []
+    for fill in result.fills:
+        if fill.side == "buy":
+            state["basis"] += Fraction(fill.notional) + Fraction(fill.commission)
+            state["qty"] += Fraction(fill.notional) / Fraction(fill.price)
+            continue
+        qty = state["qty"]
+        if fill.qty == decimal_ratio(qty):
+            sold = qty
+        elif fill.qty == decimal_ratio(qty / 2):
+            sold = qty / 2
+        else:
+            raise AssertionError("sell qty is not the open quantity or half of it")
+        sold_basis = state["basis"] * sold / qty
+        state["realized"] += Fraction(fill.notional) - Fraction(fill.commission) - sold_basis
+        state["basis"] -= sold_basis
+        state["qty"] = qty - sold
+        if state["qty"] == 0:
+            closed_exact.append(state["realized"])
+            state["basis"] = Fraction(0)
+            state["realized"] = Fraction(0)
+    mark = Decimal(str(bars[-1].close))
+    exact = sum(closed_exact, Fraction(0)) + state["realized"]
+    if state["qty"] != 0:
+        exact += state["qty"] * Fraction(mark) - state["basis"]
+    exact_equity = Fraction(result.final_cash)
+    if state["qty"] != 0:
+        exact_equity += state["qty"] * Fraction(mark)
+    initial = Fraction(result.metrics.initial_equity)
+    assert exact == exact_equity - initial
+    reported_closed = [trade.realized_pnl for trade in result.trades if trade.status == "closed"]
+    assert reported_closed == [quantize_cents(item) for item in closed_exact]
+    open_trades = [trade for trade in result.trades if trade.status == "open"]
+    if state["qty"] == 0:
+        assert open_trades == []
+    else:
+        assert len(open_trades) == 1
+        trade = open_trades[0]
+        assert trade.realized_pnl == quantize_cents(state["realized"])
+        plug = trade.unrealized_pnl - quantize_cents(
+            state["qty"] * Fraction(mark) - state["basis"]
+        )
+        assert abs(plug) <= Decimal("0.01")
+    reported = sum(
+        (trade.realized_pnl + trade.unrealized_pnl for trade in result.trades), Decimal("0.00")
+    )
+    assert reported == result.final_equity - result.metrics.initial_equity
+
+
+def test_a_full_day_calmar_overflow_does_not_fail_the_run() -> None:
+    """1440 one-minute bars, buy and hold, +25% with a 0.018 dip at bar 700.
+
+    The run is one day, so it is annualized. Calmar is past the 1e-10
+    quantize. Removing the overflow guard fails this run. Case G never
+    reaches that guard, because an hour is too_short.
+    """
+    bars = []
+    for index in range(1440):
+        price = round(100 + 25 * index / 1439, 6)
+        if index == 700:
+            price = round(price - 0.018, 6)
+        bars.append(_bar(60 * index, price))
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(50, 50)
+    result = run_backtest(document, {"sol": bars})
+    _finite(result)
+    assert result.metrics.bar_count == 1440
+    assert result.metrics.net_return == Decimal("0.25")
+    assert result.metrics.annualized_return is not None
+    assert result.metrics.calmar is None
+    assert result.metrics.undefined["calmar"] == "annualization_overflow"
+
+
+def test_one_day_is_annualized_and_the_bar_before_is_too_short() -> None:
+    def flat(count: int):
+        return run_backtest(_flat(), {"sol": [_bar(60 * index, 1) for index in range(count)]})
+
+    full = flat(1440)
+    short = flat(1439)
+    assert full.metrics.bar_count == 1440
+    assert full.metrics.annualized_return == Decimal("0")
+    assert "annualized_return" not in full.metrics.undefined
+    assert full.metrics.undefined["calmar"] == "no_drawdown"
+    assert short.metrics.bar_count == 1439
+    assert short.metrics.net_return == Decimal("0")
+    assert short.metrics.annualized_return is None
+    assert short.metrics.undefined["annualized_return"] == "too_short"
+    assert short.metrics.undefined["calmar"] == "too_short"
+
+
+def test_fewer_than_two_returns_are_null() -> None:
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("11000"),),
+        closed_pnls=(),
+        open_trades=1,
+        bar_seconds=60,
+        take_profit_limit_below_low=0,
+        quality=QualityCounts(1, 0, 0, 0, 0, 120, 0, 0, 0, 0),
+    )
+    assert metrics.sharpe is None
+    assert metrics.sortino is None
+    assert metrics.undefined["sharpe"] == "too_few_returns"
+    assert metrics.undefined["sortino"] == "too_few_returns"
+    assert metrics.net_return == Decimal("0.1")
+
+
+def test_a_payoff_that_will_not_quantize_is_overflow() -> None:
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("10000"), Decimal("10000")),
+        closed_pnls=(Decimal("1E+60"), Decimal("-0.01")),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=QualityCounts(2, 0, 0, 0, 0, 120, 0, 0, 0, 0),
+    )
+    assert metrics.payoff_ratio is None
+    assert metrics.undefined["payoff_ratio"] == "overflow"
+    assert metrics.annualized_return == Decimal("0")
+
+
+def test_a_caller_inexact_trap_does_not_blank_ratios() -> None:
+    quality = QualityCounts(2, 0, 0, 0, 0, 120, 0, 0, 0, 0)
+    kwargs = {
+        "initial": Decimal("10000"),
+        "curve": (Decimal("10000"), Decimal("11000")),
+        "closed_pnls": (Decimal("1000"),),
+        "open_trades": 0,
+        "bar_seconds": 86_400,
+        "take_profit_limit_below_low": 0,
+        "quality": quality,
+    }
+    plain = compute_metrics(**kwargs)
+    with localcontext() as ctx:
+        ctx.traps[Inexact] = True
+        trapped = compute_metrics(**kwargs)
+    assert plain.sharpe is not None
+    assert trapped.sharpe == plain.sharpe
+    assert trapped.net_return == plain.net_return
+    assert trapped.sortino == plain.sortino
+    assert trapped.annualized_return == plain.annualized_return
+    assert trapped.undefined == plain.undefined
+
+
+def test_a_sub_cent_pnl_error_fails_the_run() -> None:
+    import app.backtest.engine as engine
+
+    real = engine._book_pnl
+
+    def planted(*args, **kwargs):
+        return real(*args, **kwargs) + Fraction(4, 1000)
+
+    engine._book_pnl = planted
+    try:
+        try:
+            run_backtest(_flat(), {"sol": [_bar(0, 1), _bar(60, 1)]})
+        except BacktestError as exc:
+            assert "do not match the equity change" in str(exc)
+        else:
+            raise AssertionError("a 0.4 cent pnl error was absorbed")
+    finally:
+        engine._book_pnl = real
+
+
+def test_the_cent_remainder_goes_to_the_larger_unrealized_remainder() -> None:
+    """Two open trades, one cent short. The earlier, larger remainder gets it."""
+
+    def trade(asset: str, trade_id: int) -> Trade:
+        return Trade(
+            trade_id=trade_id,
+            asset_id=asset,
+            status="open",
+            entry_time=0,
+            exit_time=None,
+            qty=Decimal("1"),
+            entry_price=Decimal("1"),
+            exit_price=None,
+            entry_notional=Decimal("1.00"),
+            exit_notional=Decimal("0.00"),
+            commission=Decimal("0.00"),
+            realized_pnl=Decimal("0.00"),
+            unrealized_pnl=Decimal("1.00"),
+            limit_below_low=False,
+            overlaps_suspect_outage=False,
+            synthetic_bars=0,
+            missing_bars=0,
+            long_no_trade_bars=0,
+            long_no_trade_minutes=0,
+            suspect_outage_bars=0,
+            suspect_outage_minutes=0,
+        )
+
+    trades = (trade("sol", 1), trade("jup", 2))
+    # Reported cents sum to 2.00. The target is 2.01, so one cent is added.
+    # sol was rounded down by 0.004, jup by 0.001. sol receives the cent.
+    spread = _spread_remainder(
+        trades, (Fraction("1.004"), Fraction("1.001")), Decimal("0"), Decimal("2.01")
+    )
+    assert spread[0].unrealized_pnl == Decimal("1.01")
+    assert spread[1].unrealized_pnl == Decimal("1.00")
+    tied = _spread_remainder(
+        trades, (Fraction("1.004"), Fraction("1.004")), Decimal("0"), Decimal("2.01")
+    )
+    assert tied[0].unrealized_pnl == Decimal("1.01")
+    assert tied[1].unrealized_pnl == Decimal("1.00")
+    # A cent too high comes off the trade that was rounded up, even when it is first.
+    over = _spread_remainder(
+        trades, (Fraction("0.996"), Fraction("1.001")), Decimal("0"), Decimal("1.99")
+    )
+    assert over[0].unrealized_pnl == Decimal("0.99")
+    assert over[1].unrealized_pnl == Decimal("1.00")
+
+
+def test_a_partial_sale_keeps_the_exact_basis_split() -> None:
+    """50% of a 10.01 basis is 5.005. Realized is the cent of 10.01 - 5.005.
+
+    Rounding the basis share to a cent first would report 5.01.
+    """
+    document = _strategy(
+        capital={"initial": 10.01, "currency": "USDC"},
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 1)},
+            {"id": "trim", "expr": _eq("close", 1.5)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 50},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "trim", "do": "exit_sol"},
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 1), _bar(60, 1.5)]})
+    trade = result.trades[0]
+    assert trade.status == "open"
+    assert trade.realized_pnl == Decimal("2.50")
+    assert trade.realized_pnl + trade.unrealized_pnl == result.final_equity - Decimal("10.01")
+
+
+def test_a_scratch_is_not_a_payoff_loss() -> None:
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("10000"), Decimal("10100"), Decimal("10050")),
+        closed_pnls=(Decimal("100.00"), Decimal("0.00"), Decimal("-50.00")),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=QualityCounts(3, 0, 0, 0, 0, 120, 0, 0, 0, 0),
+    )
+    assert metrics.payoff_ratio == Decimal("2")
+    assert "payoff_ratio" not in metrics.undefined
+
+
+def test_price_cells_do_not_use_scientific_notation() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    result = run_backtest(document, {"sol": [_bar(0, 1e-9), _bar(60, 1e-9)]})
+    row = json.loads(trade_log_json(result.trades))["trades"][0]
+    for column in ("qty", "entry_price"):
+        assert "E" not in row[column]
+        assert "e" not in row[column]
+        assert row[column] == format(getattr(result.trades[0], column), "f")
+    assert "E" not in trade_log_csv(result.trades)
+
+
+def test_the_trade_log_schema_string_is_the_documented_id() -> None:
+    payload = json.loads(trade_log_json(()))
+    assert payload["schema"] == "tradoortest.trade_log.v1"
+    assert SCHEMA == "tradoortest.trade_log.v1"
+
+
+def test_entry_price_is_the_quantity_weighted_average() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "add", "expr": _eq("close", 150)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "add_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "add_rule", "when": "add", "do": "add_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 150)]})
+    trade = result.trades[0]
+    # 5000 at 100 and, once cash is the cap, 5000 at 150. 10000 / (250/3) = 120.
+    assert trade.status == "open"
+    assert [fill.price for fill in result.fills] == [Decimal("100"), Decimal("150")]
+    assert trade.entry_price == Decimal("120")
+    assert trade.qty == decimal_ratio(Fraction(250, 3))
+
+
+def test_closed_trades_are_listed_before_open_trades() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        assets=[
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+            {
+                "id": "jup",
+                "symbol": "JUP",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+        ],
+        signals=[
+            {"id": "go_jup", "expr": _eq("close", 100)},
+            {"id": "go_sol", "expr": _eq("close", 100)},
+            {"id": "out_sol", "expr": _eq("close", 110)},
+        ],
+        actions=[
+            {
+                "id": "enter_jup",
+                "type": "enter",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 40},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 40},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_jup_rule", "when": "go_jup", "do": "enter_jup"},
+            {"id": "enter_sol_rule", "when": "go_sol", "do": "enter_sol"},
+            {"id": "exit_sol_rule", "when": "out_sol", "do": "exit_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 2,
+            "allow_pyramiding": False,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(
+        document,
+        {
+            "jup": [_bar(0, 100), _bar(60, 101), _bar(120, 102)],
+            "sol": [_bar(0, 50), _bar(60, 100), _bar(120, 110)],
+        },
+    )
+    assert [trade.asset_id for trade in result.trades] == ["sol", "jup"]
+    assert [trade.status for trade in result.trades] == ["closed", "open"]
+    assert result.trades[1].entry_time < result.trades[0].entry_time
+
+
+def test_a_seeded_ema_and_rsi_across_an_outage_are_linted() -> None:
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "ema_3",
+                "kind": "indicator",
+                "indicator": "ema",
+                "source": "close",
+                "params": {"period": 3},
+            },
+            {
+                "id": "rsi_2",
+                "kind": "indicator",
+                "indicator": "rsi",
+                "source": "close",
+                "params": {"period": 2},
+            },
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    bars = [
+        _bar(0, 10, synthetic=True),
+        _bar(60, 11, synthetic=True),
+        _bar(120, 12),
+        _bar(180, 13),
+        _bar(240, 14),
+        _bar(300, 15),
+    ]
+    result = run_backtest(document, {"sol": bars}, long_no_trade_minutes=1)
+    assert result.metrics.suspect_outage is True
+    assert "ema_3 on sol is computed across 2 suspect_outage bars" in result.lints
+    assert "rsi_2 on sol is computed across 2 suspect_outage bars" in result.lints
