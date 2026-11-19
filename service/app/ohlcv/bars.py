@@ -1,0 +1,100 @@
+"""One OHLCV bar and the checks every ingested bar has to pass.
+
+A failing bar is reported and dropped. No field is rewritten to make the
+bar pass, and no missing minute is invented.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+# 1m is native. Higher timeframes are resampled from 1m on UTC epoch buckets.
+TIMEFRAME_SECONDS: dict[str, int] = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
+
+# Values above about 1e154 overflow the Bollinger square and make SMA, EMA,
+# and ATR non-finite. Anything above 1e15 is rejected here, before that.
+MAX_ABS_VALUE = 1e15
+
+_FIELDS = ("open", "high", "low", "close", "volume")
+_PRICES = ("open", "high", "low", "close")
+
+
+@dataclass(frozen=True, slots=True)
+class Bar:
+    """One candle. ``open_time`` is the bucket start, unix seconds, UTC."""
+
+    mint: str
+    timeframe: str
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass(frozen=True, slots=True)
+class BarRejection:
+    """A candle that was not stored, with the rules it failed."""
+
+    mint: str
+    timeframe: str
+    open_time: int | None
+    reasons: tuple[str, ...]
+
+
+def validate_bar(bar: Bar) -> list[str]:
+    """Return every rule the bar breaks. An empty list means it can be stored.
+
+    Rules, all of them, with no repair:
+
+    - ``mint`` is a non-empty string and ``timeframe`` is one of the six.
+    - ``open_time`` is an integer on that timeframe's UTC epoch grid.
+    - open, high, low, close, and volume are finite.
+    - each of those values is ``>= 0`` and ``<= 1e15``.
+    - ``high >= max(open, close) >= min(open, close) >= low``.
+    """
+    reasons: list[str] = []
+    if not isinstance(bar.mint, str) or bar.mint == "":
+        reasons.append("mint is empty")
+    step = TIMEFRAME_SECONDS.get(bar.timeframe)
+    if step is None:
+        reasons.append("timeframe is not supported")
+    elif isinstance(bar.open_time, bool) or not isinstance(bar.open_time, int):
+        reasons.append("open_time is not an integer second")
+    elif bar.open_time % step != 0:
+        reasons.append(f"open_time is not aligned to {bar.timeframe}")
+
+    finite: dict[str, float] = {}
+    for name in _FIELDS:
+        value = getattr(bar, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            reasons.append(f"{name} is not a real number")
+            continue
+        if not math.isfinite(value):
+            reasons.append(f"{name} is not finite")
+            continue
+        if value < 0.0:
+            reasons.append(f"{name} is negative")
+            continue
+        if value > MAX_ABS_VALUE:
+            reasons.append(f"{name} is above 1e15")
+            continue
+        finite[name] = float(value)
+
+    if all(name in finite for name in _PRICES):
+        body_high = max(finite["open"], finite["close"])
+        body_low = min(finite["open"], finite["close"])
+        if finite["high"] < body_high:
+            reasons.append("high is below max(open, close)")
+        if finite["low"] > body_low:
+            reasons.append("low is above min(open, close)")
+    return reasons

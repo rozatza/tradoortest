@@ -172,7 +172,9 @@ Call names and parameters are fixed here so the indicator library can implement 
 
 `service/app/indicators` computes these series for a derived series and, later, the backtester. Each output has the same length as its input. Bars before the warmup index are NaN. The functions do not backfill, forward-fill, or otherwise invent a value. A non-finite sample (NaN or an infinity) is a gap. It is never treated as a price.
 
-`period`, `fast`, `slow`, `signal`, `k_period`, and `d_period` are integers from 1 to 500. `stddev` is a number in `(0, 10]`. A period longer than the input is not an error: every output is NaN. An empty input returns an empty output. ATR and Stochastic read `high`, `low`, and `close` of equal length. The DSL `source` is still one series name. The numeric ATR and Stochastic use the bar's high, low, and close. The other indicators read the source series.
+`period`, `fast`, `slow`, `signal`, `k_period`, and `d_period` are plain Python integers from 1 to 500. `stddev` is a plain Python number in `(0, 10]`. Series inputs are sequences of plain Python `float` (an `int` element is accepted and converted). A numpy scalar, a numpy array, and a dict are rejected at this boundary. Convert numpy values with `floats_from_numpy` and `period_from_numpy` in `service/app/indicators/boundary.py` before the call. The canonical IR does not carry numpy types. A period longer than the input is not an error: every output is NaN. An empty input returns an empty output. ATR and Stochastic read `high`, `low`, and `close` of equal length. The DSL `source` is still one series name. The numeric ATR and Stochastic use the bar's high, low, and close. The other indicators read the source series.
+
+OHLCV ingest (`docs/ohlcv.md`) rejects a bar whose absolute value is above `1e15` before these functions see it. An input above about `1e154` overflows the Bollinger square and makes SMA, EMA, and ATR non-finite. These functions do not clamp.
 
 | Output | Leading NaNs |
 | --- | --- |
@@ -196,7 +198,7 @@ A gap ends the run. The next run of `period` finite prices seeds a new EMA. The 
 
 `avg = (avg_prev * (period - 1) + current) / period`
 
-RSI is `100 * avg_gain / (avg_gain + avg_loss)` when the average loss is positive. It is 100 when the average loss is 0 and the average gain is positive. It is 0 when both averages are 0, which is what a constant series produces. The result is never infinite. A gap ends the run. The next RSI waits for `period + 1` new finite prices. The strategy schema still requires an RSI period of at least 2. The function is also defined for period 1.
+RSI is `100 * avg_gain / (avg_gain + avg_loss)` when the average loss is positive. It is 100 when the average loss is 0 and the average gain is positive. It is 0 when the average gain is 0 and the average loss is positive. RSI holds its last value when a market goes flat after a move (i.e. only fully flat windows with zero avg gain and zero avg loss are NaN). A fully flat window is NaN, and that call emits one `IndicatorLint` warning. TA-Lib returns 0 for the same window. This library does not. The running averages are kept through the flat window, so a later non-zero change can produce a number without seeding again. The result is never infinite. A non-finite price is a different kind of gap: it ends the run, and the next RSI waits for `period + 1` new finite prices. The strategy schema still requires an RSI period of at least 2. The function is also defined for period 1.
 
 **ATR.** Wilder smoothing of true range. True range at bar `i` (`i ≥ 1`) is the greatest of `high - low`, `|high - previous close|`, and `|low - previous close|`. Bar 0 has no previous close, so it has no true range. The first ATR, at index `period`, is the SMA of the first `period` true ranges. Later bars use:
 
@@ -212,7 +214,7 @@ A non-finite high, low, or close ends the run. Period 1 is the true range itself
 
 `%K = 100 * (close - lowest low) / (highest high - lowest low)`
 
-When the highest high equals the lowest low, `%K` is 0. It is not infinite, and it is not carried forward from the previous bar. `%D` is the SMA of `%K` over `d_period`. This is the two-parameter fast stochastic. It is not the slow stochastic, which would smooth `%K` by a third period before the `%D` average.
+When the highest high equals the lowest low, `%K` is NaN, and that call emits one `IndicatorLint` warning. It is not 0, it is not infinite, and it is not carried forward from the previous bar. TA-Lib returns 0 for that zero range. This library does not. `%D` is the SMA of `%K` over `d_period`, so a NaN `%K` makes a `%D` window that contains it NaN too. This is the two-parameter fast stochastic. It is not the slow stochastic, which would smooth `%K` by a third period before the `%D` average.
 
 Rolling outputs (SMA, Bollinger, `%K`, and `%D` because it is an SMA) are NaN exactly on bars whose window contains a non-finite input. They resume on the next complete finite window.
 

@@ -24,12 +24,12 @@ state at a gap and seed again from the next finite run.
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from app.indicators.errors import IndicatorError
-
-_MAX_PERIOD = 500
+from app.indicators.boundary import as_float_series, as_period
+from app.indicators.errors import IndicatorError, IndicatorLint
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +114,13 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
     over the first `period` changes. Later bars use
     `(prev * (period - 1) + current) / period`.
 
-    Both averages at 0 (a flat run) produce 0. Average loss 0 with a positive
-    average gain produces 100. The result is never infinite. A gap ends the
-    run; the next value needs `period + 1` new finite prices.
+    RSI holds its last value when a market goes flat after a move. Only a
+    fully flat window, where average gain and average loss are both 0, is
+    NaN. That call also emits ``IndicatorLint``. TA-Lib returns 0 there.
+    Average loss 0 with a positive average gain produces 100. The result is
+    never infinite. A non-finite price is a gap and ends the run; the next
+    value needs `period + 1` new finite prices. A flat window does not reset
+    the running averages.
 
     The strategy schema requires a period of at least 2. Period 1 is defined
     here: one change, then each new bar replaces the averages.
@@ -124,6 +128,7 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
     period = _period(period, "period")
     data = _series(values, "values")
     out = _nan(len(data))
+    warned = False
     for start, end in _finite_runs(data):
         if end - start < period + 1:
             continue
@@ -137,14 +142,16 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
                 loss_sum -= change
         avg_gain = gain_sum / period
         avg_loss = loss_sum / period
-        out[start + period] = _rsi_value(avg_gain, avg_loss)
+        out[start + period] = _rsi_point(avg_gain, avg_loss, warned)
+        warned = warned or _flat_rsi(avg_gain, avg_loss)
         for index in range(start + period + 1, end):
             change = data[index] - data[index - 1]
             gain = change if change > 0.0 else 0.0
             loss = -change if change < 0.0 else 0.0
             avg_gain = (avg_gain * (period - 1) + gain) / period
             avg_loss = (avg_loss * (period - 1) + loss) / period
-            out[index] = _rsi_value(avg_gain, avg_loss)
+            out[index] = _rsi_point(avg_gain, avg_loss, warned)
+            warned = warned or _flat_rsi(avg_gain, avg_loss)
     return out
 
 
@@ -283,9 +290,11 @@ def stochastic(
     There is no third smoothing period.
 
     `%K = 100 * (close - lowest low) / (highest high - lowest low)` over the
-    last `k_period` bars. When the high equals the low, `%K` is 0. It is not
-    infinite and it is not copied from the previous bar. A non-finite sample
-    in the window makes that `%K` NaN. `%D` then follows SMA rules.
+    last `k_period` bars. When the highest high equals the lowest low, `%K`
+    is NaN and the call emits ``IndicatorLint``. TA-Lib returns 0 there. The
+    value is not infinite and it is not copied from the previous bar. A
+    non-finite sample in the window makes that `%K` NaN. `%D` then follows
+    SMA rules, so a NaN `%K` makes that `%D` window NaN too.
     """
     k_length = _period(k_period, "k_period")
     d_length = _period(d_period, "d_period")
@@ -294,6 +303,7 @@ def stochastic(
     closes = _series(close, "close")
     _same_length(("high", "low", "close"), (highs, lows, closes))
     k = _nan(len(closes))
+    warned = False
     for index in range(k_length - 1, len(closes)):
         window_high = highs[index - k_length + 1 : index + 1]
         window_low = lows[index - k_length + 1 : index + 1]
@@ -308,9 +318,16 @@ def stochastic(
         lowest = min(window_low)
         span = highest - lowest
         if span == 0.0:
-            k[index] = 0.0
-        else:
-            k[index] = 100.0 * (price - lowest) / span
+            if not warned:
+                warnings.warn(
+                    "Stochastic %K is NaN because the highest high equals the lowest low. "
+                    "TA-Lib returns 0 for this zero range.",
+                    IndicatorLint,
+                    stacklevel=2,
+                )
+                warned = True
+            continue
+        k[index] = 100.0 * (price - lowest) / span
     return Stochastic(k, sma(k, d_length))
 
 
@@ -321,10 +338,21 @@ def stochastic_warmup(k_period: int, d_period: int) -> tuple[int, int]:
     return k_length - 1, k_length + d_length - 2
 
 
-def _rsi_value(avg_gain: float, avg_loss: float) -> float:
+def _flat_rsi(avg_gain: float, avg_loss: float) -> bool:
+    return avg_gain == 0.0 and avg_loss == 0.0
+
+
+def _rsi_point(avg_gain: float, avg_loss: float, already_warned: bool) -> float:
+    if _flat_rsi(avg_gain, avg_loss):
+        if not already_warned:
+            warnings.warn(
+                "RSI is NaN because average gain and average loss are both 0. "
+                "TA-Lib returns 0 for this fully flat window.",
+                IndicatorLint,
+                stacklevel=3,
+            )
+        return math.nan
     if avg_loss == 0.0:
-        if avg_gain == 0.0:
-            return 0.0
         return 100.0
     return 100.0 * avg_gain / (avg_gain + avg_loss)
 
@@ -339,9 +367,7 @@ def _true_range(high: list[float], low: list[float], close: list[float], index: 
 
 
 def _period(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_PERIOD:
-        raise IndicatorError(f"{name} must be an integer from 1 to 500")
-    return value
+    return as_period(value, name)
 
 
 def _band_width(value: object) -> float:
@@ -354,18 +380,7 @@ def _band_width(value: object) -> float:
 
 
 def _series(values: object, name: str) -> list[float]:
-    if isinstance(values, (str, bytes)) or values is None:
-        raise IndicatorError(f"{name} must be a sequence of numbers")
-    try:
-        iterator = iter(values)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise IndicatorError(f"{name} must be a sequence of numbers") from exc
-    data: list[float] = []
-    for item in iterator:
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise IndicatorError(f"{name} must be a sequence of numbers")
-        data.append(float(item))
-    return data
+    return as_float_series(values, name)
 
 
 def _same_length(names: tuple[str, ...], series: tuple[list[float], ...]) -> None:

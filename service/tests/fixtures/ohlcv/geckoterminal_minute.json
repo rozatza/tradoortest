@@ -1,0 +1,12 @@
+{
+  "data": {
+    "id": "synthetic-minute",
+    "type": "ohlcv_request_response",
+    "attributes": {
+      "ohlcv_list": [
+        [1700000100, 1.5, 1.6, 1.4, 1.55, 4.0],
+        [1700000040, 1.0, 1.2, 0.5, 1.5, 10.0]
+      ]
+    }
+  }
+}
