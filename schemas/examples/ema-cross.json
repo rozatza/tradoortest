@@ -1,0 +1,106 @@
+{
+  "ir_version": "1.0",
+  "strategy": {
+    "id": "ema_cross_sol",
+    "name": "EMA cross",
+    "description": "Enter long when the fast EMA crosses above the slow EMA. Exit when it crosses back below."
+  },
+  "engine": {
+    "bar_size": "1h",
+    "event": "bar_close",
+    "fill_price_mode": "on_close",
+    "warmup_bars": 26
+  },
+  "capital": {
+    "initial": 10000,
+    "currency": "USDC"
+  },
+  "costs": {
+    "commission_bps": 10,
+    "slippage_bps": 5
+  },
+  "assets": [
+    {
+      "id": "sol",
+      "symbol": "SOL",
+      "chain": "solana",
+      "market": "spot",
+      "quote": "USDC"
+    }
+  ],
+  "derived_series": [
+    {
+      "id": "ema_fast",
+      "kind": "indicator",
+      "indicator": "ema",
+      "source": "close",
+      "params": { "period": 12 }
+    },
+    {
+      "id": "ema_slow",
+      "kind": "indicator",
+      "indicator": "ema",
+      "source": "close",
+      "params": { "period": 26 }
+    }
+  ],
+  "signals": [
+    {
+      "id": "ema_buy",
+      "expr": {
+        "op": "cross_above",
+        "args": [
+          { "op": "ref", "name": "ema_fast" },
+          { "op": "ref", "name": "ema_slow" }
+        ]
+      }
+    },
+    {
+      "id": "ema_sell",
+      "expr": {
+        "op": "cross_below",
+        "args": [
+          { "op": "ref", "name": "ema_fast" },
+          { "op": "ref", "name": "ema_slow" }
+        ]
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "enter_sol",
+      "type": "enter",
+      "side": "long",
+      "asset": "sol",
+      "order": { "type": "market" },
+      "sizing": { "mode": "percent_equity", "percent": 25 },
+      "risk": {
+        "type": "oco",
+        "evaluation": "on_entry_fill",
+        "movement": "tighten_only",
+        "take_profit": { "mode": "percent", "percent": 8 },
+        "stop_loss": { "mode": "percent", "percent": 4 }
+      }
+    },
+    {
+      "id": "exit_sol",
+      "type": "exit",
+      "side": "long",
+      "asset": "sol",
+      "order": { "type": "market" },
+      "sizing": { "mode": "percent_position", "percent": 100 }
+    }
+  ],
+  "rules": [
+    { "id": "enter_on_ema_buy", "when": "ema_buy", "do": "enter_sol" },
+    { "id": "exit_on_ema_sell", "when": "ema_sell", "do": "exit_sol" }
+  ],
+  "portfolio": {
+    "mode": "spot",
+    "direction": "long_only",
+    "chain": "solana",
+    "max_positions": 1,
+    "allow_pyramiding": false,
+    "quote_currency": "USDC"
+  }
+}

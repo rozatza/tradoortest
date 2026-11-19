@@ -1,0 +1,503 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rozatza/tradoortest/schemas/strategy-ir-v1.schema.json",
+  "title": "Strategy IR v1",
+  "description": "Canonical JSON IR for one spot, long-only strategy on Solana. ir_version is the string constant \"1.0\" (the token \"1\" is rejected). There is no short side, no leverage, and no chain other than solana.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ir_version",
+    "strategy",
+    "engine",
+    "capital",
+    "costs",
+    "assets",
+    "derived_series",
+    "signals",
+    "actions",
+    "rules",
+    "portfolio"
+  ],
+  "properties": {
+    "ir_version": {
+      "description": "Only the string \"1.0\" is canonical IR v1. \"1\" does not match.",
+      "const": "1.0"
+    },
+    "strategy": { "$ref": "#/$defs/strategy" },
+    "engine": { "$ref": "#/$defs/engine" },
+    "capital": { "$ref": "#/$defs/capital" },
+    "costs": { "$ref": "#/$defs/costs" },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "derived_series": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/derived_series" }
+    },
+    "signals": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/signal" }
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "portfolio": { "$ref": "#/$defs/portfolio" }
+  },
+  "$defs": {
+    "ident": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]{0,15}$"
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 2000 }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bar_size", "event", "fill_price_mode", "warmup_bars"],
+      "properties": {
+        "bar_size": {
+          "enum": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
+        },
+        "event": { "const": "bar_close" },
+        "fill_price_mode": { "const": "on_close" },
+        "warmup_bars": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      }
+    },
+    "capital": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial", "currency"],
+      "properties": {
+        "initial": {
+          "description": "Starting quote balance. Zero and negative values are rejected.",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000000000
+        },
+        "currency": { "const": "USDC" }
+      }
+    },
+    "costs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commission_bps", "slippage_bps"],
+      "properties": {
+        "commission_bps": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "slippage_bps": { "type": "number", "minimum": 0, "maximum": 10000 }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Spot market on Solana. Leverage is not a property. chain and market are constants.",
+      "required": ["id", "symbol", "chain", "market", "quote"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "symbol": { "$ref": "#/$defs/symbol" },
+        "chain": { "const": "solana" },
+        "market": { "const": "spot" },
+        "quote": { "const": "USDC" }
+      }
+    },
+    "derived_series": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["id", "kind", "indicator", "source", "params"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "kind": { "const": "indicator" },
+        "indicator": {
+          "enum": ["sma", "ema", "rsi", "atr", "macd", "bollinger", "stochastic"]
+        },
+        "source": { "$ref": "#/$defs/ident" },
+        "params": { "type": "object" },
+        "output": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        { "$ref": "#/$defs/indicator_sma" },
+        { "$ref": "#/$defs/indicator_ema" },
+        { "$ref": "#/$defs/indicator_rsi" },
+        { "$ref": "#/$defs/indicator_atr" },
+        { "$ref": "#/$defs/indicator_macd" },
+        { "$ref": "#/$defs/indicator_bollinger" },
+        { "$ref": "#/$defs/indicator_stochastic" }
+      ]
+    },
+    "period_param": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500
+    },
+    "indicator_sma": {
+      "if": {
+        "properties": { "indicator": { "const": "sma" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "not": { "required": ["output"] },
+        "properties": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["period"],
+            "properties": { "period": { "$ref": "#/$defs/period_param" } }
+          }
+        }
+      }
+    },
+    "indicator_ema": {
+      "if": {
+        "properties": { "indicator": { "const": "ema" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "not": { "required": ["output"] },
+        "properties": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["period"],
+            "properties": { "period": { "$ref": "#/$defs/period_param" } }
+          }
+        }
+      }
+    },
+    "indicator_rsi": {
+      "if": {
+        "properties": { "indicator": { "const": "rsi" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "not": { "required": ["output"] },
+        "properties": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["period"],
+            "properties": {
+              "period": { "type": "integer", "minimum": 2, "maximum": 500 }
+            }
+          }
+        }
+      }
+    },
+    "indicator_atr": {
+      "if": {
+        "properties": { "indicator": { "const": "atr" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "not": { "required": ["output"] },
+        "properties": {
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["period"],
+            "properties": { "period": { "$ref": "#/$defs/period_param" } }
+          }
+        }
+      }
+    },
+    "indicator_macd": {
+      "if": {
+        "properties": { "indicator": { "const": "macd" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "required": ["output"],
+        "properties": {
+          "output": { "enum": ["macd", "signal", "histogram"] },
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fast", "slow", "signal"],
+            "properties": {
+              "fast": { "$ref": "#/$defs/period_param" },
+              "slow": { "$ref": "#/$defs/period_param" },
+              "signal": { "$ref": "#/$defs/period_param" }
+            }
+          }
+        }
+      }
+    },
+    "indicator_bollinger": {
+      "if": {
+        "properties": { "indicator": { "const": "bollinger" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "required": ["output"],
+        "properties": {
+          "output": { "enum": ["lower", "middle", "upper"] },
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["period", "stddev"],
+            "properties": {
+              "period": { "$ref": "#/$defs/period_param" },
+              "stddev": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 }
+            }
+          }
+        }
+      }
+    },
+    "indicator_stochastic": {
+      "if": {
+        "properties": { "indicator": { "const": "stochastic" } },
+        "required": ["indicator"]
+      },
+      "then": {
+        "required": ["output"],
+        "properties": {
+          "output": { "enum": ["k", "d"] },
+          "params": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["k_period", "d_period"],
+            "properties": {
+              "k_period": { "$ref": "#/$defs/period_param" },
+              "d_period": { "$ref": "#/$defs/period_param" }
+            }
+          }
+        }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "expr"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "expr": { "$ref": "#/$defs/expr" }
+      }
+    },
+    "expr": {
+      "oneOf": [
+        { "$ref": "#/$defs/expr_lit" },
+        { "$ref": "#/$defs/expr_ref" },
+        { "$ref": "#/$defs/expr_unary" },
+        { "$ref": "#/$defs/expr_binary" },
+        { "$ref": "#/$defs/expr_call" }
+      ]
+    },
+    "expr_lit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "value"],
+      "properties": {
+        "op": { "const": "lit" },
+        "value": { "type": ["number", "boolean"] }
+      }
+    },
+    "expr_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "name"],
+      "properties": {
+        "op": { "const": "ref" },
+        "name": { "$ref": "#/$defs/ident" }
+      }
+    },
+    "expr_unary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "arg"],
+      "properties": {
+        "op": { "enum": ["not", "neg"] },
+        "arg": { "$ref": "#/$defs/expr" }
+      }
+    },
+    "expr_binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "left", "right"],
+      "properties": {
+        "op": {
+          "enum": ["add", "sub", "mul", "div", "gt", "gte", "lt", "lte", "eq", "neq", "and", "or"]
+        },
+        "left": { "$ref": "#/$defs/expr" },
+        "right": { "$ref": "#/$defs/expr" }
+      }
+    },
+    "expr_call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "args"],
+      "properties": {
+        "op": { "enum": ["cross_above", "cross_below", "bars_since", "entry_price"] },
+        "args": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/expr" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "op": { "enum": ["cross_above", "cross_below"] } },
+            "required": ["op"]
+          },
+          "then": { "properties": { "args": { "minItems": 2, "maxItems": 2 } } }
+        },
+        {
+          "if": {
+            "properties": { "op": { "const": "bars_since" } },
+            "required": ["op"]
+          },
+          "then": { "properties": { "args": { "minItems": 1, "maxItems": 1 } } }
+        },
+        {
+          "if": {
+            "properties": { "op": { "const": "entry_price" } },
+            "required": ["op"]
+          },
+          "then": { "properties": { "args": { "maxItems": 0 } } }
+        }
+      ]
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "side", "asset", "order", "sizing"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "type": { "enum": ["enter", "exit"] },
+        "side": {
+          "description": "Long only. sell_to_open and short are rejected. exit closes a long.",
+          "const": "long"
+        },
+        "asset": { "$ref": "#/$defs/ident" },
+        "order": { "$ref": "#/$defs/order" },
+        "sizing": { "$ref": "#/$defs/sizing" },
+        "risk": { "$ref": "#/$defs/oco_risk" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "enter" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["risk"],
+            "properties": {
+              "sizing": {
+                "properties": { "mode": { "const": "percent_equity" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "exit" } },
+            "required": ["type"]
+          },
+          "then": {
+            "not": { "required": ["risk"] },
+            "properties": {
+              "sizing": {
+                "properties": { "mode": { "const": "percent_position" } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "market" }
+      }
+    },
+    "sizing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "percent"],
+      "properties": {
+        "mode": { "enum": ["percent_equity", "percent_position"] },
+        "percent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+      }
+    },
+    "oco_risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Take-profit and stop-loss are one OCO pair. Both legs are required.",
+      "required": ["type", "evaluation", "movement", "take_profit", "stop_loss"],
+      "properties": {
+        "type": { "const": "oco" },
+        "evaluation": { "const": "on_entry_fill" },
+        "movement": { "const": "tighten_only" },
+        "take_profit": { "$ref": "#/$defs/percent_level" },
+        "stop_loss": { "$ref": "#/$defs/percent_level" }
+      }
+    },
+    "percent_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "percent"],
+      "properties": {
+        "mode": { "const": "percent" },
+        "percent": {
+          "description": "Percent from the entry fill. Must be greater than 0 and at most 100.",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "when", "do"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ident" },
+        "when": { "$ref": "#/$defs/ident" },
+        "do": { "$ref": "#/$defs/ident" }
+      }
+    },
+    "portfolio": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Spot, long-only, Solana. Direction, market, and chain are constants.",
+      "required": [
+        "mode",
+        "direction",
+        "chain",
+        "max_positions",
+        "allow_pyramiding",
+        "quote_currency"
+      ],
+      "properties": {
+        "mode": { "const": "spot" },
+        "direction": { "const": "long_only" },
+        "chain": { "const": "solana" },
+        "max_positions": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "allow_pyramiding": { "type": "boolean" },
+        "quote_currency": { "const": "USDC" }
+      }
+    }
+  }
+}
