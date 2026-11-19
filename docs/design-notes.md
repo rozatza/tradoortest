@@ -42,6 +42,6 @@ When multi-user auth exists, replace the body of `get_current_user`. Rows alread
 
 - Accounts, sessions, invites, or access-control lists.
 - Wallets, private keys, signing, transaction building, swaps, or order routing.
-- A DSL parser, indicator math, market data, or a backtester.
+- The strategy-file parser, indicator math, market data, or a backtester. Expression text is parsed by `service/app/expr`.
 
 `.env.example` has no values. Do not commit secrets.

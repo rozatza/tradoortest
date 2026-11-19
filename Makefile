@@ -15,10 +15,15 @@ help:
 
 install: $(STAMP_PY) $(STAMP_WEB)
 
-$(STAMP_PY): service/pyproject.toml
+# service/requirements.lock is a hashed pin of service/pyproject.toml.
+# Regenerate with:
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras --extra=dev \
+#     --output-file=service/requirements.lock service/pyproject.toml
+$(STAMP_PY): service/pyproject.toml service/requirements.lock
 	$(PYTHON) -m venv $(VENV)
 	$(PY) -m pip install -U pip
-	$(PY) -m pip install -e "./service[dev]"
+	$(PY) -m pip install --require-hashes -r service/requirements.lock
+	$(PY) -m pip install --no-deps --no-build-isolation -e "./service"
 	touch $(STAMP_PY)
 
 $(STAMP_WEB): web/package-lock.json

@@ -7,7 +7,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | Path | What it is |
 | --- | --- |
 | `web/` | Next.js placeholder page. No product features. |
-| `service/` | FastAPI app. `GET /health`, the auth seam, and the IR validator. |
+| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, and the expression parser (`app/expr`). |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
 | `docs/dsl-spec.md` | Strategy DSL and IR contract. |
 | `docs/design-notes.md` | `user_id` on stored rows, and the single-user auth seam. |
@@ -24,7 +24,7 @@ make install
 make test
 ```
 
-`make test` creates `.venv`, installs the service (including dev tools), installs `web/` dependencies when the lockfile changes, then runs ruff, pytest, and the web typecheck and production build. CI runs that same `make test` target.
+`make test` creates `.venv`, installs Python dependencies from the hashed lock `service/requirements.lock`, installs `web/` dependencies when the lockfile changes, then runs ruff, pytest, and the web typecheck and production build. CI runs that same `make test` target.
 
 Copy `.env.example` only if you want a local env file. It has no values. Do not put secrets in it.
 
