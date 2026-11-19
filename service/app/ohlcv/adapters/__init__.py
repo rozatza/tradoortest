@@ -17,6 +17,10 @@ def open_source(name: str = "geckoterminal") -> OhlcvSource:
         from app.ohlcv.adapters.geckoterminal import GeckoTerminalSource
 
         return GeckoTerminalSource()
+    if name == "any-mint":
+        from app.ohlcv.adapters.any_mint import AnyMintSource
+
+        return AnyMintSource()
     raise SourceError(
         f"unknown OHLCV source {name!r}. "
         "Add an adapter that implements fetch_bars(mint, timeframe, start, end)."

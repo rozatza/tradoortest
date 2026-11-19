@@ -115,6 +115,7 @@ class GeckoTerminalSource:
         min_interval: float = 12.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        pace: _Pace | None = None,
     ) -> None:
         if page_limit < 1 or page_limit > _PAGE_LIMIT:
             raise ValueError("page_limit must be from 1 to 1000")
@@ -123,7 +124,8 @@ class GeckoTerminalSource:
         self._pools = POOLS if pools is None else pools
         self._page_limit = page_limit
         self._sleep = sleep
-        self._pace = _Pace(min_interval, sleep, monotonic)
+        # A shared pace keeps the pool lookup and the candle calls on one clock.
+        self._pace = _Pace(min_interval, sleep, monotonic) if pace is None else pace
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:

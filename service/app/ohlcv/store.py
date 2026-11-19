@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Protocol
 
 from app.ohlcv.bars import Bar, BarRejection, validate_bar
-from app.ohlcv.errors import StoreError
+from app.ohlcv.errors import IngestExpired, StoreError
 from app.ohlcv.gaps import spans_touching
 from app.ohlcv.synthetic import synthetic_minutes
 
@@ -66,6 +66,32 @@ CREATE TABLE IF NOT EXISTS rejections (
     reasons TEXT NOT NULL,
     stored_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, mint, timeframe, open_time)
+)
+"""
+
+# Pool choice and the ingest document are provider results. They use the
+# same TTL and the same ``_purge`` as the bars. Birdeye rows are not kept
+# longer than GeckoTerminal rows.
+_PROVIDER_TABLES = """
+CREATE TABLE IF NOT EXISTS pool_resolutions (
+    user_id TEXT NOT NULL,
+    mint TEXT NOT NULL,
+    address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    quote_token TEXT NOT NULL,
+    liquidity_usd TEXT NOT NULL,
+    resolved_at INTEGER NOT NULL,
+    pool_created_at INTEGER,
+    provider TEXT NOT NULL,
+    stored_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, mint)
+);
+CREATE TABLE IF NOT EXISTS ingest_results (
+    user_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    stored_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, job_id)
 )
 """
 
@@ -189,7 +215,8 @@ class SqliteBarStore:
         self._ttl = ttl_seconds
         self._now = (lambda: int(time.time())) if now is None else now
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path)
+        # The HTTP handler runs on a worker thread. This process is one user.
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         self._ensure_schema()
         self._purge()
 
@@ -502,6 +529,127 @@ class SqliteBarStore:
             if timeframe == "1m":
                 self._rewrite_synthetics(user_id, mint, window_start, window_end)
 
+    def save_pool(
+        self,
+        *,
+        user_id: str,
+        mint: str,
+        address: str,
+        dex: str,
+        quote_token: str,
+        liquidity_usd: str,
+        resolved_at: int,
+        pool_created_at: int | None,
+        provider: str,
+    ) -> None:
+        """Remember the pool chosen for ``mint``. The row expires with the bars."""
+        self._purge()
+        _owner(user_id)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO pool_resolutions (
+                    user_id, mint, address, dex, quote_token, liquidity_usd,
+                    resolved_at, pool_created_at, provider, stored_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, mint) DO UPDATE SET
+                    address = excluded.address,
+                    dex = excluded.dex,
+                    quote_token = excluded.quote_token,
+                    liquidity_usd = excluded.liquidity_usd,
+                    resolved_at = excluded.resolved_at,
+                    pool_created_at = excluded.pool_created_at,
+                    provider = excluded.provider,
+                    stored_at = excluded.stored_at
+                """,
+                (
+                    user_id,
+                    mint,
+                    address,
+                    dex,
+                    quote_token,
+                    liquidity_usd,
+                    resolved_at,
+                    pool_created_at,
+                    provider,
+                    int(self._now()),
+                ),
+            )
+
+    def load_pool(self, *, user_id: str, mint: str) -> dict[str, object] | None:
+        """The fresh pool row, or ``None`` after the TTL has deleted it."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT address, dex, quote_token, liquidity_usd, resolved_at,
+                   pool_created_at, provider
+            FROM pool_resolutions
+            WHERE user_id = ? AND mint = ?
+            """,
+            (user_id, mint),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "address": row[0],
+            "dex": row[1],
+            "quote_token": row[2],
+            "liquidity_usd": row[3],
+            "resolved_at": row[4],
+            "pool_created_at": row[5],
+            "provider": row[6],
+        }
+
+    def save_ingest_result(self, *, user_id: str, job_id: str, payload: dict[str, object]) -> None:
+        """Store the job result. It is deleted by the same purge as the bars."""
+        self._purge()
+        _owner(user_id)
+        if not isinstance(job_id, str) or job_id == "":
+            raise StoreError("job_id is required")
+        text = json.dumps(payload)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO ingest_results (user_id, job_id, payload, stored_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, job_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    stored_at = excluded.stored_at
+                """,
+                (user_id, job_id, text, int(self._now())),
+            )
+
+    def read_ingest_result(self, *, user_id: str, job_id: str) -> dict[str, object] | None:
+        """Return the result, or raise ``IngestExpired`` when this read deletes it.
+
+        A missing id is ``None``. A row that has reached the TTL is deleted
+        here, together with the other expired provider rows, and the caller
+        reports that as gone.
+        """
+        _owner(user_id)
+        row = self._conn.execute(
+            "SELECT payload, stored_at FROM ingest_results WHERE user_id = ? AND job_id = ?",
+            (user_id, job_id),
+        ).fetchone()
+        if row is None:
+            self._purge()
+            return None
+        expired = int(row[1]) <= int(self._now()) - self._ttl
+        self._purge()
+        if expired:
+            raise IngestExpired("the ingest result has expired")
+        loaded = self._conn.execute(
+            "SELECT payload FROM ingest_results WHERE user_id = ? AND job_id = ?",
+            (user_id, job_id),
+        ).fetchone()
+        if loaded is None:
+            return None
+        payload = json.loads(loaded[0])
+        if not isinstance(payload, dict):
+            raise StoreError("stored ingest result is not an object")
+        return payload
+
     def _ensure_schema(self) -> None:
         self._conn.executescript(_CREATE)
         bars = {row[1] for row in self._conn.execute("PRAGMA table_info(bars)")}
@@ -509,17 +657,16 @@ class SqliteBarStore:
         rejections = {row[1] for row in self._conn.execute("PRAGMA table_info(rejections)")}
         fresh = {"synthetic", "stored_at"} <= bars and {"stored_at", "empty"} <= fetched
         fresh = fresh and "stored_at" in rejections
-        if fresh:
-            self._conn.commit()
-            return
-        self._conn.executescript(
-            """
-            DROP TABLE IF EXISTS bars;
-            DROP TABLE IF EXISTS fetched;
-            DROP TABLE IF EXISTS rejections;
-            """
-        )
-        self._conn.executescript(_CREATE)
+        if not fresh:
+            self._conn.executescript(
+                """
+                DROP TABLE IF EXISTS bars;
+                DROP TABLE IF EXISTS fetched;
+                DROP TABLE IF EXISTS rejections;
+                """
+            )
+            self._conn.executescript(_CREATE)
+        self._conn.executescript(_PROVIDER_TABLES)
         self._conn.commit()
 
     def _purge(self) -> None:
@@ -529,6 +676,8 @@ class SqliteBarStore:
             self._conn.execute("DELETE FROM bars WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM fetched WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM rejections WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM pool_resolutions WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM ingest_results WHERE stored_at <= ?", (cutoff,))
 
     def _rewrite_synthetics(self, user_id: str, mint: str, start: int, end: int) -> None:
         """Rebuild 1m synthetic bars on every fetched span that touches the window.

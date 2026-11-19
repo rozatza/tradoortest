@@ -1,0 +1,32 @@
+{
+  "synthetic": true,
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "o": 1.0,
+        "h": 1.2,
+        "l": 0.8,
+        "c": 1.1,
+        "v": 3.0,
+        "v_usd": 4.0,
+        "unix_time": 1699999980,
+        "address": "synthetic-mint",
+        "type": "1m",
+        "currency": "usd"
+      },
+      {
+        "o": 1.1,
+        "h": 1.4,
+        "l": 1.0,
+        "c": 1.3,
+        "v": 5.0,
+        "v_usd": 6.0,
+        "unix_time": 1700000100,
+        "address": "synthetic-mint",
+        "type": "1m",
+        "currency": "usd"
+      }
+    ]
+  }
+}

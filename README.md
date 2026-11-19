@@ -42,7 +42,7 @@ Run the API locally, after `make install`:
 
 `GET /health` returns `{"status": "ok"}`. `POST /backtests` starts a simulation job for the local user. Status and results are `GET /backtests/{job_id}` and `GET /backtests/{job_id}/results`. The queue is a SQLite file, `data/backtest-jobs.sqlite`, which git ignores. Details are in `docs/jobs.md`. The web placeholder is `npm run dev --prefix web`.
 
-Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Details, rate limits, and the gap report are in `docs/ohlcv.md`.
+Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Any other Solana mint is `--mints`. GeckoTerminal stays the primary source. Birdeye is an optional fallback and stays off unless `BIRDEYE_API_KEY` is set in the environment. Details, rate limits, and the gap report are in `docs/ohlcv.md`. A local live check, not part of CI, is `scripts/acceptance_roz92.py`.
 
 ```bash
 .venv/bin/python -m app.ohlcv.backfill --days 90

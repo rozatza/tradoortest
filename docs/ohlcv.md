@@ -6,7 +6,7 @@ This is one user. Each row has `user_id`, always the auth seam's `local-user`. T
 
 ## Phase 1 choice
 
-ROZ-69 named Birdeye, Bitquery, and Helius, with Postgres or Parquet for storage. Phase 1 does not do that. It uses the keyless GeckoTerminal API and SQLite behind `BarStore`. A long-history store, with a licensed provider, is deferred to ROZ-92.
+ROZ-69 named Birdeye, Bitquery, and Helius, with Postgres or Parquet for storage. Phase 1 does not do that. It uses the keyless GeckoTerminal API and SQLite behind `BarStore`. ROZ-92 adds any Solana mint on that same cache. It does not add a long-history store. Every provider row, including a Birdeye fallback, still expires within 24 hours.
 
 CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. Cached rows and fetched-range records live at most 24 hours. They are deleted on open, on every read and write, and when the store is closed, then fetched again. Attribution: data by GeckoTerminal / CoinGecko. The gap report includes that line.
 
@@ -34,7 +34,7 @@ A dense 90-day 1-minute fetch is 129,600 minutes. At 1,000 candles per call that
 
 Wrapped BTC and wrapped ETH are not in the list. These five are large assets that trade on Solana: SOL, the Jupiter token, the Jito token, Bonk, and dogwifhat.
 
-The registry (`service/app/ohlcv/registry.py`) is symbol to mint only. Pool addresses live in the GeckoTerminal adapter. A later source that can take any mint implements `fetch_bars(mint, timeframe, start, end)` and does not change the backfill. A durable history store, with a licensed provider, is ROZ-92.
+The registry (`service/app/ohlcv/registry.py`) is symbol to mint only. The five majors keep the pool addresses in the GeckoTerminal adapter, and an unknown mint is still refused before a request. Any other mint uses `open_source("any-mint")` or `--mints`, which resolves a pool and then calls the same `fetch_bars(mint, timeframe, start, end)` seam. There is still no durable history store.
 
 Pools were picked on 2026-11-19: created more than 90 days earlier, and the deepest SOL or USDC pair for that mint among pools that old. The deep JUP/USDC pool created 2026-11-10 was skipped because it is newer than the window.
 
@@ -54,9 +54,9 @@ Pools were picked on 2026-11-19: created more than 90 days earlier, and the deep
 | Binance public klines | Off-chain CEX | No | Yes, several years | Free. Higher rate limit. | The book is not a Solana pool. |
 | Coinbase Exchange public candles | Off-chain CEX | No | Yes for listed products. 300 candles per call. | Free | Not all five assets are listed. |
 | Kraken public OHLC | Off-chain CEX | No | No. About 720 recent candles, roughly 12 hours of 1m. | Free | Not enough history. |
-| Birdeye | On-chain | Yes (`X-API-KEY`) | Free Standard is 30,000 compute units per month, 1 request/second, and limited data access. One 90-day 1m pass might fit the unit budget. The plan does not promise that history. | Free tier, then paid | Named by ROZ-69. Not built. A licensed long-history store is ROZ-92. |
+| Birdeye | On-chain | Yes, header `X-API-KEY` from `BIRDEYE_API_KEY` only | Free Standard: 30,000 compute units per month and 1 request/second. `padding` is false. | Free Standard only. No paid-plan headers or a faster default. | Optional fallback inside `any-mint`. Off, and not an error, when the key is unset. |
 | Bitquery | On-chain | Yes | Named by ROZ-69. Not evaluated as the Phase 1 source. | Paid plans | Not used. |
-| Helius | On-chain RPC | Yes | No OHLCV product. Bars would be derived from transactions. | Free tier with a key | Named by ROZ-69. Not built. A licensed long-history store is ROZ-92. |
+| Helius | On-chain RPC | Yes | No OHLCV product. Bars would be derived from transactions. | Free tier with a key | Named by ROZ-69. Not built. |
 
 No paid tier is used.
 
@@ -115,17 +115,17 @@ A rejected minute is missing. It is not a gap when the provider already answered
 
 ## Storage
 
-`BarStore` in `service/app/ohlcv/store.py` is the seam. `SqliteBarStore` is the Phase 1 cache. A Postgres or Parquet implementation would be another class with the same methods. No Postgres driver is installed, and no database URL is read. That durable store is ROZ-92, with a licensed provider.
+`BarStore` in `service/app/ohlcv/store.py` is the seam. `SqliteBarStore` is the cache. A Postgres or Parquet implementation would be another class with the same methods. No Postgres driver is installed, and no database URL is read. ROZ-92 did not add that store. Pool choices and ingest job results live in the same SQLite file and expire on the same clock as the bars.
 
 The file is `ohlcv.sqlite` under `OHLCV_DATA_DIR`, or `./data` when that variable is unset. `data/` is gitignored. Do not commit bar files, gap reports, or SQLite sidecars. The committed fixtures are synthetic and tiny, and each one is labeled `synthetic: true`.
 
-The TTL defaults to 24 hours. `--cache-ttl-hours` or `OHLCV_CACHE_TTL_HOURS` can set a shorter one. A value above 24 hours is rejected with a message about the CoinGecko API terms. It is not clamped. `nan` and `inf` are rejected with that same one-line message. On open, on every read and write, and on close, rows, rejections, and fetched-range records with `stored_at + ttl <= now` are deleted. They are treated as missing and fetched again. Each fetched page is its own row with its own clock, so a newer page does not keep an older page alive. A synthetic bar uses the `stored_at` of the real close it copies, so it expires with that trade.
+The TTL defaults to 24 hours. `--cache-ttl-hours` or `OHLCV_CACHE_TTL_HOURS` can set a shorter one. A value above 24 hours is rejected with a message about the CoinGecko API terms. It is not clamped. `nan` and `inf` are rejected with that same one-line message. On open, on every read and write, and on close, rows, rejections, fetched-range records, pool choices, and ingest results with `stored_at + ttl <= now` are deleted. A Birdeye series uses that same purge. It is not kept longer. They are treated as missing and fetched again. Each fetched page is its own row with its own clock, so a newer page does not keep an older page alive. A synthetic bar uses the `stored_at` of the real close it copies, so it expires with that trade.
 
 The primary key of a bar is `(user_id, mint, timeframe, open_time)`. Inserting the same key again replaces the OHLC values. The same input leaves the same row.
 
 ## Gap report
 
-The CLI prints JSON and writes the same document when `--report` is set. `forward_filled` is always false: the provider is not asked to copy a close forward. `synthetic_no_trade` is true because 1m no-trade minutes are stored as flagged flat bars. `attribution` is `Data by GeckoTerminal / CoinGecko`.
+The CLI prints JSON and writes the same document when `--report` is set. `forward_filled` is always false: the provider is not asked to copy a close forward. `synthetic_no_trade` is true because 1m no-trade minutes are stored as flagged flat bars. `attribution` is `Data by GeckoTerminal / CoinGecko`, or `Data by Birdeye` when every series in that run was served by the fallback.
 
 Counts are per symbol and timeframe. `coverage_pct` is real bars divided by the expected grid, as a percent. `real` counts provider candles. `synthetic` counts flagged no-trade bars. `present` is those two, so a quiet 1m minute counts as present and is not missing. `missing` is `expected - present`. `unfetched` counts grid points no fetched span covers. `no_trade` is the synthetic count on 1m, and on 5m and above it is the number of omitted native buckets after history has started. `long_no_trade_minutes` is the threshold for this report. `long_no_trade` lists quiet runs strictly longer than that threshold, with `start`, `end`, and `minutes`. `suspect_outage` is true when that list is not empty. Those runs are not gaps.
 
@@ -175,6 +175,30 @@ The 00:01 candle was not repaired. 00:02 and 00:04 are synthetic bars with volum
 
 A window whose first candle is later than the start lists that leading range under `gaps` even though the span was fetched. `unfetched` stays 0 for that range. A native 5m bucket the provider omitted after the first candle is `no_trade`, not a gap. An empty page is a response with no candles at all: history that has not started, or a short page that comes back empty. It is a gap, and it is not filled with synthetic bars. A real mid-history GeckoTerminal outage does not look like that. The API returns the older candles, the quiet minutes stay synthetic, and a run longer than the threshold sets `suspect_outage`.
 
+## Any Solana mint
+
+`--mints` takes comma-separated mint addresses. It does not take the five symbols. Pass `--symbols` or `--mints`, not both. An empty `--mints` exits 1. A mint that is not the base58 encoding of 32 bytes is `invalid mint` before any request, and the text does not echo the input. The five majors are unchanged: `GeckoTerminalSource` still refuses a mint that is not in its pool map before a request.
+
+The any-mint source asks GeckoTerminal for pools, one page of up to 20 by default (`--pool-pages` raises that). GeckoTerminal orders that page by a blend of liquidity and volume. This code re-ranks it. The tie-break, among eligible DEX pools, is:
+
+1. Highest `reserve_in_usd`, as a base-10 decimal. A missing, non-numeric, or negative reserve is not eligible.
+2. If liquidity is equal, the earlier `pool_created_at` wins. A missing timestamp loses.
+3. If those still tie, the lexicographically smallest pool address wins.
+
+A pump.fun bonding curve is not eligible. That is a dex id of `pump-fun`, `pumpfun`, or `pump.fun`, or `launchpad_details.completed` set to false. PumpSwap (`pumpswap`) is a DEX pool after migration and stays eligible. When every candidate is a bonding curve, the error is `no DEX pool yet` (API `no_dex_pool_yet`, HTTP 422). When there is no pool and the token is not an ungraduated launchpad, the error is `no pool for mint <mint>` (API `no_pool`, HTTP 404). The CLI exits 1 with that one line.
+
+The chosen pool is on the ingest result, the CLI JSON, and `GET /ohlcv/jobs/{job_id}`: address, dex, dex id, quote token, quote symbol, liquidity at resolution, and `resolved_at`. Each series also records `provider` (`geckoterminal` or `birdeye`).
+
+`--days` above 180 is a clear error before any request. The window is not clamped. The API code is `history_limit`, HTTP 400.
+
+GeckoTerminal calls share the 12-second pace with the pool lookup. HTTP 429 and HTTP 5xx retry up to five times. The call cap defaults to 180 (`--gt-max-calls` or `OHLCV_GT_MAX_CALLS`). Exhausting the cap or the retries is HTTP 429 `rate_limit`, and the message does not include the response body.
+
+Birdeye `GET /defi/v3/ohlcv` runs only when `BIRDEYE_API_KEY` is set, and only when GeckoTerminal has no pool, has no DEX pool yet, or returned a pool whose candle page was empty. A partial series is not replaced. The key is sent as the `X-API-KEY` header. It is not put in the query, a fixture, a log line, an error, or a repr. Unset, blank, or whitespace means the fallback is skipped and is not an error. The pace is 1 request per second. The compute-unit budget defaults to 30,000 (`--birdeye-cu-budget` or `BIRDEYE_CU_BUDGET`) and is not raised on its own. The next call is refused before it is sent when the budget cannot pay for the candles that were asked for. A successful HTTP 200 is what gets billed. `padding` and `outlier` are false, so a missing minute is not copied forward and a candle is not dropped for us. A month counter may be written to `birdeye-cu.json` under the data directory. That file holds the period and the used count. It does not hold the key.
+
+Flags describe the stored series. They do not add bars. `short_history` means the first real bar is after the window start, or there are fewer real bars than `--warmup-bars`. Nothing is back-filled. `sparse` means fewer than half the expected bars are real, once the grid is at least four bars. `zero_volume` counts real bars whose volume is 0 and keeps them. `young_pool` means the pool was created inside the window, or it is younger than the window. A hole the provider left empty is a gap. Neighbor closes are not averaged and not copied across that hole. A 1m minute inside a fetched span that had no trade is still the existing synthetic bar. That is not a gap and `forward_filled` stays false.
+
+`POST /ohlcv/jobs` runs the ingest for the local user and returns the same JSON. A `user_id` in the body is ignored. `GET /ohlcv/jobs/{job_id}` returns it until the 24-hour purge. The read that deletes an expired row is HTTP 410 `expired`. An id that is already gone is HTTP 404.
+
 ## Run the backfill
 
 From the repo root, after `make install`:
@@ -195,7 +219,19 @@ Useful flags:
   --cache-ttl-hours 24
 ```
 
-`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits 1. `--days` above 180 exits 1 before any request. `--cache-ttl-hours` above 24 hours, or `nan`, or `inf`, does too. `--long-no-trade-minutes` below 1 does too. Usage errors from the argument parser also exit 1. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A transport error or a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit 1 with one error line on stderr and no traceback. The report path is checked before any request, including a parent directory that exists but is not writable. Ctrl-C exits 130 and does not print a traceback. Progress lines are separate from that error line.
+`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits 1. `--days` above 180 exits 1 before any request, for `--symbols` and for `--mints`. The window is not clamped. `--cache-ttl-hours` above 24 hours, or `nan`, or `inf`, does too. `--long-no-trade-minutes` below 1 does too. Usage errors from the argument parser also exit 1. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A transport error or a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit 1 with one error line on stderr and no traceback. The report path is checked before any request, including a parent directory that exists but is not writable. Ctrl-C exits 130 and does not print a traceback. Progress lines are separate from that error line.
+
+Any mint, one day of 5-minute bars:
+
+```bash
+.venv/bin/python -m app.ohlcv.backfill \
+  --mints <mint> \
+  --days 1 \
+  --timeframes 5m \
+  --data-dir data
+```
+
+`--warmup-bars` applies only with `--mints`. It flags a short series. It does not invent bars.
 
 ## Environment
 
@@ -203,9 +239,12 @@ Useful flags:
 | --- | --- | --- |
 | `OHLCV_DATA_DIR` | No | Directory for `ohlcv.sqlite`. Default `./data`. |
 | `OHLCV_CACHE_TTL_HOURS` | No | How long cached rows are kept. Default 24. Above 24 is rejected. |
+| `BIRDEYE_API_KEY` | No | Turns on the Birdeye fallback. Unset means off. Never printed. |
+| `BIRDEYE_CU_BUDGET` | No | Compute-unit budget for that fallback. Default 30000. |
+| `OHLCV_GT_MAX_CALLS` | No | GeckoTerminal call cap for one any-mint run. Default 180. |
 
-There is no provider API key variable. `.env.example` lists the names and has no values.
+`.env.example` lists the names and has no values. The Birdeye key is not one of those values.
 
 ## Tests
 
-`make test` does not call the network. `service/tests/conftest.py` blocks `socket.connect`, `socket.connect_ex`, `socket.create_connection`, and DNS for every test. The adapter tests use `httpx.MockTransport` and the committed fixtures under `service/tests/fixtures/ohlcv/`. Both fixtures are synthetic and labeled `synthetic: true`. They have no headers, no key, and no account id. `geckoterminal_sparse_synthetic.json` is shaped like a thin JUP or WIF pool. It is not a live response.
+`make test` does not call the network. `service/tests/conftest.py` blocks `socket.connect`, `socket.connect_ex`, `socket.create_connection`, and DNS for every test. The adapter tests use `httpx.MockTransport` and the committed fixtures under `service/tests/fixtures/ohlcv/`. Those fixtures are synthetic and labeled `synthetic: true`. They have no headers, no key, and no account id. `geckoterminal_sparse_synthetic.json` is shaped like a thin JUP or WIF pool. It is not a live response. `geckoterminal_pools_synthetic.json`, `geckoterminal_pump_synthetic.json`, and `birdeye_ohlcv_synthetic.json` are the any-mint fixtures. `scripts/acceptance_roz92.py` is a local live check. CI does not run it.
