@@ -6,7 +6,8 @@ a database URL.
 
 This is a TTL cache, not a long-term store. CoinGecko's API terms do not
 allow keeping the response. Rows and fetched-span records older than the
-TTL are deleted on open, read, and write. The TTL cannot exceed 24 hours.
+TTL are deleted on open, on every read and write, and on close. The TTL
+cannot exceed 24 hours.
 
 Rows carry ``user_id`` so a later session can filter on the auth seam.
 This process still serves one user. There is no user list and no sharing.
@@ -26,6 +27,7 @@ from typing import Protocol
 
 from app.ohlcv.bars import Bar, BarRejection, validate_bar
 from app.ohlcv.errors import StoreError
+from app.ohlcv.gaps import spans_touching
 from app.ohlcv.synthetic import synthetic_minutes
 
 # CoinGecko API terms §6: do not keep a persistent copy. 24h is the cap.
@@ -179,7 +181,16 @@ class SqliteBarStore:
         self._purge()
 
     def close(self) -> None:
-        self._conn.close()
+        """Purge expired rows, then close the file.
+
+        A process that exits through ``close`` does not leave expired bars
+        for the next open. A kill that skips ``close`` is purged on the
+        next open.
+        """
+        try:
+            self._purge()
+        finally:
+            self._conn.close()
 
     def upsert(self, bars: Sequence[Bar], *, user_id: str) -> int:
         self._purge()
@@ -444,52 +455,60 @@ class SqliteBarStore:
             self._conn.execute("DELETE FROM rejections WHERE stored_at <= ?", (cutoff,))
 
     def _rewrite_synthetics(self, user_id: str, mint: str, start: int, end: int) -> None:
-        """Replace 1m synthetic bars in the window. Caller holds the transaction."""
+        """Rebuild 1m synthetic bars on every fetched span that touches the window.
+
+        The rebuild covers the whole span, not only ``[start, end)``. A later
+        window therefore still sees a real close stored before ``start``, and
+        a long no-trade run is classified the same way no matter which window
+        was requested last. An unfetched hole splits the span, so that close
+        does not cross it. Caller holds the transaction.
+        """
         ranges = self._conn.execute(
             """
             SELECT start, end FROM fetched
             WHERE user_id = ? AND mint = ? AND timeframe = '1m'
-              AND start < ? AND end > ?
             """,
-            (user_id, mint, end, start),
+            (user_id, mint),
         ).fetchall()
-        real_rows = self._conn.execute(
-            """
-            SELECT open_time, close, stored_at FROM bars
-            WHERE user_id = ? AND mint = ? AND timeframe = '1m' AND synthetic = 0
-              AND open_time >= ? AND open_time < ?
-            """,
-            (user_id, mint, start, end),
-        ).fetchall()
-        rejected_rows = self._conn.execute(
-            """
-            SELECT open_time FROM rejections
-            WHERE user_id = ? AND mint = ? AND timeframe = '1m'
-              AND open_time >= ? AND open_time < ?
-            """,
-            (user_id, mint, start, end),
-        ).fetchall()
-        self._conn.execute(
-            """
-            DELETE FROM bars
-            WHERE user_id = ? AND mint = ? AND timeframe = '1m' AND synthetic = 1
-              AND open_time >= ? AND open_time < ?
-            """,
-            (user_id, mint, start, end),
-        )
-        built = synthetic_minutes(
-            mint=mint,
-            real={int(row[0]): (float(row[1]), int(row[2])) for row in real_rows},
-            rejected={int(row[0]) for row in rejected_rows},
-            covered=[(int(row[0]), int(row[1])) for row in ranges],
-            start=start,
-            end=end,
-        )
-        if built:
-            self._conn.executemany(
-                _UPSERT,
-                [_row(user_id, bar, stored_at) for bar, stored_at in built],
+        touching = spans_touching([(int(row[0]), int(row[1])) for row in ranges], start, end)
+        for lo, hi in touching:
+            real_rows = self._conn.execute(
+                """
+                SELECT open_time, close, stored_at FROM bars
+                WHERE user_id = ? AND mint = ? AND timeframe = '1m' AND synthetic = 0
+                  AND open_time >= ? AND open_time < ?
+                """,
+                (user_id, mint, lo, hi),
+            ).fetchall()
+            rejected_rows = self._conn.execute(
+                """
+                SELECT open_time FROM rejections
+                WHERE user_id = ? AND mint = ? AND timeframe = '1m'
+                  AND open_time >= ? AND open_time < ?
+                """,
+                (user_id, mint, lo, hi),
+            ).fetchall()
+            self._conn.execute(
+                """
+                DELETE FROM bars
+                WHERE user_id = ? AND mint = ? AND timeframe = '1m' AND synthetic = 1
+                  AND open_time >= ? AND open_time < ?
+                """,
+                (user_id, mint, lo, hi),
             )
+            built = synthetic_minutes(
+                mint=mint,
+                real={int(row[0]): (float(row[1]), int(row[2])) for row in real_rows},
+                rejected={int(row[0]) for row in rejected_rows},
+                covered=[(lo, hi)],
+                start=lo,
+                end=hi,
+            )
+            if built:
+                self._conn.executemany(
+                    _UPSERT,
+                    [_row(user_id, bar, stored_at) for bar, stored_at in built],
+                )
 
 
 def _owner(user_id: str) -> None:

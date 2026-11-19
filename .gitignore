@@ -11,5 +11,9 @@ web/.next/
 web/out/
 *.tsbuildinfo
 
-# Local OHLCV bars. Never commit this directory.
+# Local OHLCV bars. Never commit this directory or a sqlite file left elsewhere.
 data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

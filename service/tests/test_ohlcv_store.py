@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,7 @@ def test_bar_directory_is_gitignored() -> None:
     root = Path(__file__).resolve().parents[2]
     ignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "\ndata/\n" in f"\n{ignore}\n"
+    assert "\n*.sqlite\n" in f"\n{ignore}\n"
 
 
 def test_ttl_above_24_hours_is_rejected(tmp_path: Path) -> None:
@@ -180,6 +182,21 @@ def test_an_older_page_expires_without_extending_its_ttl(tmp_path: Path) -> None
         assert [bar.open_time for bar in stored] == [_T + 60]
     finally:
         store.close()
+
+
+def test_close_deletes_rows_that_have_reached_the_ttl(tmp_path: Path) -> None:
+    clock = {"now": 1_800_000_000}
+    path = tmp_path / "ohlcv.sqlite"
+    store = SqliteBarStore(path, ttl_seconds=60, now=lambda: clock["now"])
+    store.upsert([_bar()], user_id=LOCAL_USER_ID)
+    clock["now"] += 60
+    store.close()
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM bars").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM fetched").fetchone() == (0,)
+    finally:
+        conn.close()
 
 
 def test_a_fetched_page_cannot_contain_a_synthetic_bar(tmp_path: Path) -> None:

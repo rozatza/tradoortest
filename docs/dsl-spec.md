@@ -78,7 +78,7 @@ engine:
   warmup_bars: 14
 ```
 
-Evaluation uses only data through the close of the current bar. The fill price is that close, then costs are applied (see costs). Bars inside the warmup window do not fire rules. Indicator outputs are empty during their own warmup; this schema does not invent those values.
+Evaluation uses only data through the close of the current bar. The fill price is that close, then costs are applied (see costs). Bars inside the warmup window do not fire rules. Indicator outputs are empty during their own warmup; this schema does not invent those values. `docs/backtest.md` is how the engine applies this section. It does not fill the entry `risk` pair. That pair is a later task.
 
 ## capital
 
@@ -198,7 +198,7 @@ A gap ends the run. The next run of `period` finite prices seeds a new EMA. The 
 
 `avg = (avg_prev * (period - 1) + current) / period`
 
-RSI is `100 * avg_gain / (avg_gain + avg_loss)` when the average loss is positive. It is 100 when the average loss is 0 and the average gain is positive. It is 0 when the average gain is 0 and the average loss is positive. RSI holds its last value when a market goes flat after a move (i.e. only fully flat windows with zero avg gain and zero avg loss are NaN). A fully flat window is NaN, and that call emits one `IndicatorLint` warning. TA-Lib returns 0 for the same window. This library does not. After a very long flat run, continued Wilder scaling underflows the averages into subnormal numbers and the ratio drifts toward 50; TA-Lib keeps scaling and can print 50. This library stops scaling once the next flat step would be subnormal or would flush a non-zero average to 0, so the last value stays put. The running averages are kept through the flat window, so a later non-zero change can produce a number without seeding again. The result is never infinite. A non-finite price is a different kind of gap: it ends the run, and the next RSI waits for `period + 1` new finite prices. The strategy schema still requires an RSI period of at least 2. The function is also defined for period 1.
+RSI is `100 * avg_gain / (avg_gain + avg_loss)` when the average loss is positive. It is 100 when the average loss is 0 and the average gain is positive. It is 0 when the average gain is 0 and the average loss is positive. RSI holds its last value when a market goes flat after a move (i.e. only fully flat windows with zero avg gain and zero avg loss are NaN). A fully flat window is NaN, and that call emits one `IndicatorLint` warning. TA-Lib returns 0 for the same window. This library does not. After a very long flat run, continued Wilder scaling underflows the averages into subnormal numbers and the ratio drifts toward 50; TA-Lib keeps scaling and can print 50. This library stops scaling once the next flat step would be subnormal or would flush a non-zero average to 0, so the last value stays put. The running averages are kept through the flat window, so a later non-zero change can produce a number without seeding again. The result is never infinite. A non-finite price is a different kind of gap: it ends the run, and the next RSI waits for `period + 1` new finite prices. The strategy schema still requires an RSI period of at least 2. The function is also defined for period 1. Period 1 keeps a single change. A flat bar sets both averages to 0, so that bar is NaN and the call emits one `IndicatorLint`. Period 1 does not hold the previous value. Period 2 and above still hold, because a flat step scales the averages by `(period - 1) / period` instead of clearing them.
 
 **ATR.** Wilder smoothing of true range. True range at bar `i` (`i ≥ 1`) is the greatest of `high - low`, `|high - previous close|`, and `|low - previous close|`. Bar 0 has no previous close, so it has no true range. The first ATR, at index `period`, is the SMA of the first `period` true ranges. Later bars use:
 
@@ -553,4 +553,4 @@ Each example is SOL spot on Solana, long-only, with an OCO take-profit and stop-
 
 ## Non-goals
 
-This spec does not define historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. Indicator math is the section above and `service/app/indicators`. The strategy file parser is `service/app/dsl`. Expression text is parsed by `service/app/expr`. The versioned save envelope is `docs/save-format.md`.
+This spec does not define historical data or any order route. The backtest that evaluates this IR is `docs/backtest.md`. It does not define wallets, keys, signing, or swaps. Indicator math is the section above and `service/app/indicators`. The strategy file parser is `service/app/dsl`. Expression text is parsed by `service/app/expr`. The versioned save envelope is `docs/save-format.md`.

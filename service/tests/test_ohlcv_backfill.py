@@ -18,6 +18,7 @@ from app.ohlcv.errors import SourceError, StoreError
 from app.ohlcv.registry import MAJORS, SOL_MINT
 from app.ohlcv.source import FetchPage, FetchResult
 from app.ohlcv.store import SqliteBarStore
+from app.ohlcv.synthetic import MAX_SYNTHETIC_RUN, synthetic_minutes
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
 _MINT = SOL_MINT
@@ -333,8 +334,15 @@ def test_sparse_window_is_one_call_and_a_rerun_does_not_refetch(tmp_path: Path) 
         section = report["series"][0]
         assert section["unfetched"] == 0
         assert section["real"] == 2
-        assert section["synthetic"] == 1438
-        assert section["gaps"] == []
+        assert section["synthetic"] == 0
+        assert section["missing"] == 1438
+        assert section["gaps"] == [
+            {
+                "start": "2026-01-01T00:02:00Z",
+                "end": "2026-01-02T00:00:00Z",
+                "missing": 1438,
+            }
+        ]
         assert section["coverage_pct"] == round(100.0 * 2 / 1440, 2)
         run_backfill(
             source=source,
@@ -451,7 +459,7 @@ def test_cli_rejects_a_user_id_flag(tmp_path: Path) -> None:
             source=MemorySource([]),
             now=_START + 86400,
         )
-    assert caught.value.code != 0
+    assert caught.value.code == 1
 
 
 def test_dns_failure_through_the_cli_is_one_line(
@@ -518,6 +526,7 @@ def test_bad_paths_and_sqlite_errors_are_one_line(
 
     report_parent = tmp_path / "report-parent"
     report_parent.write_text("x", encoding="utf-8")
+    report_source = MemorySource([_minute(0)])
     bad_report = main(
         [
             *args,
@@ -526,9 +535,10 @@ def test_bad_paths_and_sqlite_errors_are_one_line(
             "--report",
             str(report_parent / "gap.json"),
         ],
-        source=MemorySource([_minute(0)]),
+        source=report_source,
         now=now,
     )
+    assert report_source.calls == []
     report_err = capsys.readouterr().err
     assert bad_report == 1
     assert "Traceback" not in report_err
@@ -621,7 +631,7 @@ def test_cache_ttl_above_24_hours_is_rejected(
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert _cli_errors(err) == [
-        "cache TTL must be greater than 0 and at most 24 hours; "
+        "cache TTL must be a finite number of hours, greater than 0 and at most 24 hours; "
         "the CoinGecko API terms do not allow a longer store"
     ]
     monkeypatch.setenv("OHLCV_CACHE_TTL_HOURS", "25")
@@ -734,3 +744,250 @@ def test_prior_close_does_not_cross_an_unfetched_hole(tmp_path: Path) -> None:
         assert by_time[_START + 300].volume == 0.0
     finally:
         store.close()
+
+
+def test_synthetic_run_cap_and_prior_close_seed() -> None:
+    assert MAX_SYNTHETIC_RUN == 15
+    real_time = _START
+    seeded = synthetic_minutes(
+        mint=_MINT,
+        real={real_time: (2.5, 10)},
+        rejected=set(),
+        covered=[(real_time, real_time + 180)],
+        start=real_time + 60,
+        end=real_time + 180,
+    )
+    assert [bar.open_time for bar, _stored in seeded] == [real_time + 60, real_time + 120]
+    assert all(bar.synthetic and bar.close == 2.5 and bar.volume == 0.0 for bar, _stored in seeded)
+    short = synthetic_minutes(
+        mint=_MINT,
+        real={real_time: (1.0, 1)},
+        rejected=set(),
+        covered=[(real_time, real_time + 16 * 60)],
+        start=real_time,
+        end=real_time + 16 * 60,
+    )
+    assert len(short) == 15
+    long = synthetic_minutes(
+        mint=_MINT,
+        real={real_time: (1.0, 1)},
+        rejected=set(),
+        covered=[(real_time, real_time + 17 * 60)],
+        start=real_time,
+        end=real_time + 17 * 60,
+    )
+    assert long == []
+
+
+def test_a_long_no_trade_run_is_a_gap(tmp_path: Path) -> None:
+    end = _START + 21 * 60
+    later = _minute(20 * 60, high=4.0, close=3.0)
+    source = MemorySource([_minute(0), later])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert [bar.open_time for bar in stored] == [_START, _START + 20 * 60]
+        assert all(not bar.synthetic for bar in stored)
+        section = report["series"][0]
+        assert section["synthetic"] == 0
+        assert section["unfetched"] == 0
+        assert section["gaps"] == [
+            {
+                "start": "2026-01-01T00:01:00Z",
+                "end": "2026-01-01T00:20:00Z",
+                "missing": 19,
+            }
+        ]
+    finally:
+        store.close()
+
+
+def test_shifted_windows_store_the_same_series_in_either_order(tmp_path: Path) -> None:
+    later = Bar(_MINT, "1m", _START + 300, 3.0, 5.0, 2.0, 4.0, 1.0)
+    windows = [(_START, _START + 300), (_START + 120, _START + 480)]
+
+    def series(name: str, order: list[tuple[int, int]]) -> list[tuple[int, float, bool]]:
+        source = MemorySource([_minute(0), later])
+        store = SqliteBarStore(tmp_path / name / "ohlcv.sqlite")
+        try:
+            for start, end in order:
+                run_backfill(
+                    source=source,
+                    store=store,
+                    assets=(MAJORS[0],),
+                    start=start,
+                    end=end,
+                    timeframes=("1m",),
+                    user_id=LOCAL_USER_ID,
+                    generated_at=end,
+                )
+            stored = store.load(
+                user_id=LOCAL_USER_ID,
+                mint=_MINT,
+                timeframe="1m",
+                start=_START,
+                end=_START + 480,
+            )
+            return [(bar.open_time, bar.close, bar.synthetic) for bar in stored]
+        finally:
+            store.close()
+
+    forward = series("forward", windows)
+    backward = series("backward", list(reversed(windows)))
+    assert forward == backward
+    by_time = {open_time: (close, synthetic) for open_time, close, synthetic in forward}
+    assert by_time[_START + 120] == (1.5, True)
+    assert by_time[_START + 240] == (1.5, True)
+    assert by_time[_START + 300] == (4.0, False)
+    assert by_time[_START + 360] == (4.0, True)
+
+
+def test_short_page_before_the_window_start_is_a_leading_gap(tmp_path: Path) -> None:
+    end = _START + 600
+    candles = [
+        [_START + 540, 1.0, 2.0, 0.5, 1.5, 1.0],
+        [_START + 480, 1.0, 2.0, 0.5, 1.5, 1.0],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "include_empty_intervals" not in request.url.params
+        before = int(request.url.params["before_timestamp"])
+        limit = int(request.url.params["limit"])
+        page = sorted((row for row in candles if row[0] <= before), reverse=True)[:limit]
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, page_limit=2, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 2
+        assert section["synthetic"] == 0
+        assert section["unfetched"] == 0
+        assert section["gaps"] == [
+            {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:08:00Z", "missing": 8}
+        ]
+    finally:
+        store.close()
+        client.close()
+
+
+def test_history_that_starts_mid_window_is_a_leading_gap(tmp_path: Path) -> None:
+    # One short page. The adapter records coverage from the window start,
+    # and the minutes before the first candle are a gap.
+    end = _START + 600
+    candle = [_START + 300, 1.0, 2.0, 0.5, 1.5, 1.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": [candle]}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 1
+        assert section["unfetched"] == 0
+        assert section["gaps"][0] == {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:05:00Z",
+            "missing": 5,
+        }
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert stored[0].open_time == _START + 300
+        assert stored[0].synthetic is False
+        assert any(bar.synthetic for bar in stored)
+    finally:
+        store.close()
+        client.close()
+
+
+def test_ctrl_c_exits_130_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Interrupt:
+        name = "memory"
+
+        def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+            raise KeyboardInterrupt
+
+    code = main(
+        ["--days", "1", "--symbols", "SOL", "--timeframes", "1m", "--data-dir", str(tmp_path)],
+        source=Interrupt(),
+        now=_START + 86400,
+    )
+    assert code == 130
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+
+def test_nan_and_inf_ttl_are_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = MemorySource([_minute(0)])
+    code = main(
+        [
+            "--days",
+            "1",
+            "--symbols",
+            "SOL",
+            "--timeframes",
+            "1m",
+            "--data-dir",
+            str(tmp_path),
+            "--cache-ttl-hours",
+            "nan",
+        ],
+        source=source,
+        now=_START + 86400,
+    )
+    assert code == 1
+    assert source.calls == []
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert err.strip().count("\n") == 0
+    assert "finite" in err
+    monkeypatch.setenv("OHLCV_CACHE_TTL_HOURS", "inf")
+    again = main(
+        ["--days", "1", "--symbols", "SOL", "--timeframes", "1m", "--data-dir", str(tmp_path)],
+        source=source,
+        now=_START + 86400,
+    )
+    assert again == 1
+    assert source.calls == []
+    assert "finite" in capsys.readouterr().err
+    assert "Traceback" not in capsys.readouterr().err

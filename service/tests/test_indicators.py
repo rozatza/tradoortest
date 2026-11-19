@@ -237,6 +237,28 @@ def test_rsi_does_not_drift_toward_50_on_a_very_long_flat_run() -> None:
     assert not math.isnan(values[-1])
 
 
+def test_rsi_period_one_flat_bar_is_nan_and_warns() -> None:
+    # Period 1 keeps one change. A flat step clears both averages, so the
+    # value is NaN and the call lints. It must not hold the previous 100.
+    with pytest.warns(IndicatorLint, match="average gain and average loss are both 0") as caught:
+        after_a_move = rsi([10.0, 12.0, 12.0], 1)
+    assert len(caught) == 1
+    assert math.isnan(after_a_move[0])
+    assert after_a_move[1] == 100.0
+    assert math.isnan(after_a_move[2])
+    with pytest.warns(IndicatorLint, match="average gain and average loss are both 0") as flat:
+        fully_flat = rsi([4.0, 4.0, 4.0, 4.0], 1)
+    assert len(flat) == 1
+    assert math.isnan(fully_flat[0])
+    assert all(math.isnan(value) for value in fully_flat[1:])
+    # The cleared averages are the next change, not a new seed wait.
+    with pytest.warns(IndicatorLint, match="average gain and average loss are both 0"):
+        resumed = rsi([10.0, 12.0, 12.0, 14.0], 1)
+    assert resumed[1] == 100.0
+    assert math.isnan(resumed[2])
+    assert resumed[3] == 100.0
+
+
 def test_rsi_holds_its_last_value_when_the_market_goes_flat_after_a_move() -> None:
     # Period 2. Changes +2, -2, then two flat bars. The ratio stays 50.
     with warnings.catch_warnings(record=True) as caught:

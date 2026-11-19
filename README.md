@@ -7,7 +7,8 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | Path | What it is |
 | --- | --- |
 | `web/` | Next.js placeholder page. No product features. |
-| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), and historical OHLCV ingest (`app/ohlcv`). |
+| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), historical OHLCV ingest (`app/ohlcv`), and the backtest engine (`app/backtest`). |
+| `docs/backtest.md` | How the engine fills market orders on bar close. Simulation only. |
 | `docs/ohlcv.md` | Provider, cost, timeframes, bar checks, and the backfill command. |
 | `data/` | Local OHLCV cache. Gitignored. Expires within 24 hours. Not created until a backfill runs. |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |

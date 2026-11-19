@@ -7,16 +7,21 @@ were never fetched. After the TTL, those spans are gone and are fetched
 again.
 
 1m minutes inside a fetched span with no candle become flagged synthetic
-flat bars once a real close exists in that span. Minutes before that close
-stay missing. Higher timeframes are native GeckoTerminal aggregates. They
-are not built from 1m bars. Rejected candles stay rejected and are not
-repaired.
+flat bars once a real close exists in that span, for a run of at most 15
+minutes. A longer no-trade run is a gap. Minutes before the first close in
+the span are a leading gap, including when the provider's history starts
+inside the window. The prior close is seeded from the fetched span even
+when that close sits before the current window, and it does not cross an
+unfetched hole. Higher timeframes are native GeckoTerminal aggregates. They
+are not built from 1m bars. A missing native bucket is a gap. Rejected
+candles stay rejected and are not repaired.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -284,8 +289,17 @@ def _iso(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class _Parser(argparse.ArgumentParser):
+    """Usage errors exit 1, the same code as every other CLI failure."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="python -m app.ohlcv.backfill",
         description="Fetch native OHLCV for SOL and majors into a 24-hour cache.",
     )
@@ -346,6 +360,8 @@ def main(
     active: OhlcvSource | None = None
     owns_source = source is None
     try:
+        if args.report is not None:
+            _prepare_report_path(Path(args.report))
         assets = require_assets(symbols)
         timeframes = tuple(part.strip() for part in args.timeframes.split(",") if part.strip())
         clock = int(time.time()) if now is None else now
@@ -360,16 +376,16 @@ def main(
             start=start,
             end=end,
             timeframes=timeframes,
-                user_id=LOCAL_USER_ID,
-                generated_at=clock,
-                progress=_progress,
-            )
+            user_id=LOCAL_USER_ID,
+            generated_at=clock,
+            progress=_progress,
+        )
         text = json.dumps(report, indent=2) + "\n"
         if args.report is not None:
-            destination = Path(args.report)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
+            Path(args.report).write_text(text, encoding="utf-8")
         sys.stdout.write(text)
+    except KeyboardInterrupt:
+        return 130
     except (SourceError, StoreError, ValueError, OSError, sqlite3.Error) as exc:
         print(_one_line(exc), file=sys.stderr)
         return 1
@@ -383,8 +399,18 @@ def main(
     return 0
 
 
+_TTL_ERROR = (
+    "cache TTL must be a finite number of hours, greater than 0 and at most 24 hours; "
+    "the CoinGecko API terms do not allow a longer store"
+)
+
+
 def _ttl_seconds(hours: float | None) -> int:
-    """Resolve the cache TTL. Above 24 hours is an error, not a silent clamp."""
+    """Resolve the cache TTL. Above 24 hours is an error, not a silent clamp.
+
+    ``nan`` and ``inf`` are rejected with the same one-line message. They are
+    not clamped and they are not turned into a zero TTL.
+    """
     if hours is None:
         raw = os.environ.get("OHLCV_CACHE_TTL_HOURS")
         if raw is None or raw.strip() == "":
@@ -392,23 +418,28 @@ def _ttl_seconds(hours: float | None) -> int:
         try:
             hours = float(raw)
         except ValueError as exc:
-            raise ValueError(
-                "OHLCV_CACHE_TTL_HOURS must be a number of hours, at most 24"
-            ) from exc
-    if hours <= 0 or hours > 24:
-        raise ValueError(
-            "cache TTL must be greater than 0 and at most 24 hours; "
-            "the CoinGecko API terms do not allow a longer store"
-        )
+            raise ValueError(_TTL_ERROR) from exc
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)):
+        raise ValueError(_TTL_ERROR)
+    if not math.isfinite(hours) or hours <= 0 or hours > 24:
+        raise ValueError(_TTL_ERROR)
     seconds = int(hours * 3600)
     if seconds < 1:
         seconds = 1
     if seconds > MAX_CACHE_TTL_SECONDS:
-        raise ValueError(
-            "cache TTL must be greater than 0 and at most 24 hours; "
-            "the CoinGecko API terms do not allow a longer store"
-        )
+        raise ValueError(_TTL_ERROR)
     return seconds
+
+
+def _prepare_report_path(path: Path) -> None:
+    """Fail before any fetch when the report cannot be written."""
+    if path.exists() and path.is_dir():
+        raise ValueError(f"report path {path} is a directory")
+    parent = path.parent
+    if parent.exists() and not parent.is_dir():
+        raise ValueError(f"report directory {parent} is not a directory")
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
 
 
 def _progress(message: str) -> None:

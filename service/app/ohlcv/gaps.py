@@ -63,6 +63,37 @@ def gap_ranges(present: set[int], start: int, end: int, step: int) -> tuple[GapR
     )
 
 
+def merged_spans(covered: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlaps and abutments. An unfetched hole stays a hole.
+
+    The result is not clipped to a window, so a span can start before the
+    caller's current request.
+    """
+    merged: list[list[int]] = []
+    for lo, hi in sorted(covered):
+        if lo >= hi:
+            continue
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+def spans_touching(
+    covered: Sequence[tuple[int, int]], start: int, end: int
+) -> list[tuple[int, int]]:
+    """Merged spans that overlap ``[start, end)``.
+
+    A returned span may start before ``start`` and end after ``end``.
+    Abutting spans are one span. A hole between two fetches keeps them apart,
+    so a prior close on the far side of that hole is not in this span.
+    """
+    if end < start:
+        raise ValueError("gap window is not aligned to the timeframe")
+    return [(lo, hi) for lo, hi in merged_spans(covered) if lo < end and hi > start]
+
+
 def covered_spans(
     covered: Sequence[tuple[int, int]], start: int, end: int
 ) -> list[tuple[int, int]]:
@@ -115,15 +146,24 @@ def series_report(
 ) -> SeriesReport:
     """Count the grid.
 
-    ``gaps`` are only the grid points the provider has not answered. A minute
-    inside a fetched span is not a gap, whether it holds a real bar, a
-    flagged synthetic bar, a rejection, or nothing (no prior close yet).
+    ``gaps`` are grid points with no bar. That is every never-fetched point,
+    plus provider-missing points inside a fetched span: a leading range
+    before the first candle, a 1m no-trade run that was too long to store as
+    a synthetic bar, and a missing native bucket at 5m or above. A rejected
+    minute is not a gap. A flagged synthetic bar is not a gap.
+    ``unfetched`` counts only points no fetched span covers.
     ``coverage_pct`` is real bars divided by the expected grid, as a percent.
     """
     step = TIMEFRAME_SECONDS[timeframe]
     _check_window(start, end, step)
     expected = (end - start) // step
     unfetched_times: list[int] = []
+    gap_times: list[int] = []
+    rejected_times = {
+        item.open_time
+        for item in rejected
+        if isinstance(item.open_time, int) and not isinstance(item.open_time, bool)
+    }
     real_count = 0
     synthetic_count = 0
     cursor = start
@@ -134,8 +174,14 @@ def series_report(
             synthetic_count += 1
         if not _covers(cursor, fetched):
             unfetched_times.append(cursor)
+        # A rejected candle was answered and is reported on its own. It is
+        # not a gap. Everything else with no stored bar is a gap, including
+        # a point the provider never returned inside a fetched span.
+        if cursor not in real and cursor not in synthetic and cursor not in rejected_times:
+            gap_times.append(cursor)
         cursor += step
-    gaps = _ranges_from_times(unfetched_times, step)
+    gaps = _ranges_from_times(gap_times, step)
+    unfetched = _ranges_from_times(unfetched_times, step)
     present = real_count + synthetic_count
     coverage = 0.0 if expected == 0 else round(100.0 * real_count / expected, 2)
     return SeriesReport(
@@ -150,7 +196,7 @@ def series_report(
         present=present,
         missing=expected - present,
         coverage_pct=coverage,
-        unfetched=sum(gap.missing for gap in gaps),
+        unfetched=sum(gap.missing for gap in unfetched),
         gaps=gaps,
         rejected=rejected,
     )

@@ -8,7 +8,7 @@ This is one user. Each row has `user_id`, always the auth seam's `local-user`. T
 
 ROZ-69 named Birdeye, Bitquery, and Helius, with Postgres or Parquet for storage. Phase 1 does not do that. It uses the keyless GeckoTerminal API and SQLite behind `BarStore`. A long-history store, with a licensed provider, is deferred to ROZ-92.
 
-CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. Cached rows and fetched-range records live at most 24 hours, then they are deleted and fetched again. Attribution: data by GeckoTerminal / CoinGecko. The gap report includes that line.
+CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. Cached rows and fetched-range records live at most 24 hours. They are deleted on open, on every read and write, and when the store is closed, then fetched again. Attribution: data by GeckoTerminal / CoinGecko. The gap report includes that line.
 
 ## Provider
 
@@ -83,7 +83,11 @@ fetch_bars(mint, timeframe, start, end) -> bars
 
 Each requested timeframe is fetched on its own. Higher timeframes are not built from 1-minute bars. There is no 1m resample path.
 
-On 1m, a minute inside a fetched span with no candle becomes a flat synthetic bar: open, high, low, and close are the previous real close, volume is 0, and `synthetic` is true. That flag is stored and it is on the bar the store returns. It is a no-trade minute, and it is not a trade. Minutes before the first real bar in that span have no prior close, so they stay missing. Nothing is copied from before the span, and a prior close does not cross an unfetched hole. A rejected minute stays rejected. It is not turned into a synthetic bar. 5m and above are stored only as the provider returned them.
+On 1m, a short run of minutes inside a fetched span with no candle becomes flat synthetic bars: open, high, low, and close are the previous real close, volume is 0, and `synthetic` is true. That flag is stored and it is on the bar the store returns. It is a no-trade minute, and it is not a trade. A run is at most 15 consecutive minutes. A longer run is a gap, not a row of flat bars, so a multi-hour outage is not stored as hours of silent synthetics. The 15 minutes are counted across the whole fetched span, not only inside the current window.
+
+The previous close is the latest real close in that same fetched span. A later window that starts in the middle of a span already fetched still uses that close, so the synthetic bars at the new window's start stay. The close does not come from before the span, and it does not cross an unfetched hole. Two runs that cover the same spans store the same series, whichever window was requested first.
+
+Minutes before the first real bar in a span have no prior close, so they stay missing and the gap report lists them. A rejected minute stays rejected. It is not turned into a synthetic bar and it is not a gap. 5m and above are stored only as the provider returned them. A missing native bucket inside a fetched span is a gap. Nothing is resampled from 1m and nothing is copied forward.
 
 The window is at least `--days` long (default 90). It is floored to the coarsest requested timeframe, which can add less than one of those bars.
 
@@ -111,7 +115,7 @@ A rejected minute is missing. It is not a gap when the provider already answered
 
 The file is `ohlcv.sqlite` under `OHLCV_DATA_DIR`, or `./data` when that variable is unset. `data/` is gitignored. Do not commit bar files, gap reports, or SQLite sidecars. The committed fixtures are synthetic and tiny, and each one is labeled `synthetic: true`.
 
-The TTL defaults to 24 hours. `--cache-ttl-hours` or `OHLCV_CACHE_TTL_HOURS` can set a shorter one. A value above 24 hours is rejected with a message about the CoinGecko API terms. It is not clamped. On open, and on every read and write, rows, rejections, and fetched-range records with `stored_at + ttl <= now` are deleted. They are treated as missing and fetched again. Each fetched page is its own row with its own clock, so a newer page does not keep an older page alive. A synthetic bar uses the `stored_at` of the real close it copies, so it expires with that trade.
+The TTL defaults to 24 hours. `--cache-ttl-hours` or `OHLCV_CACHE_TTL_HOURS` can set a shorter one. A value above 24 hours is rejected with a message about the CoinGecko API terms. It is not clamped. `nan` and `inf` are rejected with that same one-line message. On open, on every read and write, and on close, rows, rejections, and fetched-range records with `stored_at + ttl <= now` are deleted. They are treated as missing and fetched again. Each fetched page is its own row with its own clock, so a newer page does not keep an older page alive. A synthetic bar uses the `stored_at` of the real close it copies, so it expires with that trade.
 
 The primary key of a bar is `(user_id, mint, timeframe, open_time)`. Inserting the same key again replaces the OHLC values. The same input leaves the same row.
 
@@ -119,7 +123,7 @@ The primary key of a bar is `(user_id, mint, timeframe, open_time)`. Inserting t
 
 The CLI prints JSON and writes the same document when `--report` is set. `forward_filled` is always false: the provider is not asked to copy a close forward. `synthetic_no_trade` is true because 1m no-trade minutes are stored as flagged flat bars. `attribution` is `Data by GeckoTerminal / CoinGecko`.
 
-Counts are per symbol and timeframe. `coverage_pct` is real bars divided by the expected grid, as a percent. `real` counts provider candles. `synthetic` counts flagged no-trade bars. `present` is those two. `missing` is `expected - present`. `gaps` and `unfetched` are only ranges the provider failed to return or that were never fetched. A minute inside a fetched span is not a gap, including a rejected minute and a minute that is still empty because it sits before the first real close.
+Counts are per symbol and timeframe. `coverage_pct` is real bars divided by the expected grid, as a percent. `real` counts provider candles. `synthetic` counts flagged no-trade bars. `present` is those two. `missing` is `expected - present`. `unfetched` counts grid points no fetched span covers. `gaps` includes those points and every other grid point that has no stored bar, except a rejected minute. A leading range is a gap when the provider's history starts inside the window, or when a short page does not reach back to the window start. A 1m no-trade run longer than 15 minutes is a gap. A missing 5m, 15m, 1h, 4h, or 1d bucket inside a fetched span is a gap. A rejected minute is listed under `rejected` and is not a gap. A flagged synthetic bar is not a gap.
 
 Synthetic example (not a live response). SOL, five 1-minute slots. The span was fetched. 00:00 and 00:03 are real. 00:01 is rejected because high does not cover the close, so it is not a synthetic bar. 00:02 copies the 00:00 close. 00:04 copies the 00:03 close. Coverage is 2 / 5.
 
@@ -157,7 +161,9 @@ Synthetic example (not a live response). SOL, five 1-minute slots. The span was 
 }
 ```
 
-The 00:01 candle was not repaired. 00:02 and 00:04 are synthetic bars with volume 0 and `synthetic: true`. A later run inside the TTL does not request the span again.
+The 00:01 candle was not repaired. 00:02 and 00:04 are synthetic bars with volume 0 and `synthetic: true`. Each of those no-trade runs is one minute, under the 15-minute cap. A later run inside the TTL does not request the span again.
+
+A window whose first candle is later than the start lists that leading range under `gaps` even though the span was fetched. `unfetched` stays 0 for that range. The same is true of a native 5m bucket the provider omitted.
 
 ## Run the backfill
 
@@ -179,7 +185,7 @@ Useful flags:
   --cache-ttl-hours 24
 ```
 
-`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits non-zero. `--days` above 180 exits non-zero before any request. `--cache-ttl-hours` above 24 does too. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A connect or DNS failure, a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit non-zero with one error line on stderr and no traceback. Progress lines are separate from that error line.
+`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits 1. `--days` above 180 exits 1 before any request. `--cache-ttl-hours` above 24 hours, or `nan`, or `inf`, does too. Usage errors from the argument parser also exit 1. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A connect or DNS failure, a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit 1 with one error line on stderr and no traceback. The report path is checked before any request. Ctrl-C exits 130 and does not print a traceback. Progress lines are separate from that error line.
 
 ## Environment
 

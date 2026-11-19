@@ -1,4 +1,4 @@
-"""Indicator math for derived series and the later backtester.
+"""Indicator math for derived series and the backtester.
 
 The functions are pure. They do not read the network, a strategy file, or
 market data. See `docs/dsl-spec.md` for the formulas and warmup lengths.

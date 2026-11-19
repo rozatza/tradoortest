@@ -91,11 +91,14 @@ def test_sparse_pool_flags_synthetic_minutes_and_keeps_native_5m(tmp_path: Path)
         assert sections["1m"]["real"] == 2
         assert sections["1m"]["synthetic"] == 7
         assert sections["1m"]["coverage_pct"] == 20.0
-        assert sections["1m"]["gaps"] == []
         assert sections["1m"]["unfetched"] == 0
+        assert sections["1m"]["gaps"] == [
+            {"start": "2023-11-14T22:15:00Z", "end": "2023-11-14T22:16:00Z", "missing": 1}
+        ]
         assert sections["5m"]["real"] == 1
         assert sections["5m"]["synthetic"] == 0
-        assert sections["5m"]["gaps"] == []
+        assert sections["5m"]["missing"] == 1
+        assert sections["5m"]["gaps"][0]["missing"] == 1
         assert sections["5m"]["present"] == 1
         assert seen == [
             (f"/api/v2/networks/solana/pools/{seen[0][0].split('/')[6]}/ohlcv/minute", "1"),
