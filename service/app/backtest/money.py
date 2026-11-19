@@ -1,10 +1,10 @@
-"""Cent rounding from an exact rational.
+"""Cent rounding, and the fill-quantity grid.
 
-Quantity is notional divided by fill price. That quotient often does not
-terminate. Rounding it to 50 significant digits, then multiplying by the
-sale price, lands just off an exact half-cent. Half-even then keeps the
-wrong cent. ``quantize_cents`` rounds the fraction itself, so the cent is
-the half-even cent of the exact value.
+A fill quantity is notional divided by fill price, then rounded down to
+``1e-12``. That grid stands in for a token's base units. The quotient often
+does not terminate, and an unrounded quantity grows without a bound as a
+position is added to. ``quantize_cents`` then rounds ``qty * price`` itself,
+so the cent is the half-even cent of that grid quantity times the price.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from fractions import Fraction
 from app.backtest.errors import BacktestError
 
 _QTY_PREC = 50
+# A fill quantity is a whole number of these units. The grid stands in for a
+# token's base units: the engine does not model a mint's decimals.
+_QTY_UNITS = 10**12
 
 
 def quantize_cents(amount: Fraction) -> Decimal:
@@ -23,6 +26,23 @@ def quantize_cents(amount: Fraction) -> Decimal:
         return _cents(amount)
     except DecimalException as exc:
         raise BacktestError("order amount is outside the range this book can price") from exc
+
+
+def floor_qty(amount: Fraction) -> Decimal:
+    """Round a fill quantity down to the ``1e-12`` grid.
+
+    A buy uses this before the cash leaves the account, so the quantity
+    costs at most the notional it was given. Zero means the notional cannot
+    buy one unit.
+    """
+    if amount <= 0:
+        return Decimal(0)
+    scaled = amount * _QTY_UNITS
+    units = scaled.numerator // scaled.denominator
+    if units <= 0:
+        return Decimal(0)
+    # scaleb changes the exponent. It does not round through the caller's context.
+    return Decimal(units).scaleb(-12)
 
 
 def decimal_ratio(amount: Fraction) -> Decimal:

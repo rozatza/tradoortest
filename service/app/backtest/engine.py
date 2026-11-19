@@ -17,17 +17,19 @@ The decision for bar ``i`` reads bars ``0..i`` only. Indicator functions are
 the causal library in ``app.indicators``, called on the grid with holes left
 as NaN. A later bar cannot change an earlier fill.
 
-Metrics and the trade log are ``docs/metrics.md``. Quantity is an exact
-fraction. USDC cents are half-even from that fraction, not from a 50-digit
-approximation of it.
+Metrics and the trade log are ``docs/metrics.md``. A fill quantity is rounded
+down to ``1e-12``, a stand-in for a token's base units, so a buy never takes
+more than its notional. USDC cents are half-even of that grid quantity times
+the fill price.
 """
 
 from __future__ import annotations
 
 import math
 import warnings
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
 from fractions import Fraction
 from typing import Any
@@ -35,7 +37,7 @@ from typing import Any
 from app.backtest.errors import BacktestError
 from app.backtest.eval import EvalContext, EvalMemory, evaluate
 from app.backtest.metrics import Metrics, Trade, compute_metrics
-from app.backtest.money import decimal_ratio, quantize_cents
+from app.backtest.money import decimal_ratio, floor_qty, quantize_cents
 from app.backtest.quality import AssetFlags, QualityCounts, asset_flags, outage_lints
 from app.indicators import atr, bollinger, ema, macd, rsi, sma, stochastic
 from app.indicators.errors import IndicatorLint
@@ -128,16 +130,27 @@ class BacktestResult:
 
 @dataclass
 class _Position:
-    """``qty`` and ``cost`` are exact. ``cost`` is the open quote notional."""
+    """``qty`` is a multiple of ``1e-12``. ``cost`` is the open quote notional.
 
-    qty: Fraction
-    cost: Fraction
+    ``entry`` is ``cost / qty`` from the last fill. Bars that do not trade
+    read this stored average. They do not divide the position again.
+    """
+
+    qty: Decimal
+    cost: Decimal
+    entry: Decimal = Decimal("0")
 
     @property
     def entry_price(self) -> Decimal:
-        if self.qty == 0:
-            return Decimal("0")
-        return decimal_ratio(self.cost / self.qty)
+        return self.entry
+
+
+def _remember(position: _Position) -> None:
+    """Store the average fill. The next bars read ``entry`` and do not divide."""
+    if position.qty == 0:
+        position.entry = Decimal("0")
+        return
+    position.entry = position.cost / position.qty
 
 
 @dataclass
@@ -146,11 +159,11 @@ class _Acc:
 
     asset_id: str
     entry_time: int
-    qty: Fraction = field(default_factory=lambda: Fraction(0))
-    qty_entry: Fraction = field(default_factory=lambda: Fraction(0))
-    cost: Fraction = field(default_factory=lambda: Fraction(0))
-    entry_value: Fraction = field(default_factory=lambda: Fraction(0))
-    exit_value: Fraction = field(default_factory=lambda: Fraction(0))
+    qty: Decimal = Decimal(0)
+    qty_entry: Decimal = Decimal(0)
+    cost: Decimal = Decimal(0)
+    entry_value: Decimal = Decimal(0)
+    exit_value: Decimal = Decimal(0)
     entry_notional: Decimal = Decimal("0.00")
     exit_notional: Decimal = Decimal("0.00")
     buy_commission: Decimal = Decimal("0.00")
@@ -158,9 +171,10 @@ class _Acc:
     limit_below_low: bool = False
     exit_time: int | None = None
     # Open cost including the buy commission still attached to the open quantity.
-    basis: Fraction = field(default_factory=lambda: Fraction(0))
+    # Exact cents still open, as a rational. A partial sale splits this exactly.
+    basis: Fraction = Fraction(0)
     # Booked at each sell from the basis then open. Later buys do not rewrite it.
-    realized_exact: Fraction = field(default_factory=lambda: Fraction(0))
+    realized_exact: Fraction = Fraction(0)
 
 
 @dataclass
@@ -595,7 +609,7 @@ def _walk(
                         open_time,
                         asset_id,
                         side,
-                        decimal_ratio(qty),
+                        qty,
                         price,
                         notional,
                         commission,
@@ -628,7 +642,7 @@ def _walk(
         curve.append(EquityPoint(open_time, _equity(book, marks), book.cash))
     final_equity = curve[-1].equity if curve else initial
     positions = tuple(
-        OpenPosition(asset_id, decimal_ratio(position.qty), position.entry_price)
+        OpenPosition(asset_id, position.qty, position.entry_price)
         for asset_id, position in book.positions.items()
     )
     _require_exact_pnl(closed_acc, open_acc, book, marks, initial)
@@ -839,7 +853,7 @@ def _fill_oco(
             open_time,
             asset_id,
             side,
-            decimal_ratio(qty),
+            qty,
             price,
             notional,
             commission,
@@ -897,12 +911,12 @@ def _fill(
     max_positions: int,
     commission_bps: Decimal,
     slippage_bps: Decimal,
-) -> str | tuple[str, Fraction, Decimal, Decimal, Decimal]:
+) -> str | tuple[str, Decimal, Decimal, Decimal, Decimal]:
     """Apply one market order.
 
     A string is the skip reason. A tuple is
     ``(side, qty, price, notional, commission)`` after the book has changed.
-    ``qty`` is the exact fraction.
+    ``qty`` is the ``1e-12`` grid quantity.
     """
     asset_id = action["asset"]
     percent = _dec(action["sizing"]["percent"])
@@ -939,33 +953,43 @@ def _enter(
     max_positions: int,
     commission_bps: Decimal,
     slippage_bps: Decimal,
-) -> str | tuple[str, Fraction, Decimal, Decimal, Decimal]:
+) -> str | tuple[str, Decimal, Decimal, Decimal, Decimal]:
     existing = book.positions.get(asset_id)
     if existing is not None and not allow_pyramiding:
         return "pyramiding"
     if existing is None and len(book.positions) >= max_positions:
         return "max_positions"
     equity = _equity(book, marks)
-    budget = quantize_cents(Fraction(equity) * Fraction(percent) / 100)
+    budget = _cent(equity * percent / Decimal(100))
     spend = budget if budget <= book.cash else book.cash
     if spend <= 0:
         return "no_cash"
-    notional = quantize_cents(
-        Fraction(spend) * Fraction(_BPS) / (Fraction(_BPS) + Fraction(commission_bps))
-    )
-    if notional <= 0:
+    room = _cent(spend * _BPS / (_BPS + commission_bps))
+    if room <= 0:
         return "no_cash"
-    commission = spend - notional
     fill_price = close * (_BPS + slippage_bps) / _BPS
     if fill_price <= 0:
         return "no_cash"
-    qty = Fraction(notional) / Fraction(fill_price)
-    book.cash -= spend
+    # Down to the grid, so the quantity costs at most ``room``. The cash that
+    # leaves is the cent of that quantity, not the unspent dust.
+    qty = floor_qty(Fraction(room) / Fraction(fill_price))
+    if qty <= 0:
+        return "no_cash"
+    notional = _cent(qty * fill_price)
+    if notional <= 0 or notional > room:
+        return "no_cash"
+    commission = _cent(notional * commission_bps / _BPS)
+    if notional + commission > spend:
+        commission = spend - notional
+    book.cash -= notional + commission
     if existing is None:
-        book.positions[asset_id] = _Position(qty, Fraction(notional))
+        position = _Position(qty, notional)
+        _remember(position)
+        book.positions[asset_id] = position
     else:
         existing.qty += qty
-        existing.cost += Fraction(notional)
+        existing.cost += notional
+        _remember(existing)
     return ("buy", qty, fill_price, notional, commission)
 
 
@@ -977,21 +1001,21 @@ def _exit(
     *,
     commission_bps: Decimal,
     slippage_bps: Decimal,
-) -> str | tuple[str, Fraction, Decimal, Decimal, Decimal]:
+) -> str | tuple[str, Decimal, Decimal, Decimal, Decimal]:
     existing = book.positions.get(asset_id)
     if existing is None or existing.qty <= 0:
         return "no_position"
     if percent == Decimal(100):
         qty_exit = existing.qty
     else:
-        qty_exit = existing.qty * Fraction(percent) / 100
+        qty_exit = floor_qty(Fraction(existing.qty) * Fraction(percent) / 100)
     if qty_exit <= 0 or qty_exit > existing.qty:
         return "no_position"
     fill_price = close * (_BPS - slippage_bps) / _BPS
     if fill_price < 0:
         return "no_position"
-    notional = quantize_cents(qty_exit * Fraction(fill_price))
-    commission = quantize_cents(Fraction(notional) * Fraction(commission_bps) / Fraction(_BPS))
+    notional = _cent(qty_exit * fill_price)
+    commission = _cent(notional * commission_bps / _BPS)
     if commission > notional:
         commission = notional
     book.cash += notional - commission
@@ -1000,17 +1024,23 @@ def _exit(
     else:
         existing.cost = existing.cost * (existing.qty - qty_exit) / existing.qty
         existing.qty -= qty_exit
+        _remember(existing)
     return ("sell", qty_exit, fill_price, notional, commission)
 
 
+def _cent(amount: Decimal) -> Decimal:
+    """Half-even to 0.01. ``amount`` is already a bounded decimal."""
+    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+
 def _equity(book: _Book, marks: dict[str, Decimal]) -> Decimal:
-    total = Fraction(book.cash)
+    total = book.cash
     for asset_id, position in book.positions.items():
         price = marks.get(asset_id)
         if price is None:
             continue
-        total += position.qty * Fraction(price)
-    return quantize_cents(total)
+        total += position.qty * price
+    return _cent(total)
 
 
 def _dec(value: object) -> Decimal:
@@ -1031,7 +1061,7 @@ def _note_buy(
     open_acc: dict[str, _Acc],
     asset_id: str,
     open_time: int,
-    qty: Fraction,
+    qty: Decimal,
     price: Decimal,
     notional: Decimal,
     commission: Decimal,
@@ -1042,8 +1072,8 @@ def _note_buy(
         open_acc[asset_id] = acc
     acc.qty += qty
     acc.qty_entry += qty
-    acc.cost += Fraction(notional)
-    acc.entry_value += qty * Fraction(price)
+    acc.cost += notional
+    acc.entry_value += qty * price
     acc.entry_notional += notional
     acc.buy_commission += commission
     acc.basis += Fraction(notional) + Fraction(commission)
@@ -1054,7 +1084,7 @@ def _note_sell(
     closed_acc: list[_Acc],
     asset_id: str,
     open_time: int,
-    qty: Fraction,
+    qty: Decimal,
     price: Decimal,
     notional: Decimal,
     commission: Decimal,
@@ -1062,19 +1092,22 @@ def _note_sell(
 ) -> None:
     acc = open_acc[asset_id]
     previous = acc.qty
-    sold_basis = acc.basis * qty / previous
+    sold_basis = acc.basis * Fraction(qty) / Fraction(previous)
     acc.realized_exact += Fraction(notional) - Fraction(commission) - sold_basis
     acc.basis -= sold_basis
-    acc.exit_value += qty * Fraction(price)
+    if qty == previous:
+        acc.basis = Fraction(0)
+        acc.cost = Decimal(0)
+        acc.qty = Decimal(0)
+    else:
+        acc.cost = acc.cost * (previous - qty) / previous
+        acc.qty = previous - qty
+    acc.exit_value += qty * price
     acc.exit_notional += notional
     acc.sell_commission += commission
     acc.limit_below_low = acc.limit_below_low or limit_below_low
-    acc.cost = acc.cost * (previous - qty) / previous
-    acc.qty = previous - qty
     if acc.qty == 0:
         acc.exit_time = open_time
-        acc.cost = Fraction(0)
-        acc.basis = Fraction(0)
         closed_acc.append(acc)
         del open_acc[asset_id]
 
@@ -1090,17 +1123,32 @@ def _trades(
     ordered = [*closed_acc, *open_acc.values()]
     trades: list[Trade] = []
     exact_unrealized: list[Fraction] = []
+    # One prefix per asset. Each trade then reads its span in log(bars),
+    # instead of walking the whole grid.
+    prefixes = {
+        asset_id: (
+            _flag_prefix(flag.synthetic),
+            _flag_prefix(flag.missing),
+            _flag_prefix(flag.outage),
+        )
+        for asset_id, flag in flags.items()
+    }
     for number, acc in enumerate(ordered, start=1):
         end = grid[-1] if acc.exit_time is None else acc.exit_time
-        synthetic, missing, outage = _span(flags[acc.asset_id], grid, acc.entry_time, end)
+        synthetic_prefix, missing_prefix, outage_prefix = prefixes[acc.asset_id]
+        synthetic = _between(synthetic_prefix, grid, acc.entry_time, end)
+        missing = _between(missing_prefix, grid, acc.entry_time, end)
+        outage = _between(outage_prefix, grid, acc.entry_time, end)
         sold = acc.qty_entry - acc.qty
         status = "closed" if acc.qty == 0 else "open"
         realized, unrealized = _pnl(acc, marks.get(acc.asset_id))
         if status == "closed":
             unrealized = Decimal("0.00")
-        exit_price = decimal_ratio(acc.exit_value / sold) if sold > 0 else None
+        exit_price = decimal_ratio(Fraction(acc.exit_value) / Fraction(sold)) if sold > 0 else None
         entry_price = (
-            decimal_ratio(acc.entry_value / acc.qty_entry) if acc.qty_entry else Decimal("0")
+            decimal_ratio(Fraction(acc.entry_value) / Fraction(acc.qty_entry))
+            if acc.qty_entry
+            else Decimal("0")
         )
         qty = acc.qty_entry if status == "closed" else acc.qty
         minutes = outage * step // 60
@@ -1111,7 +1159,7 @@ def _trades(
                 status=status,
                 entry_time=acc.entry_time,
                 exit_time=acc.exit_time,
-                qty=decimal_ratio(qty),
+                qty=qty,
                 entry_price=entry_price,
                 exit_price=exit_price,
                 entry_notional=acc.entry_notional,
@@ -1151,7 +1199,7 @@ def _pnl(acc: _Acc, mark: Decimal | None) -> tuple[Decimal, Decimal]:
     if acc.qty == 0 or mark is None:
         unrealized = Decimal("0.00")
     else:
-        unrealized = quantize_cents(acc.qty * Fraction(mark) - acc.basis)
+        unrealized = quantize_cents(Fraction(acc.qty) * Fraction(mark) - acc.basis)
     return realized, unrealized
 
 
@@ -1173,14 +1221,14 @@ def _unrounded_equity(book: _Book, marks: Mapping[str, Decimal]) -> Fraction:
         price = marks.get(asset_id)
         if price is None:
             continue
-        total += position.qty * Fraction(price)
+        total += Fraction(position.qty) * Fraction(price)
     return total
 
 
 def _exact_unrealized(acc: _Acc, mark: Decimal | None) -> Fraction:
     if acc.qty == 0 or mark is None:
         return Fraction(0)
-    return acc.qty * Fraction(mark) - acc.basis
+    return Fraction(acc.qty) * Fraction(mark) - acc.basis
 
 
 def _require_exact_pnl(
@@ -1231,7 +1279,7 @@ def _spread_remainder(
     sign = 1 if cents > 0 else -1
 
     def _rank(index: int) -> tuple[Fraction, int]:
-        remainder = exact_unrealized[index] - Fraction(trades[index].unrealized_pnl)
+        remainder = Fraction(exact_unrealized[index]) - Fraction(trades[index].unrealized_pnl)
         # A positive gap fills the trades rounded down the most. A negative
         # gap takes the cent back from the trades rounded up the most.
         return (-sign * remainder, index)
@@ -1247,17 +1295,19 @@ def _spread_remainder(
     return tuple(patched)
 
 
-def _span(
-    flags: AssetFlags, grid: Sequence[int], start: int, end: int
-) -> tuple[int, int, int]:
-    synthetic = missing = outage = 0
-    for index, open_time in enumerate(grid):
-        if open_time < start or open_time > end:
-            continue
-        if flags.synthetic[index]:
-            synthetic += 1
-        if flags.missing[index]:
-            missing += 1
-        if flags.outage[index]:
-            outage += 1
-    return synthetic, missing, outage
+def _flag_prefix(flags: Sequence[bool]) -> list[int]:
+    """Inclusive counts. ``prefix[i]`` is the number of true flags before ``i``."""
+    prefix = [0]
+    total = 0
+    for flag in flags:
+        if flag:
+            total += 1
+        prefix.append(total)
+    return prefix
+
+
+def _between(prefix: Sequence[int], grid: Sequence[int], start: int, end: int) -> int:
+    """How many flagged slots have an open time in ``start..end``, inclusive."""
+    lo = bisect_left(grid, start)
+    hi = bisect_right(grid, end)
+    return prefix[hi] - prefix[lo]

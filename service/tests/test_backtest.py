@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 from decimal import ROUND_DOWN, Decimal, getcontext, localcontext
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
 from app.backtest import BacktestError, move_oco, run_backtest, trade_log_csv, trade_log_json
+from app.backtest.money import floor_qty
 from app.ohlcv.bars import Bar
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
@@ -239,9 +241,7 @@ def test_hand_computed_round_trip_matches_to_the_cent() -> None:
     assert buy.price == _BUY_PRICE
     assert buy.notional == _BUY_NOTIONAL
     assert buy.commission == _BUY_COMMISSION
-    with localcontext() as ctx:
-        ctx.prec = 50
-        assert buy.qty == _BUY_NOTIONAL / _BUY_PRICE
+    assert buy.qty == floor_qty(Fraction(_BUY_NOTIONAL) / Fraction(_BUY_PRICE))
     assert buy.equity_after == _EQUITY_AFTER_BUY
     assert sell.side == "sell"
     assert sell.price == _SELL_PRICE

@@ -56,10 +56,10 @@ Costs, from the IR, in basis points:
 
 - buy fill price = close × (1 + slippage_bps / 10000)
 - sell fill price = close × (1 − slippage_bps / 10000)
-- on a buy, the cash spent is the budget. Notional is that budget divided by (1 + commission_bps / 10000), rounded half-even to the cent. Commission is the budget minus the notional, so the two sum to the cash that leaves the account.
+- on a buy, the budget is capped by cash. The room for the position is that budget divided by (1 + commission_bps / 10000), rounded half-even to the cent. Quantity is that room divided by the fill price, rounded down to `1e-12`. Notional is the half-even cent of that quantity times the fill price, and it is at most the room. Commission is the notional times commission_bps / 10000, rounded the same way, and the two never exceed the budget. Unspent dust stays in cash.
 - on a sell, notional is quantity × fill price, rounded half-even to the cent. Commission is the notional × commission_bps / 10000, rounded the same way, and it is never more than the notional. Cash increases by notional − commission.
 
-The mark used for sizing is cash plus quantity × that bar's close, rounded half-even to the cent, before the fill. Reported equity uses the same rounding after the fill. The next decision uses that rounded mark. Quantity itself is not rounded to a cent.
+The mark used for sizing is cash plus quantity × that bar's close, rounded half-even to the cent, before the fill. Reported equity uses the same rounding after the fill. The next decision uses that rounded mark. Quantity is not rounded to a cent. At fill time it is rounded down to `1e-12`, a stand-in for a token's base units, so a buy never receives more than its budget can pay for. The cash spent is the cent of the quantity that was actually filled. A budget that cannot buy one unit is skipped (`no_cash`) and spends nothing. A 100% exit sells the open quantity exactly. A partial exit rounds that percent down to the same grid. The average fill price is stored on the fill and read on later bars. It is not divided again on a bar that does not trade.
 
 A second run with the same IR and the same bars returns the same fills, skips, and equity. The engine does not use the clock or a random source.
 
@@ -67,7 +67,7 @@ A second run with the same IR and the same bars returns the same fills, skips, a
 
 An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is moved onto `lints`. The warning is not also emitted to the caller. The text names the series and the asset, for example `stoch_k on sol: ...`. A tighten-only rejection is moved onto `lints` the same way. The lint is the `move_oco` message plus the asset and the bar open time, in unix seconds: `tighten_only rejected a looser stop_loss on sol at bar 1767225600`.
 
-USDC amounts use a local 50-digit decimal context and half-even cents. Quantity and open cost are kept as exact rationals. A cent is half-even of that rational, not of a quantity that was already rounded to 50 significant digits. Rounding the quantity first lands just off an exact half-cent, and the next multiply keeps the wrong cent: `43175 / 78.834 * 1.655514` is `906.675`, which half-even takes to `906.68`, while the 50-digit quantity produces `906.67`. `5049.495` rounds to `5049.50` and `5049.485` rounds to `5049.48`. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
+USDC amounts use a local 50-digit decimal context and half-even cents. The open quantity is a multiple of `1e-12` and the open cost is the cents spent on what is still open. A cent is half-even of that grid quantity times the price. `5049.495` rounds to `5049.50` and `5049.485` rounds to `5049.48`. The unrounded product `43175 / 78.834 * 1.655514` is `906.675`, which half-even takes to `906.68`. The grid quantity is one `1e-12` unit smaller, the product is `906.6749999999994`, and the cent is `906.67`. A 50-digit rounding of the unrounded quantity would have landed on the same `906.67` from the other side. The hand round trip and the hand OCO pair sit far from a half-cent, and their cents do not move. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
 
 ## No look-ahead
 
@@ -81,7 +81,7 @@ Buy fill = 100 × 10005 / 10000 = 100.05.
 Budget = 5000.00.
 Notional = round half-even of 5000 × 10000 / 10010 = round half-even of 4995.004995… = 4995.00.
 Commission = 5000.00 − 4995.00 = 5.00.
-Quantity = 4995.00 / 100.05.
+Quantity = 4995.00 / 100.05, rounded down to `1e-12`. The cents below are the half-even cents of that grid quantity.
 Cash left = 5000.00.
 Equity at close 100 = round half-even of 5000 + quantity × 100 = 9992.50.
 
@@ -130,7 +130,7 @@ The hand-computed pair is synthetic and lives in `service/tests/fixtures/backtes
 Buy fill = 100 × 10005 / 10000 = 100.05.
 Notional = round half-even of 10000 × 10000 / 10010 = 9990.01.
 Commission = 10000 − 9990.01 = 9.99.
-Quantity = 9990.01 / 100.05.
+Quantity = 9990.01 / 100.05, rounded down to `1e-12`. The cents below are unchanged.
 
 The next bar trades 100–115 and hits the take-profit only.
 Take-profit = 100.05 × 1.10 = 110.055.

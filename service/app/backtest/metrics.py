@@ -291,18 +291,28 @@ def _net(
 
 
 def _drawdown(initial: Decimal, curve: Sequence[Decimal]) -> Decimal:
-    peak = Fraction(initial)
+    """Largest drop from a cent peak. The ratio is the exact cent fraction.
+
+    Equity points are already cents, so the walk uses those integers. The
+    published figure is still the half-even quantize of that fraction.
+    """
+    peak = _cent_int(initial)
     worst = Fraction(0)
     for equity in curve:
-        current = Fraction(equity)
+        current = _cent_int(equity)
         if current > peak:
             peak = current
         if peak > 0:
-            drop = (peak - current) / peak
+            drop = Fraction(peak - current, peak)
             if drop > worst:
                 worst = drop
     value = _ratio_fraction(worst)
     return Decimal(0) if value is None else value
+
+
+def _cent_int(amount: Decimal) -> int:
+    scaled = amount * 100
+    return int(scaled.to_integral_value())
 
 
 def _risk_ratios(
@@ -316,9 +326,16 @@ def _risk_ratios(
     # 50-digit running sums. Exact rationals make the denominators grow with
     # the curve, and a long run spends its time in gcd.
     counted = Decimal(count)
-    mean = sum(returns, _ZERO) / counted
-    variance = sum(((item - mean) ** 2 for item in returns), _ZERO)
-    downside = sum((min(item, _ZERO) ** 2 for item in returns), _ZERO)
+    # Equal returns have variance 0. Averaging them again at 50 digits leaves
+    # a tiny remainder, and that remainder used to quantize as overflow.
+    if all(item == returns[0] for item in returns):
+        mean = returns[0]
+        variance = _ZERO
+        downside = min(mean, _ZERO) ** 2 * counted
+    else:
+        mean = sum(returns, _ZERO) / counted
+        variance = sum(((item - mean) ** 2 for item in returns), _ZERO)
+        downside = sum((min(item, _ZERO) ** 2 for item in returns), _ZERO)
     try:
         scale = _sqrt(Fraction(per_year))
     except DecimalException:

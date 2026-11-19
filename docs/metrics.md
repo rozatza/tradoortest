@@ -16,7 +16,7 @@ The bar return is the simple return
 r_i = (E_i - E_{i-1}) / E_{i-1}
 ```
 
-for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. The division is skipped. These returns are the Sharpe and Sortino inputs. Each return, and the sums of those returns, are carried at 50 decimal digits. The published ratio is still the half-even quantize of that result to `1e-10`. On the hand series the `1e-10` digit matches the exact rational.
+for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. The division is skipped. These returns are the Sharpe and Sortino inputs. Each return, and the sums of those returns, are carried at 50 decimal digits. When every return is the same 50-digit value, the variance is 0 and Sharpe is `zero_variance`. Averaging those equal returns a second time leaves a remainder near `1e-50`, and that remainder is not a variance. The published ratio is still the half-even quantize of that result to `1e-10`. On the hand series the `1e-10` digit matches the exact rational. Max drawdown walks the cent integers of the curve and quantizes the exact drop.
 
 **Net return** is `(final - initial) / initial`. It uses the last mark, so an open long is in the number. Flat equity is a real 0. If `initial` quantizes to 0 the reason is `zero_initial`. An empty grid is `no_bars`. A net return the `1e-10` quantize cannot hold is null, reason `overflow`.
 

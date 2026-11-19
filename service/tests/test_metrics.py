@@ -30,7 +30,7 @@ from app.backtest import (
 from app.backtest.engine import _spread_remainder
 from app.backtest.log import METRICS_SCHEMA, SCHEMA
 from app.backtest.metrics import Trade, compute_metrics
-from app.backtest.money import decimal_ratio, quantize_cents
+from app.backtest.money import decimal_ratio, floor_qty, quantize_cents
 from app.backtest.quality import QualityCounts
 from app.ohlcv.bars import Bar
 from test_backtest import (
@@ -163,10 +163,10 @@ def test_half_even_cents_use_the_exact_rational() -> None:
 
 
 def test_a_sale_on_an_exact_half_cent_does_not_use_the_50_digit_quantity() -> None:
-    """43175 / 78.834 * 1.655514 = 906.675 exactly.
+    """43175 / 78.834 * 1.655514 = 906.675 exactly, which would be 906.68.
 
-    Half-even takes the odd cent up to 906.68. The 50-digit quantity is
-    906.67499... and would keep 906.67.
+    The fill quantity is that quotient rounded down to 1e-12. Times the sale
+    price it is 906.6749999999994, and half-even keeps 906.67.
     """
     document = _strategy(
         capital={"initial": 43175, "currency": "USDC"},
@@ -193,10 +193,10 @@ def test_a_sale_on_an_exact_half_cent_does_not_use_the_50_digit_quantity() -> No
         {"sol": [_bar(0, 78.834), _bar(60, 1.655514)]},
     )
     assert result.fills[1].leg == "market"
-    assert result.fills[1].notional == Decimal("906.68")
-    assert result.final_cash == Decimal("906.68")
-    assert result.trades[0].exit_notional == Decimal("906.68")
-    assert result.trades[0].realized_pnl == Decimal("-42268.32")
+    assert result.fills[1].notional == Decimal("906.67")
+    assert result.final_cash == Decimal("906.67")
+    assert result.trades[0].exit_notional == Decimal("906.67")
+    assert result.trades[0].realized_pnl == Decimal("-42268.33")
     _finite(result)
 
 
@@ -1064,7 +1064,7 @@ def test_a_half_equity_budget_rounds_half_even() -> None:
 
 
 def test_open_equity_uses_the_exact_quantity() -> None:
-    """43175 / 78.834 * 1.655514 = 906.675, which half-even marks at 906.68."""
+    """The open long is marked with the grid quantity, so the cent is 906.67."""
     document = _strategy(
         capital={"initial": 43175, "currency": "USDC"},
         costs={"commission_bps": 0, "slippage_bps": 0},
@@ -1073,7 +1073,7 @@ def test_open_equity_uses_the_exact_quantity() -> None:
     document["actions"][0]["risk"] = _risk(100, 99)
     result = run_backtest(document, {"sol": [_bar(0, 78.834), _bar(60, 1.655514)]})
     assert result.final_positions
-    assert result.final_equity == Decimal("906.68")
+    assert result.final_equity == Decimal("906.67")
 
 
 def test_buy_commission_is_in_the_open_unrealized_pnl() -> None:
@@ -1368,24 +1368,20 @@ def test_synthetic_bars_do_not_set_the_outage_flag_on_their_own() -> None:
 def _assert_exact_pnl_and_plug(result, bars: list[Bar]) -> None:
     """Replay each fill's basis. Slippage on these books is zero.
 
-    Buy quantity is notional / price. A sell is the whole open quantity or
-    half of it, which is what the 50% and 100% actions do. The exact sum has
-    to match unrounded equity before any cent plug.
+    Buy quantity is the grid quantity on the fill. A sell carries the quantity
+    it closed. The exact sum has to match unrounded equity before any cent plug.
     """
     state = {"qty": Fraction(0), "basis": Fraction(0), "realized": Fraction(0)}
     closed_exact: list[Fraction] = []
     for fill in result.fills:
         if fill.side == "buy":
             state["basis"] += Fraction(fill.notional) + Fraction(fill.commission)
-            state["qty"] += Fraction(fill.notional) / Fraction(fill.price)
+            state["qty"] += Fraction(fill.qty)
             continue
         qty = state["qty"]
-        if fill.qty == decimal_ratio(qty):
-            sold = qty
-        elif fill.qty == decimal_ratio(qty / 2):
-            sold = qty / 2
-        else:
-            raise AssertionError("sell qty is not the open quantity or half of it")
+        sold = Fraction(fill.qty)
+        if sold <= 0 or sold > qty:
+            raise AssertionError("sell qty is outside the open quantity")
         sold_basis = state["basis"] * sold / qty
         state["realized"] += Fraction(fill.notional) - Fraction(fill.commission) - sold_basis
         state["basis"] -= sold_basis
@@ -1710,11 +1706,16 @@ def test_entry_price_is_the_quantity_weighted_average() -> None:
     )
     result = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 150)]})
     trade = result.trades[0]
-    # 5000 at 100 and, once cash is the cap, 5000 at 150. 10000 / (250/3) = 120.
+    # 50 at 100, then the cash cap of 5000 at 150 rounded down to 1e-12.
+    first, second = (fill.qty for fill in result.fills)
     assert trade.status == "open"
     assert [fill.price for fill in result.fills] == [Decimal("100"), Decimal("150")]
-    assert trade.entry_price == Decimal("120")
-    assert trade.qty == decimal_ratio(Fraction(250, 3))
+    assert first == Decimal("50")
+    assert second == floor_qty(Fraction(5000) / Fraction(150))
+    assert trade.qty == first + second
+    assert trade.entry_price == decimal_ratio(
+        (Fraction(first) * 100 + Fraction(second) * 150) / Fraction(trade.qty)
+    )
 
 
 def test_closed_trades_are_listed_before_open_trades() -> None:
@@ -1903,12 +1904,21 @@ def test_a_caller_context_cannot_put_nan_in_a_ratio() -> None:
     _no_nan(trapped_grown)
 
 
-def test_metrics_on_twenty_thousand_bars_stay_within_a_few_seconds() -> None:
-    curve = tuple(Decimal(10000 + (index % 7) - 3) for index in range(20_000))
+def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
+    """A seeded cent walk. Seven repeated values hid the old exact-sum cost."""
+    rng = random.Random(17)
+    price = Decimal("10000.00")
+    curve: list[Decimal] = []
+    for _ in range(20_000):
+        shock = Decimal(str(rng.gauss(0, 0.001)))
+        price = (price * (1 + shock)).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+        if price < Decimal("0.01"):
+            price = Decimal("0.01")
+        curve.append(price)
     started = time.perf_counter()
     metrics = compute_metrics(
-        initial=Decimal("10000"),
-        curve=curve,
+        initial=Decimal("10000.00"),
+        curve=tuple(curve),
         closed_pnls=(),
         open_trades=0,
         bar_seconds=60,
@@ -1916,10 +1926,107 @@ def test_metrics_on_twenty_thousand_bars_stay_within_a_few_seconds() -> None:
         quality=_quality(20_000),
     )
     elapsed = time.perf_counter() - started
-    assert elapsed < 5
+    assert elapsed < 1
     assert metrics.bar_count == 20_000
     assert metrics.sharpe is not None
     assert metrics.sharpe.is_finite()
+
+
+def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
+    """20k bars: one asset adds every 10 bars and trims, the other round-trips.
+
+    The budget is absolute. It is not a comparison of two clocks.
+    """
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        assets=[
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+            {
+                "id": "jup",
+                "symbol": "JUP",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+        ],
+        signals=[
+            {"id": "add", "expr": {"op": "lit", "value": True}},
+            {"id": "trim", "expr": _gt("close", 105)},
+            {"id": "enter_jup", "expr": _gt("close", 100)},
+            {"id": "exit_jup", "expr": _eq("close", 90)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 0.05},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "trim_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 50},
+            },
+            {
+                "id": "enter_jup",
+                "type": "enter",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 20},
+                "risk": _risk(2, 2),
+            },
+            {
+                "id": "exit_jup",
+                "type": "exit",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "add_sol", "when": "add", "do": "enter_sol"},
+            {"id": "trim_rule", "when": "trim", "do": "trim_sol"},
+            {"id": "open_jup", "when": "enter_jup", "do": "enter_jup"},
+            {"id": "flat_jup", "when": "exit_jup", "do": "exit_jup"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 2,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    sol = []
+    jup = []
+    for index in range(20_000):
+        # Adds every bar. Trims while the close is above 105, which is every
+        # tenth bar, and the position stays open for the whole run.
+        sol_close = 100 + (index % 10)
+        sol.append(_bar(60 * index, sol_close))
+        jup_close = 110 if index % 2 == 0 else 90
+        jup.append(_bar(60 * index, jup_close, mint="SyntheticMint222222222222222222222222222"))
+    started = time.perf_counter()
+    result = run_backtest(document, {"sol": sol, "jup": jup})
+    elapsed = time.perf_counter() - started
+    assert elapsed < 3
+    assert len(result.trades) > 500
+    assert sum(fill.side == "buy" and fill.asset_id == "sol" for fill in result.fills) > 300
 
 
 def test_a_closed_trade_qty_is_the_entry_quantity() -> None:
@@ -1977,14 +2084,12 @@ def test_a_closed_trade_qty_is_the_entry_quantity() -> None:
         document, {"sol": [_bar(0, 100), _bar(60, 150), _bar(120, 140)]}
     )
     trade = result.trades[0]
-    bought = decimal_ratio(Fraction(250, 3))
+    buys = [fill.qty for fill in result.fills if fill.side == "buy"]
     assert trade.status == "closed"
-    assert trade.qty == bought
+    assert buys[0] == Decimal("50")
+    assert buys[1] == floor_qty(Fraction(5000) / Fraction(150))
+    assert trade.qty == buys[0] + buys[1]
     assert trade.qty != 0
-    assert [fill.qty for fill in result.fills if fill.side == "buy"] == [
-        Decimal("50"),
-        decimal_ratio(Fraction(100, 3)),
-    ]
 
 
 def test_a_nan_gap_lints_the_seeded_run_before_the_gap() -> None:
@@ -2125,6 +2230,90 @@ def test_a_half_tie_at_the_tenth_digit_rounds_half_even() -> None:
     )
     assert metrics.net_return == Decimal("1")
     assert format(metrics.net_return, "f") == "1.0000000000"
+
+
+def test_equal_nonterminating_returns_are_zero_variance() -> None:
+    """1/11 and -1/3 do not terminate. The variance is still zero."""
+    up = compute_metrics(
+        initial=Decimal("1.21"),
+        curve=(Decimal("1.32"), Decimal("1.44")),
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=_quality(2),
+    )
+    assert up.undefined["sharpe"] == "zero_variance"
+    down = compute_metrics(
+        initial=Decimal("2.43"),
+        curve=(Decimal("1.62"), Decimal("1.08"), Decimal("0.72"), Decimal("0.48")),
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=_quality(4),
+    )
+    assert down.undefined["sharpe"] == "zero_variance"
+    assert down.sortino is not None
+
+
+def test_sale_cents_match_the_grid_quantity() -> None:
+    """Half-even of the floored quantity times the sale price. No mismatches."""
+    rng = random.Random(11)
+    cases = [(43175, 78.834, 1.655514)]
+    for _ in range(80):
+        cases.append(
+            (
+                rng.randrange(1, 50_000),
+                rng.randrange(1, 20_000) / 1000,
+                rng.randrange(1, 20_000) / 1000,
+            )
+        )
+    mismatches = 0
+    for capital, price, sale in cases:
+        if price == sale:
+            continue
+        document = _strategy(
+            capital={"initial": capital, "currency": "USDC"},
+            costs={"commission_bps": 0, "slippage_bps": 0},
+            signals=[
+                {"id": "go", "expr": _eq("close", price)},
+                {"id": "stop", "expr": _eq("close", sale)},
+            ],
+            actions=[
+                {
+                    "id": "enter_sol",
+                    "type": "enter",
+                    "side": "long",
+                    "asset": "sol",
+                    "order": {"type": "market"},
+                    "sizing": {"mode": "percent_equity", "percent": 100},
+                    "risk": _risk(100, 99),
+                },
+                {
+                    "id": "exit_sol",
+                    "type": "exit",
+                    "side": "long",
+                    "asset": "sol",
+                    "order": {"type": "market"},
+                    "sizing": {"mode": "percent_position", "percent": 100},
+                },
+            ],
+            rules=[
+                {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+                {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+            ],
+        )
+        result = run_backtest(document, {"sol": [_bar(0, price), _bar(60, sale)]})
+        if len(result.fills) != 2:
+            mismatches += 1
+            continue
+        buy, sell = result.fills
+        buy_priced = quantize_cents(Fraction(buy.qty) * Fraction(buy.price))
+        sell_priced = quantize_cents(Fraction(sell.qty) * Fraction(sell.price))
+        if buy.notional != buy_priced or sell.notional != sell_priced:
+            mismatches += 1
+    assert mismatches == 0
 
 
 def test_calmar_overflows_while_the_annualized_return_stays_defined() -> None:
