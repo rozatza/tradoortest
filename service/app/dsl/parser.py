@@ -15,12 +15,17 @@ from typing import Any
 
 from app.dsl.errors import StrategyError
 from app.expr import (
+    MAX_EXPR_DEPTH,
     MAX_NUMBER_LITERAL_DIGITS,
+    Binary,
+    Call,
+    Expr,
     ExprError,
     ExprType,
     IndicatorCall,
     Lit,
     Ref,
+    Unary,
     parse,
     parse_condition,
     to_ir,
@@ -269,6 +274,7 @@ class _StrategyParser:
             node = parse(expr_text, names=self.names)
         except ExprError as err:
             raise self._shift(err, expr_offset) from None
+        self._reject_deep_expr(node, expr_offset)
         if not isinstance(node, IndicatorCall):
             raise self._error(line, "series formula must be an indicator call", "invalid_series")
         if not isinstance(node.source, Ref):
@@ -302,9 +308,10 @@ class _StrategyParser:
         self._bind_expr_name(ident, line)
         try:
             node = parse_condition(expr_text, names=self.names)
-            expr = to_ir(node)
         except ExprError as err:
             raise self._shift(err, expr_offset) from None
+        self._reject_deep_expr(node, expr_offset)
+        expr = to_ir(node)
         self.names[ident] = ExprType.BOOLEAN
         self.bound.add(ident)
         return {"id": ident, "expr": expr}
@@ -467,6 +474,26 @@ class _StrategyParser:
             raise self._error(line, "expected '<number>%'", "syntax")
         return self._number(line, matched.group(1))
 
+    def _reject_deep_expr(self, node: Expr, expr_offset: int) -> None:
+        """Reject a formula whose IR tree is deeper than `from_ir` allows.
+
+        The expression parser counts parentheses, calls, `NOT`, and unary
+        minus. `from_ir`, `validate_ir`, and `canonicalize` count every node,
+        so a flat chain can pass `parse` and then blow the stack. Risk fields
+        are numbers and words, not formulas, so they have no tree to check.
+        The error points at the start of the formula.
+        """
+        if not _deeper_than_ir_limit(node):
+            return
+        line, column = _position(self.source, expr_offset)
+        raise StrategyError(
+            f"expression nested too deeply (limit {MAX_EXPR_DEPTH})",
+            code="expr_too_deep",
+            offset=expr_offset,
+            line=line,
+            column=column,
+        )
+
     def _shift(self, err: ExprError, start: int) -> StrategyError:
         offset = start + err.offset
         line, column = _position(self.source, offset)
@@ -511,7 +538,9 @@ def parse_strategy(source: str) -> dict[str, Any]:
 def _collect_lines(source: str) -> list[_Line]:
     lines: list[_Line] = []
     for line_no, start, raw in _iter_physical(source):
-        stripped = _strip_comment(raw)
+        # rstrip drops a trailing space, tab, or NBSP, including the space
+        # before `#`, so `engine: # note` and `risk oco: ` stay headers.
+        stripped = _strip_comment(raw).rstrip()
         if stripped.strip() == "":
             continue
         indent_text = stripped[: len(stripped) - len(stripped.lstrip(" \t"))]
@@ -574,6 +603,31 @@ def _strip_comment(text: str) -> str:
         elif ch == "#":
             return text[:index]
     return text
+
+
+def _deeper_than_ir_limit(node: Expr) -> bool:
+    """True when `from_ir` would raise `expr_too_deep` for this tree.
+
+    `from_ir` visits the root at depth 0 and each child at depth + 1, and
+    fails when depth is greater than `MAX_EXPR_DEPTH`. The walk is a stack,
+    so a long left-associated chain does not recurse.
+    """
+    stack: list[tuple[Expr, int]] = [(node, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_EXPR_DEPTH:
+            return True
+        if isinstance(current, Unary):
+            stack.append((current.arg, depth + 1))
+        elif isinstance(current, Binary):
+            stack.append((current.left, depth + 1))
+            stack.append((current.right, depth + 1))
+        elif isinstance(current, Call):
+            stack.extend((arg, depth + 1) for arg in current.args)
+        elif isinstance(current, IndicatorCall):
+            stack.append((current.source, depth + 1))
+            stack.extend((value, depth + 1) for _name, value in current.params)
+    return False
 
 
 def _group(body: list[_Line]) -> list[tuple[_Line, list[_Line]]]:

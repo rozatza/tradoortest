@@ -447,10 +447,11 @@ def test_trailing_input_and_trailing_comma() -> None:
 def test_bad_number() -> None:
     err = _err("1 + 1e")
     assert err.message == "bad number"
+    assert err.code == "bad_number"
     assert err.offset == 4
     assert err.column == 5
-    assert _err("1e+").message == "bad number"
-    assert _err("1e9999").message == "bad number"
+    assert _err("1e+").code == "bad_number"
+    assert _err("1e9999").code == "bad_number"
 
 
 def test_invalid_identifier_and_bare_function() -> None:
@@ -735,9 +736,11 @@ def test_long_integer_literal_is_a_positioned_error() -> None:
     source = "1" * 4301
     err = _err(source)
     assert err.message == "bad number"
+    assert err.code == "bad_number"
     assert (err.offset, err.line, err.column) == (0, 1, 1)
     over = _err("1" * (MAX_NUMBER_LITERAL_DIGITS + 1))
     assert over.message == "bad number"
+    assert over.code == "bad_number"
     assert over.offset == 0
     at_limit = parse("1" * MAX_NUMBER_LITERAL_DIGITS)
     assert isinstance(at_limit, Lit)

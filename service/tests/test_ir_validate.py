@@ -53,7 +53,7 @@ def test_ir_version_const_is_string_1_0() -> None:
 
 def test_fixture_counts() -> None:
     assert len(list(EXAMPLES.glob("*.json"))) == 3
-    assert len(list(INVALID.glob("*.json"))) >= 5
+    assert len(list(INVALID.glob("*.json"))) == 22
     assert set(EXPECTED_FAILURES) == {path.name for path in INVALID.glob("*.json")}
 
 
@@ -81,6 +81,10 @@ def test_invalid_fixture(name: str, expected_path: str, expected_keyword: str) -
         if issue.path == expected_path and issue.keyword == expected_keyword
     ]
     assert match, format_issues(issues)
+    if name == "duplicate-signal-id.json":
+        assert [(issue.path, issue.keyword) for issue in issues] == [
+            (expected_path, expected_keyword)
+        ]
     rendered = format_issues(match)
     assert expected_path in rendered
     assert expected_keyword in rendered

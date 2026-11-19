@@ -122,7 +122,7 @@
     },
     {
       "id": "exit_on_rsi_sell",
-      "when": "rsi_sell",
+      "when": "rsi_buy",
       "do": "exit_sol"
     }
   ],

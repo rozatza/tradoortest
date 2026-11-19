@@ -182,7 +182,8 @@ class Lexer:
             self._bump()
 
     def _fail(self, message: str, offset: int, line: int, column: int) -> None:
-        raise ExprError(message, offset=offset, line=line, column=column)
+        code = "bad_number" if message == "bad number" else None
+        raise ExprError(message, offset=offset, line=line, column=column, code=code)
 
 
 _TWO_CHAR = {

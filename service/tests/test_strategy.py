@@ -95,6 +95,103 @@ def test_strategy_file_unknown_name_and_type_errors_are_positioned() -> None:
     assert "BOOLEAN" in condition_err.value.message
 
 
+def _rsi_text() -> str:
+    return format_strategy(_load(EXAMPLES / "rsi-cross.json"))
+
+
+def _with_signal(expr: str) -> str:
+    text = _rsi_text()
+    anchor = "signal rsi_sell = CROSS_BELOW(rsi_14, 70)\n"
+    return text.replace(anchor, anchor + f"signal deep = {expr}\n", 1)
+
+
+def _too_deep(expr: str) -> StrategyError:
+    source = _with_signal(expr)
+    with pytest.raises(StrategyError) as caught:
+        parse_strategy(source)
+    error = caught.value
+    assert error.code == "expr_too_deep"
+    assert error.offset == source.index(expr)
+    assert error.line > 1
+    assert error.column > 1
+    return error
+
+
+def test_inline_comment_with_a_leading_space_is_ignored() -> None:
+    text = _rsi_text()
+    edited = text
+    for old in ("strategy rsi_cross_sol:", "when rsi_buy do enter_sol", "risk oco:"):
+        edited = edited.replace(old, f"{old} # note", 1)
+    assert parse_strategy(edited) == parse_strategy(text)
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t", "\u00a0"])
+def test_trailing_whitespace_on_a_header_is_ignored(suffix: str) -> None:
+    text = _rsi_text()
+    padded = text.replace("engine:", f"engine:{suffix}", 1)
+    assert parse_strategy(padded) == parse_strategy(text)
+
+
+def test_trailing_space_on_every_line_parses() -> None:
+    text = _rsi_text()
+    padded = "\n".join(f"{line} " for line in text.split("\n"))
+    assert parse_strategy(padded) == parse_strategy(text)
+
+
+def test_trailing_space_on_risk_oco_keeps_the_block() -> None:
+    text = _rsi_text()
+    padded = text.replace("risk oco:", "risk oco: ", 1)
+    parsed = parse_strategy(padded)
+    assert parsed == parse_strategy(text)
+    assert parsed["actions"][0]["risk"]["evaluation"] == "on_entry_fill"
+
+
+def test_flat_and_chain_past_the_ir_depth_limit_is_positioned() -> None:
+    _too_deep(" AND ".join(["rsi_buy"] * 82))
+
+
+def test_flat_addition_chain_is_positioned_expr_too_deep() -> None:
+    _too_deep("+".join(["1"] * 500) + " > 0")
+
+
+def test_unary_minus_inside_a_comparison_counts_every_ir_node() -> None:
+    _too_deep("-" * 80 + "close > 0")
+
+
+def test_nested_bars_since_counts_every_ir_node() -> None:
+    expr = "close > 0"
+    for _ in range(41):
+        expr = f"BARS_SINCE({expr}) > 0"
+    _too_deep(expr)
+
+
+def test_and_chain_at_the_ir_depth_limit_round_trips() -> None:
+    source = _with_signal(" AND ".join(["rsi_buy"] * 81))
+    parsed = parse_strategy(source)
+    assert validate_ir(parsed) == []
+    assert canonicalize(parsed) == parsed
+    formatted = format_strategy(parsed)
+    assert parse_strategy(formatted) == parsed
+
+
+def test_deep_series_formula_is_positioned_expr_too_deep() -> None:
+    expr = "+".join(["close"] * 500)
+    source = _rsi_text().replace("RSI(close, period=14)", expr, 1)
+    with pytest.raises(StrategyError) as caught:
+        parse_strategy(source)
+    assert caught.value.code == "expr_too_deep"
+    assert caught.value.offset == source.index(expr)
+
+
+def test_long_signal_literal_keeps_the_bad_number_code() -> None:
+    expr = "1" * 1001 + " > 0"
+    source = _rsi_text().replace("CROSS_BELOW(rsi_14, 70)", expr, 1)
+    with pytest.raises(StrategyError) as caught:
+        parse_strategy(source)
+    assert caught.value.code == "bad_number"
+    assert caught.value.offset == source.index(expr)
+
+
 def test_dsl_values_reach_the_semantic_codes() -> None:
     text = format_strategy(_load(EXAMPLES / "rsi-cross.json"))
     bar = parse_strategy(text.replace("bar_size: 1h", "bar_size: 2m", 1))

@@ -244,7 +244,7 @@ The following points are fixed here because the grammar above does not state the
 
 The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lower`), not of a surrounding parenthesized group. Output names are case-insensitive and stored in lowercase. `macd`, `bollinger`, and `stochastic` require an output. The others reject one. Period ranges (`1–500` and the rest of the indicator table above) are checked when a derived series is validated, not by this parser. Argument expressions must be numeric; they are not required to be literals.
 
-**Limits.** `MAX_EXPR_DEPTH` is 80. Grouping parentheses, calls, `NOT`, and unary minus each count as one level. One past the limit is `expr_too_deep`, positioned at the token that crossed it. `from_ir` uses the same limit on every nested IR node and raises the same code, with `path` set to that node. `MAX_EXPR_SOURCE_LENGTH` is 10000 code points. A longer source is `expression_too_long` at that offset.
+**Limits.** `MAX_EXPR_DEPTH` is 80. The expression parser counts grouping parentheses, calls, `NOT`, and unary minus. One past that limit is `expr_too_deep`, positioned at the token that crossed it. `from_ir` counts every nested IR node and fails at the same limit, with `path` set to that node. `parse_strategy` uses that node count on every signal formula and series formula, and raises `expr_too_deep` at the start of the formula. A file it accepts is shallow enough for `validate_ir`, `canonicalize`, and `format_strategy`. `MAX_EXPR_SOURCE_LENGTH` is 10000 code points. A longer source is `expression_too_long` at that offset.
 
 **Types.** Each node is `NUMERIC` or `BOOLEAN`. When `names` is passed, a mapped signal id is `BOOLEAN` and a mapped or built-in series id is `NUMERIC`. Those types are applied as the node is built.
 
@@ -321,7 +321,7 @@ Every `enter` action requires a `risk` object. An `exit` action must not carry `
 | `evaluation` | `on_entry_fill` |
 | `movement` | `tighten_only` |
 | `take_profit` | `{ "mode": "percent", "percent": P }` with `P` in `(0, 100]` |
-| `stop_loss` | `{ "mode": "percent", "percent": P }` with `P` in `(0, 100]` |
+| `stop_loss` | `{ "mode": "percent", "percent": P }` with `P` in `(0, 100)` |
 
 Levels are anchored to the entry fill price `F` (after slippage):
 
@@ -384,7 +384,7 @@ portfolio:
 
 `parse_strategy` reads the text form and returns canonical IR with `ir_version` `"1.0"`. `format_strategy` prints that IR. Formatting the parse of that text is the same string. The three examples in `schemas/examples/` round-trip this way.
 
-Top-level declarations may appear in any order. Blank lines and `#` comments (outside quoted strings) are ignored. Indentation is spaces, in multiples of 2. The canonical text uses one blank line between sections and this order: strategy, engine, capital, costs, assets, derived series, signals, actions, rules, portfolio.
+Top-level declarations may appear in any order. Blank lines and `#` comments (outside quoted strings) are ignored. A space, tab, or non-breaking space before `#`, and the same characters at the end of a line, are ignored too. Indentation is spaces, in multiples of 2. The canonical text uses one blank line between sections and this order: strategy, engine, capital, costs, assets, derived series, signals, actions, rules, portfolio.
 
 ```text
 strategy rsi_cross_sol:
@@ -482,6 +482,9 @@ File errors use `StrategyError`. `code` is the expression code when the failure 
 | `reserved_series` | a derived series id is `open`, `high`, `low`, `close`, or `volume` |
 | `missing_entry` | no rule invokes an action whose `type` is `enter` |
 | `type_error` | a signal expression is not `BOOLEAN`, or an operator's operand has the wrong type. Series names are `NUMERIC`. Earlier signal names are `BOOLEAN`. The check runs inside `from_ir` with that map |
+| `expr_too_deep` | a signal expression is nested deeper than 80 IR nodes. `from_ir` reports it, and `parse_strategy` rejects the formula at its first character |
+| `invalid_expr` | an IR expression is not an object, uses an unknown `op`, or is missing a child or a literal. `from_ir` raises it and `validate_ir` reports it |
+| `expression_too_long` | a formula is longer than 10000 code points. The expression parser and `parse_strategy` raise this. It is not a code on an IR document |
 
 `format_issues` renders one line per issue: `path: message [keyword]`.
 
