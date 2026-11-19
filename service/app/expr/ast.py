@@ -155,7 +155,7 @@ def to_ir(node: Expr) -> dict[str, Any]:
         return {"op": node.op, "args": [to_ir(arg) for arg in node.args]}
     if isinstance(node, IndicatorCall):
         raise ExprError(
-            "indicator call is not an IR expression operator",
+            f"define {node.name} on a derived series line and reference that name",
             offset=node.span.offset,
             line=node.span.line,
             column=node.span.column,

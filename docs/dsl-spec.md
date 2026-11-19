@@ -166,7 +166,55 @@ series bb_lower = BOLLINGER(close, period=20, stddev=2).lower
 }
 ```
 
-Numeric indicator definitions are not part of this schema. Call names and parameters are fixed here so later code can implement them without renaming the IR.
+Call names and parameters are fixed here so the indicator library can implement them without renaming the IR. The numeric definitions follow. A strategy document still checks the ranges in the table above, including an RSI period of at least 2. The library accepts every period from 1 to 500, so RSI period 1 is defined there, and raises `IndicatorError` outside that instead of returning a partial series.
+
+## Indicator math
+
+`service/app/indicators` computes these series for a derived series and, later, the backtester. Each output has the same length as its input. Bars before the warmup index are NaN. The functions do not backfill, forward-fill, or otherwise invent a value. A non-finite sample (NaN or an infinity) is a gap. It is never treated as a price.
+
+`period`, `fast`, `slow`, `signal`, `k_period`, and `d_period` are integers from 1 to 500. `stddev` is a number in `(0, 10]`. A period longer than the input is not an error: every output is NaN. An empty input returns an empty output. ATR and Stochastic read `high`, `low`, and `close` of equal length. The DSL `source` is still one series name. The numeric ATR and Stochastic use the bar's high, low, and close. The other indicators read the source series.
+
+| Output | Leading NaNs |
+| --- | --- |
+| SMA, EMA, Bollinger `upper`, `middle`, and `lower` | `period - 1` |
+| RSI | `period` |
+| ATR | `period` |
+| MACD `macd` | `max(fast, slow) - 1` |
+| MACD `signal` and `histogram` | that line warmup, plus `signal - 1` |
+| Stochastic `k` | `k_period - 1` |
+| Stochastic `d` | `k_period + d_period - 2` |
+
+**SMA.** The arithmetic mean of the last `period` values. One non-finite value in the window makes that bar NaN. The next window that is entirely finite is a normal average.
+
+**EMA.** The seed is the SMA of the first `period` finite values in a run, placed on the last bar of that seed. After that, with α = `2 / (period + 1)`:
+
+`ema = ema_prev + α * (price - ema_prev)`
+
+A gap ends the run. The next run of `period` finite prices seeds a new EMA. The previous EMA is not carried across the gap. Period 1 has α = 1, so the EMA equals the input and the warmup is 0. This seed is an SMA. It is not a copy of the first price with a value on bar 0.
+
+**RSI.** Wilder smoothing of the close-to-close change. The first averages, at index `period`, are the mean gain and the mean loss over the first `period` changes (the first `period + 1` prices). Later bars use:
+
+`avg = (avg_prev * (period - 1) + current) / period`
+
+RSI is `100 * avg_gain / (avg_gain + avg_loss)` when the average loss is positive. It is 100 when the average loss is 0 and the average gain is positive. It is 0 when both averages are 0, which is what a constant series produces. The result is never infinite. A gap ends the run. The next RSI waits for `period + 1` new finite prices. The strategy schema still requires an RSI period of at least 2. The function is also defined for period 1.
+
+**ATR.** Wilder smoothing of true range. True range at bar `i` (`i ≥ 1`) is the greatest of `high - low`, `|high - previous close|`, and `|low - previous close|`. Bar 0 has no previous close, so it has no true range. The first ATR, at index `period`, is the SMA of the first `period` true ranges. Later bars use:
+
+`atr = (atr_prev * (period - 1) + true_range) / period`
+
+A non-finite high, low, or close ends the run. Period 1 is the true range itself from index 1 onward.
+
+**MACD.** The line is `EMA(source, fast) - EMA(source, slow)`. Both EMAs are seeded from the start of the series. The parameters are not swapped when `fast` is greater than `slow`. The signal line is an EMA of the MACD line, with the same SMA seed and α = `2 / (signal + 1)`. The histogram is the line minus the signal, and it stays NaN until the signal exists. TA-Lib's `MACD` function re-seeds the faster EMA at the slower EMA's first bar, so those three arrays are not this definition. The continuous EMAs are.
+
+**Bollinger.** `middle` is the SMA. The standard deviation is the population figure: the square root of the mean squared difference from that SMA, dividing by `period` (ddof 0), not by `period - 1`. `upper = middle + stddev * sd` and `lower = middle - stddev * sd`. A constant window has sd 0, so the three bands are equal.
+
+**Stochastic.** `%K` is the fast stochastic over `k_period` bars. There is no extra smoothing period:
+
+`%K = 100 * (close - lowest low) / (highest high - lowest low)`
+
+When the highest high equals the lowest low, `%K` is 0. It is not infinite, and it is not carried forward from the previous bar. `%D` is the SMA of `%K` over `d_period`. This is the two-parameter fast stochastic. It is not the slow stochastic, which would smooth `%K` by a third period before the `%D` average.
+
+Rolling outputs (SMA, Bollinger, `%K`, and `%D` because it is an SMA) are NaN exactly on bars whose window contains a non-finite input. They resume on the next complete finite window.
 
 ## Expressions
 
@@ -207,7 +255,7 @@ arg      := ident "=" expr | expr
 
 `AND`, `OR`, and `NOT` associate as written above: `OR` is loosest, then `AND`, then `NOT`. `+` and `-` are left-associative, as are `*` and `/`. Unary `-` is right-associative and binds tighter than `*`. A comparison is not associative: `a > b > c` is an error. `NOT a > b` is `NOT (a > b)` because a comparison binds tighter than `NOT`.
 
-A `ref` name must be a built-in series, a derived series, or an earlier signal id. Indicator calls belong in `derived_series`, not inside a signal expression. The parser still accepts an indicator call, so a derived-series formula can be checked, but `to_ir` rejects it: a signal expression has no indicator operator.
+A `ref` name must be a built-in series, a derived series, or an earlier signal id. Indicator calls belong in `derived_series`, not inside a signal expression. The parser still accepts an indicator call, so a derived-series formula can be checked, but `to_ir` rejects it with `invalid_expr`. The message tells the caller to define the indicator on a derived series line and reference that name. The offset is the indicator call. Parentheses around the call do not move it.
 
 ### Parser
 
@@ -242,7 +290,7 @@ The following points are fixed here because the grammar above does not state the
 | `bollinger` (`bb`) | `period`, `stddev` | `.lower`, `.middle`, or `.upper` |
 | `stochastic` | `k_period`, `d_period` | `.k` or `.d` |
 
-The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lower`), not of a surrounding parenthesized group. Output names are case-insensitive and stored in lowercase. `macd`, `bollinger`, and `stochastic` require an output. The others reject one. Period ranges (`1–500` and the rest of the indicator table above) are checked when a derived series is validated, not by this parser. Argument expressions must be numeric; they are not required to be literals.
+The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lower`), not of a surrounding parenthesized group. Output names are case-insensitive and stored in lowercase. `macd`, `bollinger`, and `stochastic` require an output. The others reject one. Period ranges (`1–500` and the rest of the indicator table above) are checked when a derived series is validated, not by this parser. Argument expressions must be numeric; they are not required to be literals. An indicator call that omits a required argument (`RSI(close)` has no `period`) is `missing_param`, not `syntax`.
 
 **Limits.** `MAX_EXPR_DEPTH` is 80. The expression parser counts grouping parentheses, calls, `NOT`, and unary minus. One past that limit is `expr_too_deep`, positioned at the token that crossed it. `from_ir` counts every nested IR node and fails at the same limit, with `path` set to that node. `parse_strategy` uses that node count on every signal formula and series formula, and raises `expr_too_deep` at the start of the formula. A file it accepts is shallow enough for `validate_ir`, `canonicalize`, and `format_strategy`. `MAX_EXPR_SOURCE_LENGTH` is 10000 code points. A longer source is `expression_too_long` at that offset.
 
@@ -263,7 +311,7 @@ The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lo
 
 With no name map, a bare identifier is `NUMERIC`. With a name map, resolution happens in the parse (and in `from_ir`), not as a second walk that retypes an all-numeric tree. `rsi_buy AND x > 1`, `NOT rsi_buy`, and `BARS_SINCE(rsi_buy)` parse when `rsi_buy` is `BOOLEAN` and `x` is `NUMERIC`. Using a signal as a number, or a series as a condition, is a positioned `type_error`. A name that is neither a built-in series nor in the map is `unknown_series`. Indicator parameter ranges are still checked when a derived series is validated, not by this parser.
 
-**Errors.** Messages name the problem and carry a position: `empty input`, `unexpected token`, `unexpected character`, `unterminated paren`, `unknown function`, `wrong arity`, `trailing input`, `bad number`, `invalid identifier`, `type error`, `unknown series reference`, `expression nested too deeply`, and `expression exceeds length limit`. A chained comparison is reported as an unexpected token. `from_ir` sets `error.path` to a JSONPath such as `$.signals[1].expr.args[0]`. `str(error)` stays `line:column: message (offset N)`.
+**Errors.** Messages name the problem and carry a position: `empty input`, `unexpected token`, `unexpected character`, `unterminated paren`, `unknown function`, `wrong arity`, `trailing input`, `bad number`, `invalid identifier`, `type error`, `unknown series reference`, `expression nested too deeply`, and `expression exceeds length limit`. A chained comparison is reported as an unexpected token. A missing indicator argument is `missing_param`. `from_ir` sets `error.path` to a JSONPath such as `$.signals[1].expr.args[0]`. `str(error)` stays `line:column: message (offset N)`.
 
 ## signals
 
@@ -451,7 +499,7 @@ portfolio:
 
 `sizing: 25% equity` is `percent_equity`. `sizing: 100% position` is `percent_position`. An enter action's `risk oco` block is the OCO pair. An exit action omits it.
 
-File errors use `StrategyError`. `code` is the expression code when the failure is inside a formula (`type_error`, `unknown_series`, `expr_too_deep`, `bad_number`, `invalid_expr`, and the other expression errors), or `syntax`, `missing_section`, `missing_field`, `unknown_field`, `duplicate_section`, `duplicate_field`, `duplicate_id`, `reserved_series`, or `invalid_series`. The offset is into the strategy file.
+File errors use `StrategyError`. `code` is the expression code when the failure is inside a formula (`type_error`, `unknown_series`, `expr_too_deep`, `bad_number`, `invalid_expr`, `missing_param`, and the other expression errors), or `syntax`, `missing_section`, `missing_field`, `unknown_field`, `duplicate_section`, `duplicate_field`, `duplicate_id`, `reserved_series`, or `invalid_series`. The offset is into the strategy file.
 
 ## Canonical IR and hash
 
@@ -483,7 +531,8 @@ File errors use `StrategyError`. `code` is the expression code when the failure 
 | `missing_entry` | no rule invokes an action whose `type` is `enter` |
 | `type_error` | a signal expression is not `BOOLEAN`, or an operator's operand has the wrong type. Series names are `NUMERIC`. Earlier signal names are `BOOLEAN`. The check runs inside `from_ir` with that map |
 | `expr_too_deep` | a signal expression is nested deeper than 80 IR nodes. `from_ir` reports it, and `parse_strategy` rejects the formula at its first character |
-| `invalid_expr` | an IR expression is not an object, uses an unknown `op`, or is missing a child or a literal. `from_ir` raises it and `validate_ir` reports it. A signal formula that contains an indicator call is the same code: the indicator belongs in a `series` line. `parse_strategy` reports it at that call in the file |
+| `invalid_expr` | an IR expression is not an object, uses an unknown `op`, or is missing a child or a literal. `from_ir` raises it and `validate_ir` reports it. A signal formula that contains an indicator call is the same code. The message tells the user to define the indicator on a derived series line and reference that name. `parse_strategy` reports it at that call, including when parentheses wrap the call |
+| `missing_param` | an indicator call omits a required argument. `RSI(close)` has no `period`. The expression parser raises it and `parse_strategy` reports it at the call. It is not `syntax` |
 | `expression_too_long` | a formula is longer than 10000 code points. The expression parser and `parse_strategy` raise this. It is not a code on an IR document |
 
 `format_issues` renders one line per issue: `path: message [keyword]`.
@@ -502,4 +551,4 @@ Each example is SOL spot on Solana, long-only, with an OCO take-profit and stop-
 
 ## Non-goals
 
-This spec does not define indicator math, historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. The strategy file parser is `service/app/dsl`. Expression text is parsed by `service/app/expr`. The versioned save envelope is `docs/save-format.md`.
+This spec does not define historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. Indicator math is the section above and `service/app/indicators`. The strategy file parser is `service/app/dsl`. Expression text is parsed by `service/app/expr`. The versioned save envelope is `docs/save-format.md`.

@@ -303,10 +303,25 @@ def test_indicator_calls(text: str, name: str, params: list[str], output: str | 
 def test_indicator_is_not_an_ir_expression_operator() -> None:
     node = parse("rsi(close, 14)")
     err = _err_node(node)
-    assert err.message == "indicator call is not an IR expression operator"
+    assert err.message == "define rsi on a derived series line and reference that name"
     assert err.code == "invalid_expr"
     assert err.offset == node.span.offset
     assert parse_condition("rsi(close, 14) > 30").result_type is ExprType.BOOLEAN
+
+
+def test_parenthesized_indicator_error_points_at_the_call() -> None:
+    source = "(RSI(close, period=14)) < 30"
+    err = _err_node(parse(source))
+    assert err.code == "invalid_expr"
+    assert err.message == "define rsi on a derived series line and reference that name"
+    assert err.offset == source.index("RSI")
+
+
+def test_missing_indicator_period_is_missing_param() -> None:
+    err = _err("RSI(close)")
+    assert err.code == "missing_param"
+    assert err.message == "wrong arity: rsi expects arguments (source, period), missing period"
+    assert err.offset == 0
 
 
 def _err_node(node) -> ExprError:

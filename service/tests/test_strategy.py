@@ -217,10 +217,34 @@ def test_inline_indicator_in_a_signal_is_a_file_error(expr: str) -> None:
     source = _inject_signal(_rsi_text(), expr)
     error = _parse_error(source)
     assert error.code == "invalid_expr"
+    assert "derived series line" in error.message
     assert (error.line, error.column) != (1, 1)
     name = "RSI" if expr.startswith("RSI") else "EMA"
     formula = source.index(f"signal extra = {expr}") + len("signal extra = ")
     assert error.offset == formula + expr.index(name)
+
+
+def test_parenthesized_inline_indicator_points_at_the_call() -> None:
+    expr = "(RSI(close, period=14)) < 30"
+    source = _inject_signal(_rsi_text(), expr)
+    error = _parse_error(source)
+    assert error.code == "invalid_expr"
+    assert error.message == "define rsi on a derived series line and reference that name"
+    formula = source.index(f"signal extra = {expr}") + len("signal extra = ")
+    assert error.offset == formula + expr.index("RSI")
+
+
+def test_series_missing_period_is_missing_param_not_syntax() -> None:
+    text = _rsi_text()
+    source = text.replace(
+        "series rsi_14 = RSI(close, period=14)\n",
+        "series rsi_14 = RSI(close)\n",
+        1,
+    )
+    error = _parse_error(source)
+    assert error.code == "missing_param"
+    assert "missing period" in error.message
+    assert error.offset == source.index("RSI(close)")
 
 
 _BAD_SIGNALS = (
