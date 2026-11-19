@@ -13,6 +13,10 @@ from enum import Enum
 
 from .errors import ExprError
 
+# Python's default int-from-string limit is 4300 digits. Stay under it so a
+# long literal is a positioned ExprError, not a bare ValueError.
+MAX_NUMBER_LITERAL_DIGITS = 1000
+
 
 class TokenKind(Enum):
     NUMBER = "NUMBER"
@@ -146,6 +150,9 @@ class Lexer:
             if self.index == exp_digits:
                 self._fail("bad number", offset, line, column)
         lexeme = self.source[start : self.index]
+        digits = sum(ch.isascii() and ch.isdigit() for ch in lexeme)
+        if digits > MAX_NUMBER_LITERAL_DIGITS:
+            self._fail("bad number", offset, line, column)
         if any(mark in lexeme for mark in ".eE"):
             try:
                 value: int | float = float(lexeme)

@@ -1,9 +1,10 @@
 # Strategy DSL and JSON IR v1
 
 This document is the contract for a strategy. The canonical artifact is JSON IR
-validated by `schemas/strategy-ir-v1.schema.json`. The text sketches below show
-the intended DSL surface. Expression text is parsed by `service/app/expr`.
-The rest of a strategy file is not parsed yet.
+validated by `schemas/strategy-ir-v1.schema.json`. A strategy file in the DSL
+below is parsed by `service/app/dsl` into that IR. Expression text inside the
+file is parsed by `service/app/expr`. The save envelope around a canonical IR
+is `docs/save-format.md`.
 
 ## Scope
 
@@ -214,11 +215,13 @@ A `ref` name must be a built-in series, a derived series, or an earlier signal i
 
 | Entry point | Result |
 | --- | --- |
-| `parse(source)` | any expression |
-| `parse_condition(source)` | expression whose type is `BOOLEAN` |
-| `parse_numeric(source)` | expression whose type is `NUMERIC` |
+| `parse(source, names=None)` | any expression |
+| `parse_condition(source, names=None)` | expression whose type is `BOOLEAN` |
+| `parse_numeric(source, names=None)` | expression whose type is `NUMERIC` |
 | `to_ir(node)` | canonical signal IR, or an error for an indicator call |
-| `from_ir(tree)` / `format_expr(node)` | the inverse direction for canonical ops |
+| `from_ir(tree, names=None, path="$")` / `format_expr(node)` | the inverse direction for canonical ops |
+
+`names`, when passed, maps an identifier to `NUMERIC` or `BOOLEAN`. Built-in series are `NUMERIC` unless the map overrides them. The strategy parser passes this map while it parses, so a signal id is `BOOLEAN` and a series id is `NUMERIC` before the surrounding operator is type-checked. Omit `names` and every bare identifier is `NUMERIC`.
 
 Every error includes a 0-based `offset` into the source string and a 1-based `line` and `column`. A tab counts as one column. `str(error)` is `line:column: message (offset N)`.
 
@@ -226,7 +229,7 @@ The following points are fixed here because the grammar above does not state the
 
 **Layout.** Spaces, tabs, and newlines separate tokens. `#` comments run to the end of the line. Operators are single tokens (`>=`, not `> =`). There is no unary `+`, no `**`, no string literal, and no trailing comma.
 
-**Numbers.** A number is digits, optionally `.` and more digits, optionally an exponent `[eE][+-]?` digits. The token must start with a digit (`.5` is not a number). No decimal point and no exponent means an integer literal, so `30` stays `30` in IR. A decimal or an exponent is a float, including `1e2`. A non-finite value is a bad number. Unary minus is the `neg` operator, not part of the literal: `-30` is `{"op":"neg","arg":{"op":"lit","value":30}}`.
+**Numbers.** A number is digits, optionally `.` and more digits, optionally an exponent `[eE][+-]?` digits. The token must start with a digit (`.5` is not a number). No decimal point and no exponent means an integer literal, so `30` stays `30` in IR. A decimal or an exponent is a float, including `1e2`. A non-finite value is a bad number. A literal with more than 1000 digits (`MAX_NUMBER_LITERAL_DIGITS`) is a bad number at the start of the token; the parser does not call `int` on it. Unary minus is the `neg` operator, not part of the literal: `-30` is `{"op":"neg","arg":{"op":"lit","value":30}}`.
 
 **Names.** A series reference matches `^[a-z][a-z0-9_]{0,63}$`. `AND`, `OR`, `NOT`, `true`, and `false` are reserved and case-insensitive. Call names are case-insensitive: `CROSS_ABOVE`, `CROSS_BELOW`, `BARS_SINCE`, `ENTRY_PRICE`, and the indicator names below. `bb` is an alias of `bollinger`. A known call name written in identifier form without `(` is a reference (`cross_above`); the uppercase spelling without `(` is an error because it is not an identifier.
 
@@ -241,13 +244,15 @@ The following points are fixed here because the grammar above does not state the
 
 The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lower`), not of a surrounding parenthesized group. Output names are case-insensitive and stored in lowercase. `macd`, `bollinger`, and `stochastic` require an output. The others reject one. Period ranges (`1–500` and the rest of the indicator table above) are checked when a derived series is validated, not by this parser. Argument expressions must be numeric; they are not required to be literals.
 
-**Types.** Each node is `NUMERIC` or `BOOLEAN`.
+**Limits.** `MAX_EXPR_DEPTH` is 80. Grouping parentheses, calls, `NOT`, and unary minus each count as one level. One past the limit is `expr_too_deep`, positioned at the token that crossed it. `from_ir` uses the same limit on every nested IR node and raises the same code, with `path` set to that node. `MAX_EXPR_SOURCE_LENGTH` is 10000 code points. A longer source is `expression_too_long` at that offset.
+
+**Types.** Each node is `NUMERIC` or `BOOLEAN`. When `names` is passed, a mapped signal id is `BOOLEAN` and a mapped or built-in series id is `NUMERIC`. Those types are applied as the node is built.
 
 | Form | Type | Rule |
 | --- | --- | --- |
 | number | `NUMERIC` | |
 | `true`, `false` | `BOOLEAN` | |
-| identifier | `NUMERIC` | a bare name is a series reference |
+| identifier | from `names`, or `NUMERIC` | with `names`, an unknown name is `unknown_series`; without `names`, a bare name is `NUMERIC` |
 | `-x`, `+ - * /` | `NUMERIC` | each operand is `NUMERIC` |
 | comparison | `BOOLEAN` | both operands are `NUMERIC`, including `==` and `!=` |
 | `NOT`, `AND`, `OR` | `BOOLEAN` | each operand is `BOOLEAN` |
@@ -256,9 +261,9 @@ The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lo
 | `ENTRY_PRICE` | `NUMERIC` | |
 | indicator call | `NUMERIC` | every argument is `NUMERIC` |
 
-This parser does not look up names. A bare identifier is `NUMERIC` even when a later pass would resolve it to a signal. Declared-series checks, signal references, and indicator parameter ranges belong to semantic validation, not this parser.
+With no name map, a bare identifier is `NUMERIC`. With a name map, resolution happens in the parse (and in `from_ir`), not as a second walk that retypes an all-numeric tree. `rsi_buy AND x > 1`, `NOT rsi_buy`, and `BARS_SINCE(rsi_buy)` parse when `rsi_buy` is `BOOLEAN` and `x` is `NUMERIC`. Using a signal as a number, or a series as a condition, is a positioned `type_error`. A name that is neither a built-in series nor in the map is `unknown_series`. Indicator parameter ranges are still checked when a derived series is validated, not by this parser.
 
-**Errors.** Messages name the problem and carry a position: `empty input`, `unexpected token`, `unexpected character`, `unterminated paren`, `unknown function`, `wrong arity`, `trailing input`, `bad number`, `invalid identifier`, and `type error`. A chained comparison is reported as an unexpected token.
+**Errors.** Messages name the problem and carry a position: `empty input`, `unexpected token`, `unexpected character`, `unterminated paren`, `unknown function`, `wrong arity`, `trailing input`, `bad number`, `invalid identifier`, `type error`, `unknown series reference`, `expression nested too deeply`, and `expression exceeds length limit`. A chained comparison is reported as an unexpected token. `from_ir` sets `error.path` to a JSONPath such as `$.signals[1].expr.args[0]`. `str(error)` stays `line:column: message (offset N)`.
 
 ## signals
 
@@ -375,13 +380,108 @@ portfolio:
 
 `max_positions` counts distinct assets with an open long. It does not allow shorts.
 
+## Strategy file
+
+`parse_strategy` reads the text form and returns canonical IR with `ir_version` `"1.0"`. `format_strategy` prints that IR. Formatting the parse of that text is the same string. The three examples in `schemas/examples/` round-trip this way.
+
+Top-level declarations may appear in any order. Blank lines and `#` comments (outside quoted strings) are ignored. Indentation is spaces, in multiples of 2. The canonical text uses one blank line between sections and this order: strategy, engine, capital, costs, assets, derived series, signals, actions, rules, portfolio.
+
+```text
+strategy rsi_cross_sol:
+  name: "RSI cross"
+  description: "Enter long when RSI crosses above 30."
+
+engine:
+  bar_size: 1h
+  event: bar_close
+  fill_price_mode: on_close
+  warmup_bars: 14
+
+capital:
+  initial: 10000 USDC
+
+costs:
+  commission_bps: 10
+  slippage_bps: 5
+
+asset sol:
+  symbol: SOL
+  chain: solana
+  market: spot
+  quote: USDC
+
+series rsi_14 = RSI(close, period=14)
+series bb_lower = BOLLINGER(close, period=20, stddev=2).lower
+
+signal rsi_buy = CROSS_ABOVE(rsi_14, 30)
+signal both = rsi_buy AND close > 1
+
+action enter_sol:
+  type: enter
+  side: long
+  asset: sol
+  order: market
+  sizing: 25% equity
+  risk oco:
+    evaluation: on_entry_fill
+    movement: tighten_only
+    take_profit: 6%
+    stop_loss: 3%
+
+action exit_sol:
+  type: exit
+  side: long
+  asset: sol
+  order: market
+  sizing: 100% position
+
+rule enter_on_rsi_buy:
+  when rsi_buy do enter_sol
+
+portfolio:
+  mode: spot
+  direction: long_only
+  chain: solana
+  max_positions: 1
+  allow_pyramiding: false
+  quote_currency: USDC
+```
+
+`name` and `description` are JSON strings. A series formula is one indicator call: the source is a series name, and each parameter is a numeric literal. A signal formula is one boolean expression on that same line. Names already declared are in scope: built-ins and earlier series are `NUMERIC`, earlier signals are `BOOLEAN`. A series id may not be a built-in (`reserved_series`). A signal id may not reuse a built-in or an earlier series or signal id (`duplicate_id`).
+
+`sizing: 25% equity` is `percent_equity`. `sizing: 100% position` is `percent_position`. An enter action's `risk oco` block is the OCO pair. An exit action omits it.
+
+File errors use `StrategyError`. `code` is the expression code when the failure is inside a formula (`type_error`, `unknown_series`, `expr_too_deep`, `bad_number`, and the other expression errors), or `syntax`, `missing_section`, `missing_field`, `unknown_field`, `duplicate_section`, `duplicate_field`, `duplicate_id`, `reserved_series`, or `invalid_series`. The offset is into the strategy file.
+
+## Canonical IR and hash
+
+`canonicalize` rewrites a document into one key order and one number spelling. Object keys follow the order in this spec (document keys, then each object's fields, then expression keys `op` then `value` / `name` / `arg` / `left`+`right` / `args`). Indicator `params` use the parameter order in the indicator table. A finite float that is an integer inside the safe integer range is stored as an integer, so `25` and `25.0` match. Other floats keep their value.
+
+`canonical_json` is that object encoded as UTF-8 JSON with no insignificant whitespace. `ir_hash` is the lowercase sha256 hex digest of those bytes. Permuting keys, or writing an integral number as a float, does not change the hash. The same input always yields the same hash.
+
 ## Validation
 
-`service/app/ir/validate.py` loads the draft 2020-12 schema and then checks references.
+`service/app/ir/validate.py` loads the draft 2020-12 schema and then checks references and expression types.
 
 1. Schema failures return before semantic checks. Each issue has a JSONPath `path`, a `keyword`, and a `message`.
 2. For a missing property, `path` points at the missing field (for example `$.ir_version` or `$.actions[0].risk.stop_loss`) and `keyword` is `required`.
-3. Semantic keywords include `unknown_signal`, `unknown_action`, `unknown_asset`, `unknown_series`, `duplicate_id`, and `reserved_series`.
+3. Some schema failures are reported under a specific code instead of the generic keyword. Every other schema failure keeps its JSON Schema keyword (`const`, `required`, `additionalProperties`, `exclusiveMinimum`, and the rest).
+
+| Code | When |
+| --- | --- |
+| `invalid_bar_size` | `engine.bar_size` is outside `1m`–`1d` |
+| `invalid_sizing` | a sizing percent is not in `(0, 100]` |
+| `insane_stop_loss` | stop-loss percent is `<= 0` or `>= 100`. A stop of 100% prices a long at zero, which is not a long protective stop |
+| `insane_take_profit` | take-profit percent is `<= 0` or `> 100`. A long target has to stay above the entry |
+| `unknown_signal` | `rules[].when` is not a signal id in this document |
+| `unknown_action` | `rules[].do` is not an action id |
+| `unknown_asset` | `actions[].asset` is not an asset id |
+| `unknown_series` | a derived-series `source`, or an expression `ref`, is not a built-in series, an earlier derived series, or (inside a signal) an earlier signal |
+| `duplicate_id` | the same id appears twice in one list, or a signal id reuses a series id |
+| `duplicate_symbol` | two assets share the same `symbol` |
+| `reserved_series` | a derived series id is `open`, `high`, `low`, `close`, or `volume` |
+| `missing_entry` | no rule invokes an action whose `type` is `enter` |
+| `type_error` | a signal expression is not `BOOLEAN`, or an operator's operand has the wrong type. Series names are `NUMERIC`. Earlier signal names are `BOOLEAN`. The check runs inside `from_ir` with that map |
 
 `format_issues` renders one line per issue: `path: message [keyword]`.
 
@@ -399,4 +499,4 @@ Each example is SOL spot on Solana, long-only, with an OCO take-profit and stop-
 
 ## Non-goals
 
-This spec does not define the strategy-file parser, indicator math, historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. Expression text is parsed by `service/app/expr`.
+This spec does not define indicator math, historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. The strategy file parser is `service/app/dsl`. Expression text is parsed by `service/app/expr`. The versioned save envelope is `docs/save-format.md`.

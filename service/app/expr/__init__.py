@@ -19,10 +19,20 @@ from .ast import (
     to_ir,
 )
 from .errors import ExprError
-from .lexer import Token, TokenKind, tokenize
-from .parser import from_ir, parse, parse_condition, parse_numeric
+from .lexer import MAX_NUMBER_LITERAL_DIGITS, Token, TokenKind, tokenize
+from .parser import (
+    MAX_EXPR_DEPTH,
+    MAX_EXPR_SOURCE_LENGTH,
+    from_ir,
+    parse,
+    parse_condition,
+    parse_numeric,
+)
 
 __all__ = [
+    "MAX_EXPR_DEPTH",
+    "MAX_EXPR_SOURCE_LENGTH",
+    "MAX_NUMBER_LITERAL_DIGITS",
     "Binary",
     "Call",
     "Expr",

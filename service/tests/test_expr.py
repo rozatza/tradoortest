@@ -10,6 +10,9 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from app.expr import (
+    MAX_EXPR_DEPTH,
+    MAX_EXPR_SOURCE_LENGTH,
+    MAX_NUMBER_LITERAL_DIGITS,
     Call,
     ExprError,
     ExprType,
@@ -28,7 +31,7 @@ from app.expr import (
 from app.ir.validate import REPO_ROOT, load_schema
 
 EXAMPLES = REPO_ROOT / "schemas" / "examples"
-EXPR_PKG = Path(__file__).resolve().parents[1] / "app" / "expr"
+SERVICE_ROOT = Path(__file__).resolve().parents[1]
 
 # Text form of every signal expression in the three example strategies.
 SIGNAL_TEXT = {
@@ -559,15 +562,280 @@ def test_tokenize_keywords_numbers_and_operators() -> None:
     assert number.offset == 0
 
 
-def test_expr_package_does_not_execute_code() -> None:
-    files = sorted(EXPR_PKG.glob("*.py"))
-    assert len(files) >= 4
-    forbidden = re.compile(r"\b(eval|exec|compile)\s*\(")
+def test_service_does_not_execute_code() -> None:
+    files = sorted(SERVICE_ROOT.rglob("*.py"))
+    assert len(files) >= 8
+    # `re.compile` is the regex compiler. Flag a bare eval/exec/compile call.
+    forbidden = re.compile(r"(?<![\w.])(eval|exec|compile)\s*\(")
     offenders: list[str] = []
     for path in files:
+        if "__pycache__" in path.parts:
+            continue
         for match in forbidden.finditer(path.read_text(encoding="utf-8")):
-            offenders.append(f"{path.name}: {match.group(0)}")
+            offenders.append(f"{path.relative_to(SERVICE_ROOT)}: {match.group(0)}")
     assert offenders == []
+
+
+def _nested_parens(depth: int) -> str:
+    return "(" * depth + "close" + ")" * depth
+
+
+def _nested_calls(depth: int) -> str:
+    expr = "close"
+    for _ in range(depth):
+        expr = f"sma({expr}, 1)"
+    return expr
+
+
+def _nested_not(depth: int) -> str:
+    return "NOT " * depth + "true"
+
+
+def _nested_neg(depth: int) -> str:
+    return "-" * depth + "1"
+
+
+def _nested_not_ir(depth: int) -> dict:
+    node: dict = {"op": "lit", "value": True}
+    for _ in range(depth):
+        node = {"op": "not", "arg": node}
+    return node
+
+
+def _nested_neg_ir(depth: int) -> dict:
+    node: dict = {"op": "lit", "value": 1}
+    for _ in range(depth):
+        node = {"op": "neg", "arg": node}
+    return node
+
+
+def _nested_call_ir(depth: int) -> dict:
+    node: dict = {"op": "lit", "value": True}
+    for _ in range(depth):
+        node = {"op": "bars_since", "args": [node]}
+    return node
+
+
+def test_parentheses_just_under_the_depth_limit() -> None:
+    node = parse(_nested_parens(MAX_EXPR_DEPTH))
+    assert isinstance(node, Ref)
+    assert node.name == "close"
+
+
+def test_parentheses_over_the_depth_limit_are_positioned() -> None:
+    source = _nested_parens(MAX_EXPR_DEPTH + 1)
+    err = _err(source)
+    assert err.code == "expr_too_deep"
+    assert err.offset == MAX_EXPR_DEPTH
+    assert err.line == 1
+    assert err.column == MAX_EXPR_DEPTH + 1
+    assert "nested too deeply" in err.message
+
+
+def test_nested_calls_just_under_the_depth_limit() -> None:
+    node = parse(_nested_calls(MAX_EXPR_DEPTH))
+    assert isinstance(node, IndicatorCall)
+    assert node.name == "sma"
+
+
+def test_nested_calls_over_the_depth_limit_are_positioned() -> None:
+    source = _nested_calls(MAX_EXPR_DEPTH + 1)
+    err = _err(source)
+    assert err.code == "expr_too_deep"
+    assert err.offset == MAX_EXPR_DEPTH * 4
+    assert source[err.offset : err.offset + 3] == "sma"
+    assert err.line == 1
+    assert err.column == err.offset + 1
+
+
+def test_not_just_under_the_depth_limit() -> None:
+    node = parse_condition(_nested_not(MAX_EXPR_DEPTH))
+    assert node.result_type is ExprType.BOOLEAN
+
+
+def test_not_over_the_depth_limit_is_positioned() -> None:
+    source = _nested_not(MAX_EXPR_DEPTH + 1)
+    err = _err(source, parse_condition)
+    assert err.code == "expr_too_deep"
+    assert err.offset == MAX_EXPR_DEPTH * 4
+    assert source[err.offset : err.offset + 3] == "NOT"
+    assert err.column == err.offset + 1
+
+
+def test_unary_minus_just_under_the_depth_limit() -> None:
+    node = parse(_nested_neg(MAX_EXPR_DEPTH))
+    assert node.result_type is ExprType.NUMERIC
+
+
+def test_unary_minus_over_the_depth_limit_is_positioned() -> None:
+    source = _nested_neg(MAX_EXPR_DEPTH + 1)
+    err = _err(source)
+    assert err.code == "expr_too_deep"
+    assert err.offset == MAX_EXPR_DEPTH
+    assert source[err.offset] == "-"
+    assert err.column == err.offset + 1
+
+
+def test_depths_that_used_to_raise_recursion_error_are_positioned() -> None:
+    """Parentheses used to die near 110, calls near 99, NOT and minus near 985."""
+    for source in (_nested_parens(120), _nested_calls(120), _nested_not(200), _nested_neg(200)):
+        err = _err(source)
+        assert err.code == "expr_too_deep"
+        assert err.line >= 1
+        assert err.column >= 1
+
+
+def test_from_ir_not_depth_limit() -> None:
+    assert from_ir(_nested_not_ir(MAX_EXPR_DEPTH)).result_type is ExprType.BOOLEAN
+    with pytest.raises(ExprError) as caught:
+        from_ir(_nested_not_ir(MAX_EXPR_DEPTH + 1))
+    err = caught.value
+    assert err.code == "expr_too_deep"
+    assert err.path is not None
+    assert err.path.count(".arg") == MAX_EXPR_DEPTH + 1
+    assert (err.offset, err.line, err.column) == (0, 1, 1)
+
+
+def test_from_ir_unary_minus_depth_limit() -> None:
+    assert from_ir(_nested_neg_ir(MAX_EXPR_DEPTH)).result_type is ExprType.NUMERIC
+    with pytest.raises(ExprError) as caught:
+        from_ir(_nested_neg_ir(MAX_EXPR_DEPTH + 1), path="$.signals[0].expr")
+    err = caught.value
+    assert err.code == "expr_too_deep"
+    assert err.path is not None
+    assert err.path.startswith("$.signals[0].expr")
+
+
+def _valid_call_nest(wraps: int) -> dict:
+    """Boolean tree with `wraps` nested BARS_SINCE calls. Depth is 2 per wrap."""
+    node: dict = {"op": "lit", "value": True}
+    for _ in range(wraps):
+        node = {
+            "op": "gt",
+            "left": {"op": "bars_since", "args": [node]},
+            "right": {"op": "lit", "value": 0},
+        }
+    return node
+
+
+def test_from_ir_nested_calls_depth_limit() -> None:
+    under = from_ir(_valid_call_nest(MAX_EXPR_DEPTH // 2))
+    assert under.result_type is ExprType.BOOLEAN
+    with pytest.raises(ExprError) as over:
+        from_ir({"op": "not", "arg": _valid_call_nest(MAX_EXPR_DEPTH // 2)})
+    assert over.value.code == "expr_too_deep"
+    with pytest.raises(ExprError) as chain:
+        from_ir(_nested_call_ir(MAX_EXPR_DEPTH + 1), path="$.signals[1].expr")
+    assert chain.value.code == "expr_too_deep"
+    assert chain.value.path is not None
+    assert chain.value.path.startswith("$.signals[1].expr")
+
+
+def test_long_integer_literal_is_a_positioned_error() -> None:
+    source = "1" * 4301
+    err = _err(source)
+    assert err.message == "bad number"
+    assert (err.offset, err.line, err.column) == (0, 1, 1)
+    over = _err("1" * (MAX_NUMBER_LITERAL_DIGITS + 1))
+    assert over.message == "bad number"
+    assert over.offset == 0
+    at_limit = parse("1" * MAX_NUMBER_LITERAL_DIGITS)
+    assert isinstance(at_limit, Lit)
+    assert at_limit.value == int("1" * MAX_NUMBER_LITERAL_DIGITS)
+
+
+def test_expression_length_limit_is_positioned() -> None:
+    source = "1+" * MAX_EXPR_SOURCE_LENGTH
+    err = _err(source)
+    assert err.code == "expression_too_long"
+    assert err.offset == MAX_EXPR_SOURCE_LENGTH
+    assert err.line == 1
+    assert err.column == MAX_EXPR_SOURCE_LENGTH + 1
+
+
+_NAMES = {"rsi_buy": ExprType.BOOLEAN, "x": ExprType.NUMERIC}
+
+
+def test_signal_names_are_boolean_during_parse() -> None:
+    both = parse("rsi_buy AND x > 1", names=_NAMES)
+    assert both.result_type is ExprType.BOOLEAN
+    assert to_ir(both) == {
+        "op": "and",
+        "left": {"op": "ref", "name": "rsi_buy"},
+        "right": {
+            "op": "gt",
+            "left": {"op": "ref", "name": "x"},
+            "right": {"op": "lit", "value": 1},
+        },
+    }
+    assert parse("NOT rsi_buy", names=_NAMES).result_type is ExprType.BOOLEAN
+    bars = parse("BARS_SINCE(rsi_buy)", names=_NAMES)
+    assert isinstance(bars, Call)
+    assert bars.result_type is ExprType.NUMERIC
+    assert to_ir(bars) == {"op": "bars_since", "args": [{"op": "ref", "name": "rsi_buy"}]}
+
+
+def test_from_ir_accepts_not_of_a_signal_ref() -> None:
+    node = from_ir(
+        {"op": "not", "arg": {"op": "ref", "name": "rsi_buy"}},
+        names={"rsi_buy": ExprType.BOOLEAN},
+        path="$.signals[1].expr",
+    )
+    assert node.result_type is ExprType.BOOLEAN
+    assert format_expr(node) == "NOT rsi_buy"
+
+
+def test_signal_used_as_a_number_is_a_positioned_type_error() -> None:
+    source = "rsi_buy + 1"
+    err = _err(source, lambda text: parse(text, names=_NAMES))
+    assert err.code == "type_error"
+    assert err.offset == 0
+    assert err.column == 1
+    assert err.message == "type error: + expects NUMERIC, got BOOLEAN"
+
+
+def test_series_used_as_a_condition_is_a_positioned_type_error() -> None:
+    err = _err("close", lambda text: parse_condition(text, names={"close": ExprType.NUMERIC}))
+    assert err.code == "type_error"
+    assert err.offset == 0
+    assert "expects BOOLEAN, got NUMERIC" in err.message
+    mixed = _err("close AND rsi_buy", lambda text: parse(text, names=_NAMES))
+    assert mixed.code == "type_error"
+    assert mixed.offset == 0
+    assert mixed.message == "type error: AND expects BOOLEAN, got NUMERIC"
+
+
+def test_unknown_name_is_unknown_series() -> None:
+    source = "nope > 1"
+    err = _err(source, lambda text: parse(text, names={}))
+    assert err.code == "unknown_series"
+    assert err.offset == 0
+    assert err.message == "unknown series reference 'nope'"
+    assert isinstance(parse("close", names={}), Ref)
+
+
+def test_from_ir_unknown_name_and_type_error_carry_json_paths() -> None:
+    with pytest.raises(ExprError) as unknown:
+        from_ir({"op": "ref", "name": "nope"}, names={}, path="$.signals[1].expr")
+    assert unknown.value.code == "unknown_series"
+    assert unknown.value.path == "$.signals[1].expr.name"
+    with pytest.raises(ExprError) as typed:
+        from_ir(
+            {"op": "bars_since", "args": [{"op": "ref", "name": "close"}]},
+            names={"close": ExprType.NUMERIC},
+            path="$.signals[1].expr",
+        )
+    assert typed.value.code == "type_error"
+    assert typed.value.path == "$.signals[1].expr.args[0]"
+    added = {
+        "op": "add",
+        "left": {"op": "ref", "name": "rsi_buy"},
+        "right": {"op": "lit", "value": 1},
+    }
+    with pytest.raises(ExprError) as numeric:
+        from_ir(added, names={"rsi_buy": ExprType.BOOLEAN}, path="$.signals[1].expr")
+    assert numeric.value.code == "type_error"
+    assert numeric.value.path == "$.signals[1].expr.left"
 
 
 def test_parse_rejects_non_string() -> None:

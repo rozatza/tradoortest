@@ -12,11 +12,26 @@ class ExprError(Exception):
 
     `message` is the reason without the location prefix. `str(error)` is
     `line:column: message (offset N)`.
+
+    `code` is a stable identifier such as `type_error` or `unknown_series`
+    when the failure has one. `path` is a JSONPath into an IR document when
+    the failure came from `from_ir`.
     """
 
-    def __init__(self, message: str, *, offset: int, line: int, column: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        offset: int,
+        line: int,
+        column: int,
+        code: str | None = None,
+        path: str | None = None,
+    ) -> None:
         self.message = message
         self.offset = offset
         self.line = line
         self.column = column
+        self.code = code
+        self.path = path
         super().__init__(f"{line}:{column}: {message} (offset {offset})")

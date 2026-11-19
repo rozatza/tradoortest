@@ -17,8 +17,20 @@ EXPECTED_FAILURES = {
     "non-solana-chain.json": ("$.assets[0].chain", "const"),
     "non-spot-market.json": ("$.assets[0].market", "const"),
     "oco-missing-stop.json": ("$.actions[0].risk.stop_loss", "required"),
-    "bad-stop-percent.json": ("$.actions[0].risk.stop_loss.percent", "exclusiveMinimum"),
+    "bad-stop-percent.json": ("$.actions[0].risk.stop_loss.percent", "insane_stop_loss"),
     "unknown-signal-ref.json": ("$.rules[0].when", "unknown_signal"),
+    "unknown-action-ref.json": ("$.rules[1].do", "unknown_action"),
+    "unknown-asset-ref.json": ("$.actions[0].asset", "unknown_asset"),
+    "unknown-series-ref.json": ("$.derived_series[0].source", "unknown_series"),
+    "duplicate-signal-id.json": ("$.signals[1].id", "duplicate_id"),
+    "reserved-series.json": ("$.derived_series[0].id", "reserved_series"),
+    "missing-entry.json": ("$.rules", "missing_entry"),
+    "duplicate-symbol.json": ("$.assets[1].symbol", "duplicate_symbol"),
+    "invalid-bar-size.json": ("$.engine.bar_size", "invalid_bar_size"),
+    "invalid-sizing.json": ("$.actions[0].sizing.percent", "invalid_sizing"),
+    "insane-take-profit.json": ("$.actions[0].risk.take_profit.percent", "insane_take_profit"),
+    "stop-percent-100.json": ("$.actions[0].risk.stop_loss.percent", "insane_stop_loss"),
+    "signal-type-error.json": ("$.signals[0].expr", "type_error"),
     "negative-capital.json": ("$.capital.initial", "exclusiveMinimum"),
     "leverage-forbidden.json": ("$.assets[0]", "additionalProperties"),
 }
@@ -87,3 +99,43 @@ def test_non_object_document() -> None:
     issues = validate_ir(["not", "an", "object"])
     assert issues[0].path == "$"
     assert issues[0].keyword == "type"
+
+
+def test_earlier_signal_is_boolean_inside_a_later_signal() -> None:
+    document = _load(EXAMPLES / "rsi-cross.json")
+    document["signals"][1]["expr"] = {
+        "op": "not",
+        "arg": {"op": "ref", "name": "rsi_buy"},
+    }
+    assert validate_ir(document) == []
+
+
+def test_signal_used_as_a_number_is_a_type_error() -> None:
+    document = _load(EXAMPLES / "rsi-cross.json")
+    document["signals"][1]["expr"] = {
+        "op": "add",
+        "left": {"op": "ref", "name": "rsi_buy"},
+        "right": {"op": "lit", "value": 1},
+    }
+    issues = validate_ir(document)
+    typed = next(issue for issue in issues if issue.keyword == "type_error")
+    assert typed.path == "$.signals[1].expr.left"
+    assert "BOOLEAN" in typed.message
+
+
+def test_series_used_as_a_condition_is_a_type_error() -> None:
+    document = _load(EXAMPLES / "rsi-cross.json")
+    document["signals"][0]["expr"] = {"op": "not", "arg": {"op": "ref", "name": "close"}}
+    issues = validate_ir(document)
+    typed = next(issue for issue in issues if issue.keyword == "type_error")
+    assert typed.path == "$.signals[0].expr.arg"
+    assert "NUMERIC" in typed.message
+
+
+def test_unknown_expression_name_is_unknown_series() -> None:
+    document = _load(EXAMPLES / "rsi-cross.json")
+    document["signals"][0]["expr"] = {"op": "ref", "name": "nope"}
+    issues = validate_ir(document)
+    issue = next(issue for issue in issues if issue.keyword == "unknown_series")
+    assert issue.path == "$.signals[0].expr.name"
+    assert "nope" in issue.message

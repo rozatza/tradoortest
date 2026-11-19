@@ -7,13 +7,14 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | Path | What it is |
 | --- | --- |
 | `web/` | Next.js placeholder page. No product features. |
-| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, and the expression parser (`app/expr`). |
+| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), and the strategy-file parser (`app/dsl`). |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
-| `docs/dsl-spec.md` | Strategy DSL and IR contract. |
+| `docs/dsl-spec.md` | Strategy DSL, IR contract, semantic error codes, and the canonical hash. |
+| `docs/save-format.md` | Versioned save envelope (`ir_version`, `format_version`, `ir_hash`). |
 | `docs/design-notes.md` | `user_id` on stored rows, and the single-user auth seam. |
 | `.github/workflows/ci.yml` | Runs `make test`. |
 
-`ir_version` is the string `"1.0"`. The validator is `service/app/ir/validate.py`.
+`ir_version` is the string `"1.0"`. The validator is `service/app/ir/validate.py`. `ir_hash` is sha256 of the canonical JSON.
 
 ## Setup
 
@@ -41,7 +42,7 @@ Run the API locally, after `make install`:
 `make test` is the full check:
 
 - `ruff check` on `service/`
-- `pytest` (health, auth seam, schema, valid examples, invalid fixtures)
+- `pytest` (health, auth seam, schema, valid examples, invalid fixtures, DSL round-trip, canonical hash)
 - `tsc --noEmit` and `next build` in `web/`
 
 Valid IR examples live in `schemas/examples/` (RSI cross, EMA cross, Bollinger revert). Invalid fixtures live in `service/tests/fixtures/invalid/`.
