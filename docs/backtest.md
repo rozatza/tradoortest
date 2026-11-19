@@ -56,18 +56,18 @@ Costs, from the IR, in basis points:
 
 - buy fill price = close × (1 + slippage_bps / 10000)
 - sell fill price = close × (1 − slippage_bps / 10000)
-- on a buy, the cash spent is the budget. Notional is that budget divided by (1 + commission_bps / 10000), rounded half-even to the cent. Commission is the budget minus the notional, so the two sum to the cash that leaves the account.
+- on a buy, the budget is capped by cash. The room for the position is that budget divided by (1 + commission_bps / 10000), rounded half-even to the cent. Quantity is that room divided by the fill price, rounded down to `1e-12`. Notional is the half-even cent of that quantity times the fill price, and it is at most the room. Commission is the notional times commission_bps / 10000, rounded the same way. When the half-even room rounds up, notional plus that commission can be one cent over the budget. Commission is then reduced, by at most one cent, so the two never exceed the budget. On a one-cent budget at 9999 bps that one cent is the whole commission. Unspent dust stays in cash.
 - on a sell, notional is quantity × fill price, rounded half-even to the cent. Commission is the notional × commission_bps / 10000, rounded the same way, and it is never more than the notional. Cash increases by notional − commission.
 
-The mark used for sizing is cash plus quantity × that bar's close, rounded half-even to the cent, before the fill. Reported equity uses the same rounding after the fill. The next decision uses that rounded mark. Quantity itself is not rounded to a cent.
+The mark used for sizing is cash plus quantity × that bar's close, rounded half-even to the cent, before the fill. Reported equity uses the same rounding after the fill. The next decision uses that rounded mark. Quantity is not rounded to a cent. At fill time it is rounded down to `1e-12`, a stand-in for a token's base units, so a buy never receives more than its budget can pay for. The cash spent is the cent of the quantity that was actually filled. A budget that cannot buy one unit is skipped (`no_cash`) and spends nothing. A 100% exit sells the open quantity exactly. A partial exit rounds that percent down to the same grid. A partial exit that rounds to zero is skipped (`no_position`), and the dust quantity stays open. The average fill price is the open quote notional divided by the open quantity. It is stored on the position and read on later bars. It is not stored on the fill, and it is not divided again on a bar that does not trade.
 
 A second run with the same IR and the same bars returns the same fills, skips, and equity. The engine does not use the clock or a random source.
 
 `slippage_bps` of 10000 or more is refused. A sell would fill at 0. The schema still allows 10000; the engine does not.
 
-An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is moved onto `lints`. The warning is not also emitted to the caller. The text names the series and the asset, for example `stoch_k on sol: ...`. A tighten-only rejection is moved onto `lints` the same way.
+An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is moved onto `lints`. The warning is not also emitted to the caller. The text names the series and the asset, for example `stoch_k on sol: ...`. A tighten-only rejection is moved onto `lints` the same way. The lint is the `move_oco` message plus the asset and the bar open time, in unix seconds: `tighten_only rejected a looser stop_loss on sol at bar 1767225600`.
 
-USDC amounts use a local 50-digit decimal context and half-even cents. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
+USDC amounts use a local 50-digit decimal context and half-even cents. The open quantity is a multiple of `1e-12` and the open cost is the cents spent on what is still open. A partial sale removes its share of the open basis (notional plus the buy commission still open), half-even to `1e-30`. A full close removes the basis still open. The amount booked as realized and the amount removed from the open basis are the same number, so the exact pnl identity still holds. A cent is half-even of that grid quantity times the price. `5049.495` rounds to `5049.50` and `5049.485` rounds to `5049.48`. The unrounded product `43175 / 78.834 * 1.655514` is `906.675`, which half-even takes to `906.68`. The grid quantity is one `1e-12` unit smaller, the product is `906.6749999999994`, and the cent is `906.67`. A 50-digit rounding of the unrounded quantity would have landed on the same `906.67` from the other side. The hand round trip and the hand OCO pair sit far from a half-cent, and their cents do not move. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
 
 ## No look-ahead
 
@@ -81,7 +81,7 @@ Buy fill = 100 × 10005 / 10000 = 100.05.
 Budget = 5000.00.
 Notional = round half-even of 5000 × 10000 / 10010 = round half-even of 4995.004995… = 4995.00.
 Commission = 5000.00 − 4995.00 = 5.00.
-Quantity = 4995.00 / 100.05.
+Quantity = 4995.00 / 100.05, rounded down to `1e-12`. The cents below are the half-even cents of that grid quantity.
 Cash left = 5000.00.
 Equity at close 100 = round half-even of 5000 + quantity × 100 = 9992.50.
 
@@ -99,6 +99,8 @@ Every enter carries one OCO pair (`evaluation: on_entry_fill`, `movement: tighte
 - take-profit = `F * (1 + take_profit.percent / 100)`
 - stop-loss = `F * (1 - stop_loss.percent / 100)`
 
+A percent smaller than the 50-digit unit of `F` does not move the level. `1e-300` on a fill of 100 leaves both the stop and the target on the entry. The engine rejects that pair with `BacktestError` (`take_profit and stop_loss percents are too small to move the price off the entry`) and does not attach it.
+
 The pair is attached after that fill. It is not checked against the entry bar. A wick through either level on the fill bar does not exit. The next bar is the first one that can. `Fill.leg` is `market` for a rule, and `take_profit` or `stop_loss` for a leg. One fill cancels the other leg.
 
 On a later real bar, only that bar's low and high are read:
@@ -111,7 +113,7 @@ The path inside the bar is unknown, so the stop wins. That is the intrabar rule 
 
 Prices before sell slippage:
 
-- a take-profit fills at the limit, including when the bar opens above the limit
+- a take-profit fills at the limit, including when the bar opens above the limit. If that raw limit is strictly below the bar's low, `Fill.limit_below_low` is true and the metrics count it. The fill price is still the limit. `docs/metrics.md` has the flag.
 - a stop-loss fills at the stop when the bar opens above the stop
 - a stop-loss fills at the open when the bar opens at or below the stop
 
@@ -121,14 +123,14 @@ OCO runs before the bar's rules. A stop-out closes the long, and a signal exit o
 
 A synthetic bar is not a fill, and it is not a touch. It does not arm a leg. A missing bar has no high or low, so it is not a touch either. The next real bar uses the live rules: the stop fills when that bar's low is at or below the stop, at the stop or at the open when the bar gaps through, and the take-profit fills at the limit. If that bar touches both, the stop wins. Inserting a no-trade minute does not change the fill. If the run ends on the synthetic bar, the long stays open.
 
-A pyramid does not move the anchor. The anchor stays the first entry fill. If the added enter names percents that leave both levels where they are, or move the stop up, or move the target down, the levels update. `move_oco` is that check. A lower stop or a higher target rejects the whole change. Neither price moves. The added quantity still fills. The rejection is a lint, and the same text is what `move_oco` raises. OCO is settled before the bar's rules, so a tighten or a rejected loosen on this bar is first read on the next bar. The entry bar is the exception: the pair is attached during that bar's rules, and the next bar is still the first check.
+A pyramid does not move the anchor. The anchor stays the first entry fill, including when the added fill is below that anchor and the two enters name different percents. If the added enter names percents that leave both levels where they are, or move the stop up, or move the target down, the levels update. `move_oco` is that check. A lower stop or a higher target rejects the whole change, even when the other leg would have tightened. Neither price moves. The added quantity still fills. The rejection is a lint. The text is what `move_oco` raises, then ` on {asset_id} at bar {open_time}` with the bar open time in unix seconds. A NaN or an infinity raises `BacktestError` (`OCO level is not a finite price`), not `decimal.InvalidOperation`. OCO is settled before the bar's rules, so a tighten or a rejected loosen on this bar is first read on the next bar. The entry bar is the exception: the pair is attached during that bar's rules, and the next bar is still the first check.
 
 The hand-computed pair is synthetic and lives in `service/tests/fixtures/backtest/hand_oco.json`. It is not a market print. Capital 10000. Commission 10 bps. Slippage 5 bps. Enter 100% on the first bar, close 100. Take-profit 10%, stop-loss 5%. The first bar's high is 200 and its low is 1. Those wicks are not read.
 
 Buy fill = 100 × 10005 / 10000 = 100.05.
 Notional = round half-even of 10000 × 10000 / 10010 = 9990.01.
 Commission = 10000 − 9990.01 = 9.99.
-Quantity = 9990.01 / 100.05.
+Quantity = 9990.01 / 100.05, rounded down to `1e-12`. The cents below are unchanged.
 
 The next bar trades 100–115 and hits the take-profit only.
 Take-profit = 100.05 × 1.10 = 110.055.
@@ -150,4 +152,4 @@ Sell fill = 92 × 9995 / 10000 = 91.954. Notional = 9181.62. Commission = 9.18. 
 
 ## What this does not do
 
-It does not compute a drawdown report or write a result file. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
+The ratios, the drawdown, and the trade log are `docs/metrics.md`. A ratio that is undefined, or that the cent report cannot quantize, is null on that result. It does not fail the run and it does not raise `BacktestError`. The engine does not write a result file and it does not draw a chart. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
