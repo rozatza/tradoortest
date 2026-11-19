@@ -6,13 +6,21 @@ The caller is `get_current_user`. Today that is `local-user`. A job row stores t
 
 ## Queue
 
-The queue is a SQLite file, `data/backtest-jobs.sqlite`, and a thread pool in the same process. SQLite is already how this process stores bars. A Redis service would be a second process, a hashed dependency, and a network hop for a tool that has one user. The file keeps a finished result after the worker has exited, so `GET` results still works when the process is started again on the same path.
+The queue is a SQLite file, `data/backtest-jobs.sqlite`, and a thread pool in the same process. SQLite is already how this process stores bars. A Redis service would be a second process, a hashed dependency, and a network hop for a tool that has one user. The file keeps a finished result after the worker has exited, so `GET` results still works when the process is started again on the same path, until the retention window ends.
 
 Run one process. Opening the file takes an exclusive lock on `data/backtest-jobs.sqlite.lock`. A second process, including a second uvicorn worker, is refused: it would otherwise mark the first process's live jobs `interrupted`. The lock is released when the process exits, including a crash, so the next process can open the file and mark those jobs interrupted.
 
 On open, a job left `queued` or `running` by a process that stopped is marked `failed` with code `interrupted`. It does not keep a concurrency slot. The request body is deleted at the same time.
 
-The request body, OHLCV bars included, is kept only while the job is `queued` or `running`. It is deleted when the job succeeds, when it fails, and when it is marked interrupted. That row is not a bar cache. Fill prices stay in the result.
+The request body, OHLCV bars included, is kept only while the job is `queued` or `running`. It is deleted when the job succeeds, when it fails, and when it is marked interrupted. That row is not a bar cache.
+
+## Retention
+
+CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. The same note is in `docs/ohlcv.md`. A job result carries fill prices, the trade log, and metrics computed from those bars, so it follows the GeckoTerminal cache.
+
+The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result and any leftover body. A read that finds the job still stored and past the window is HTTP 410 `expired`. A later read of that id is HTTP 404 `not_found`, because the row is gone. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
+
+Keeping results longer than 24 hours waits on ROZ-92, a provider whose terms allow storage.
 
 Default limits are 2 jobs queued or running, and 30 new jobs per minute. The minute is the open 60 seconds before now: a job created exactly 60 seconds ago no longer counts, and one created 59 seconds ago still does. Queued jobs count toward the concurrency cap, not only jobs already `running`. A repeated `request_key` with the same body returns the original job and does not consume either limit. The same key with a different body is HTTP 409 `request_key_reused`.
 
@@ -55,8 +63,8 @@ Validation runs before the job is stored. A bad document, a lone surrogate (incl
 - `metrics` also carries the grid, missing, synthetic, and suspect-outage counts, the in-position twins, and `take_profit_limit_below_low`
 - `trades` and `fills` use the same decimal strings as the trade log
 
-No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404.
+No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404. A job past the retention window is HTTP 410 `expired`, and that read deletes it.
 
 A failed run uses a code, not a 500. That includes `grid_too_large`, `expr_too_deep`, `indicator_error`, `indicator_overflow`, `indicator_non_finite`, and `invalid_string`. `RecursionError` at the route is HTTP 422 `expr_too_deep`.
 
-The result is the row written when the job succeeded. Opening the database again returns the same JSON.
+The result is the row written when the job succeeded. Opening the database again returns the same JSON until the retention window ends. Startup deletes a row that has already ended.

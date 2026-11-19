@@ -28,7 +28,7 @@ from app.expr.errors import ExprError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.ir.validate import validate_ir
-from app.jobs.queue import JobQueue, JobRecord, KeyReused, LimitReached, QueueBusy
+from app.jobs.queue import JobExpired, JobQueue, JobRecord, KeyReused, LimitReached, QueueBusy
 
 router = APIRouter()
 
@@ -60,6 +60,10 @@ def _busy() -> JSONResponse:
     return error_response(503, "busy", "the job database is busy", None)
 
 
+def _expired() -> JSONResponse:
+    return error_response(410, "expired", "the backtest result has expired", None)
+
+
 @router.post("/backtests")
 async def start_backtest(request: Request, user: CurrentUserDep) -> JSONResponse:
     try:
@@ -68,6 +72,8 @@ async def start_backtest(request: Request, user: CurrentUserDep) -> JSONResponse
         return error_response(422, "expr_too_deep", "expression nested too deeply", None)
     except QueueBusy:
         return _busy()
+    except JobExpired:
+        return _expired()
 
 
 @router.get("/backtests/{job_id}")
@@ -76,6 +82,8 @@ def backtest_status(job_id: str, request: Request, user: CurrentUserDep) -> JSON
         job = _queue(request).get(user.user_id, job_id)
     except QueueBusy:
         return _busy()
+    except JobExpired:
+        return _expired()
     except KeyError:
         return error_response(404, "not_found", "backtest job was not found", None)
     return JSONResponse(status_code=200, content=_job_body(job))
@@ -89,6 +97,8 @@ def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSO
         return _busy()
     try:
         job = queue.get(user.user_id, job_id)
+    except JobExpired:
+        return _expired()
     except KeyError:
         return error_response(404, "not_found", "backtest job was not found", None)
     if job.status in {"queued", "running"}:
@@ -100,7 +110,10 @@ def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSO
             "path": None,
         }
         return JSONResponse(status_code=422, content={"error": error})
-    text = queue.result_json(user.user_id, job_id)
+    try:
+        text = queue.result_json(user.user_id, job_id)
+    except JobExpired:
+        return _expired()
     if text is None:
         return error_response(409, "not_ready", "backtest results are not ready", None)
     return JSONResponse(status_code=200, content=json.loads(text))

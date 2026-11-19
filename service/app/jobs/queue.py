@@ -9,7 +9,8 @@ transaction so two requests cannot create two jobs for one key.
 One process holds an exclusive lock file next to the database. A second
 process must not open it: it would mark this process's live jobs interrupted.
 The request body, bars included, is deleted when the job succeeds, fails, or
-is marked interrupted. The result row keeps fill prices.
+is marked interrupted. The result follows the GeckoTerminal cache: at most
+24 hours, then the job, the result, and any leftover body are deleted.
 """
 
 from __future__ import annotations
@@ -29,6 +30,9 @@ from app.jobs.errors import job_error
 from app.jobs.run import run_backtest_job
 
 Runner = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+
+# CoinGecko API terms do not allow a persistent copy. Same cap as the bar cache.
+MAX_RESULT_TTL_SECONDS = 24 * 60 * 60
 
 _CREATE = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -70,6 +74,13 @@ class QueueBusy(Exception):
     """Another process holds this job database."""
 
 
+class JobExpired(Exception):
+    """The job was stored, and its retention window has ended.
+
+    The row, the result, and any leftover body are already deleted.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class JobRecord:
     """One stored job. ``error`` is set when ``status`` is ``failed``."""
@@ -100,6 +111,7 @@ class JobQueue:
         clock: Callable[[], float] | None = None,
         error_from: Callable[[BaseException], dict[str, Any]] | None = None,
         busy_timeout_ms: int = 5000,
+        result_ttl_seconds: int = MAX_RESULT_TTL_SECONDS,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be at least 1")
@@ -107,6 +119,7 @@ class JobQueue:
             raise ValueError("per_minute must be at least 1")
         if busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must be at least 0")
+        self._ttl = _check_result_ttl(result_ttl_seconds)
         self.max_concurrent = max_concurrent
         self.per_minute = per_minute
         self._runner = runner or run_backtest_job
@@ -124,6 +137,7 @@ class JobQueue:
             self._conn.executescript(_CREATE)
             self._ensure_body_hash()
             self._fail_interrupted()
+            self._purge()
         except Exception:
             self._conn_close_quiet()
             self._release_lock()
@@ -144,9 +158,11 @@ class JobQueue:
         payload = json.dumps(body, allow_nan=False, separators=(",", ":"))
         digest = _body_hash(payload)
         created = False
+        removed: set[tuple[str, str]] = set()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                removed = self._purge_unlocked()
                 existing = self._find(user_id, request_key)
                 if existing is None:
                     active = self._conn.execute(
@@ -197,35 +213,66 @@ class JobQueue:
             except Exception:
                 self._rollback()
                 raise
+            if removed:
+                self._checkpoint()
         if created:
             self._executor.submit(self._execute, job_id)
         return self.get(user_id, job_id, created=created)
 
     def get(self, user_id: str, job_id: str, *, created: bool = False) -> JobRecord:
-        """Return the job owned by ``user_id``, or raise ``KeyError``."""
+        """Return the job owned by ``user_id``.
+
+        An id that is still stored past its TTL raises ``JobExpired`` and the
+        row is deleted. An id that is not stored raises ``KeyError``.
+        """
         with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT job_id, user_id, request_key, status, error_json
-                FROM jobs WHERE job_id = ? AND user_id = ?
-                """,
-                (job_id, user_id),
-            ).fetchone()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = self._purge_unlocked()
+                row = self._conn.execute(
+                    """
+                    SELECT job_id, user_id, request_key, status, error_json
+                    FROM jobs WHERE job_id = ? AND user_id = ?
+                    """,
+                    (job_id, user_id),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+            if removed:
+                self._checkpoint()
+        if (job_id, user_id) in removed:
+            raise JobExpired(job_id)
         if row is None:
             raise KeyError(job_id)
         error = json.loads(row[4]) if row[4] else None
         return JobRecord(row[0], row[1], row[2], row[3], error, created)
 
     def result_json(self, user_id: str, job_id: str) -> str | None:
-        """The stored result text, or ``None`` when the job has not finished."""
+        """The stored result text, or ``None`` when the job has not finished.
+
+        A job past its TTL raises ``JobExpired`` and is deleted.
+        """
         with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT result_json FROM job_results
-                WHERE job_id = ? AND user_id = ?
-                """,
-                (job_id, user_id),
-            ).fetchone()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = self._purge_unlocked()
+                row = self._conn.execute(
+                    """
+                    SELECT result_json FROM job_results
+                    WHERE job_id = ? AND user_id = ?
+                    """,
+                    (job_id, user_id),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._rollback()
+                raise
+            if removed:
+                self._checkpoint()
+        if (job_id, user_id) in removed:
+            raise JobExpired(job_id)
         if row is None:
             return None
         return str(row[0])
@@ -266,6 +313,11 @@ class JobQueue:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        removed = self._purge_unlocked()
+                        if any(job == job_id for job, _owner in removed):
+                            self._conn.execute("COMMIT")
+                            self._checkpoint()
+                            return
                         self._conn.execute(
                             """
                             INSERT INTO job_results (job_id, user_id, result_json)
@@ -334,6 +386,52 @@ class JobQueue:
 
     def _delete_body(self, job_id: str) -> None:
         self._conn.execute("DELETE FROM job_bodies WHERE job_id = ?", (job_id,))
+
+    def _purge(self) -> set[tuple[str, str]]:
+        """Delete jobs whose retention window has ended. Startup calls this."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            removed = self._purge_unlocked()
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._rollback()
+            raise
+        if removed:
+            self._checkpoint()
+        return removed
+
+    def _purge_unlocked(self) -> set[tuple[str, str]]:
+        """Delete expired jobs. Caller holds the transaction.
+
+        ``created_at + ttl <= now`` matches the bar cache. The job row, its
+        result, and any leftover body go together. Each item is
+        ``(job_id, user_id)`` so another user's read stays ``not_found``.
+        """
+        cutoff = self._clock() - self._ttl
+        rows = self._conn.execute(
+            "SELECT job_id, user_id FROM jobs WHERE created_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return set()
+        self._conn.execute(
+            """
+            DELETE FROM job_results WHERE job_id IN (
+                SELECT job_id FROM jobs WHERE created_at <= ?
+            )
+            """,
+            (cutoff,),
+        )
+        self._conn.execute(
+            """
+            DELETE FROM job_bodies WHERE job_id IN (
+                SELECT job_id FROM jobs WHERE created_at <= ?
+            )
+            """,
+            (cutoff,),
+        )
+        self._conn.execute("DELETE FROM jobs WHERE created_at <= ?", (cutoff,))
+        return {(str(row[0]), str(row[1])) for row in rows}
 
     def _fail_interrupted(self) -> None:
         """A previous process died. Those rows must not hold a concurrency slot.
@@ -431,6 +529,22 @@ def _unix_time() -> float:
 
 def _body_hash(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _check_result_ttl(seconds: int) -> int:
+    """Reject a retention window longer than the GeckoTerminal cache.
+
+    A longer window is an error, not a clamp. A licensed provider that allows
+    storage is ROZ-92.
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("result TTL must be a whole number of seconds")
+    if seconds < 1 or seconds > MAX_RESULT_TTL_SECONDS:
+        raise ValueError(
+            "result TTL must be from 1 second to 24 hours; "
+            "the CoinGecko API terms do not allow a longer store"
+        )
+    return seconds
 
 
 def _lock_file(path: str | Path) -> IO[str]:

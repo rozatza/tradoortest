@@ -452,9 +452,9 @@ def test_a_queued_job_from_a_dead_process_does_not_hold_a_slot(tmp_path: Path) -
         conn.execute(
             """
             INSERT INTO jobs (job_id, user_id, request_key, status, created_at, error_json)
-            VALUES ('stuck', ?, 'stuck', 'queued', 1, NULL)
+            VALUES ('stuck', ?, 'stuck', 'queued', ?, NULL)
             """,
-            (_LOCAL,),
+            (_LOCAL, time.time()),
         )
     reopened = JobQueue(path, max_concurrent=1, per_minute=10)
     client = _client(reopened)
@@ -598,9 +598,9 @@ def test_bar_values_do_not_remain_after_success_failure_or_interrupt(tmp_path: P
             INSERT INTO jobs (
                 job_id, user_id, request_key, status, created_at, error_json, body_hash
             )
-            VALUES ('stuck', ?, 'stuck', 'queued', 1, NULL, NULL)
+            VALUES ('stuck', ?, 'stuck', 'queued', ?, NULL, NULL)
             """,
-            (_LOCAL,),
+            (_LOCAL, time.time()),
         )
         conn.execute(
             "INSERT INTO job_bodies (job_id, body_json) VALUES ('stuck', ?)",
@@ -844,6 +844,87 @@ def test_a_result_write_retries_a_held_lock(tmp_path: Path) -> None:
         assert proxy.inserts >= 3
     finally:
         queue.close()
+
+
+_DAY = 24 * 60 * 60
+
+
+def test_a_result_is_readable_at_23h59m_and_gone_at_24h01m(tmp_path: Path) -> None:
+    """23h59m is still inside 24h. 24h01m has passed it, so the read deletes the job."""
+    now = {"t": 1_700_000_000.0}
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(
+        path,
+        clock=lambda: now["t"],
+        runner=lambda _body: {"marker": "919191.25"},
+    )
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("kept"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        now["t"] += 23 * 60 * 60 + 59 * 60
+        status = client.get(f"/backtests/{job_id}")
+        assert status.status_code == 200
+        results = client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 200
+        assert results.json()["marker"] == "919191.25"
+        now["t"] += 2 * 60
+        expired = client.get(f"/backtests/{job_id}")
+        assert expired.status_code == 410
+        assert expired.json()["error"]["code"] == "expired"
+        missing = client.get(f"/backtests/{job_id}/results")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "not_found"
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM job_results").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM job_bodies").fetchone() == (0,)
+        assert b"919191.25" not in _db_bytes(path)
+    finally:
+        queue.close()
+
+
+def test_startup_purges_an_expired_result(tmp_path: Path) -> None:
+    now = {"t": 1_700_000_000.0}
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(
+        path,
+        clock=lambda: now["t"],
+        runner=lambda _body: {"marker": "919191.25"},
+    )
+    client = _client(queue)
+    created = client.post("/backtests", json=_payload("old"))
+    job_id = created.json()["job_id"]
+    assert _wait(client, job_id)["status"] == "succeeded"
+    queue.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO job_bodies (job_id, body_json) VALUES (?, ?)",
+            (job_id, '{"volume":"919191.25"}'),
+        )
+    now["t"] += _DAY + 60
+    reopened = JobQueue(path, clock=lambda: now["t"])
+    again = _client(reopened)
+    try:
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM job_results").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM job_bodies").fetchone() == (0,)
+        assert b"919191.25" not in _db_bytes(path)
+        gone = again.get(f"/backtests/{job_id}")
+        assert gone.status_code == 404
+        assert gone.json()["error"]["code"] == "not_found"
+    finally:
+        reopened.close()
+
+
+def test_a_result_ttl_above_24_hours_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="24 hours"):
+        JobQueue(tmp_path / "jobs.sqlite", result_ttl_seconds=_DAY + 1)
+    with pytest.raises(ValueError, match="whole number"):
+        JobQueue(tmp_path / "also.sqlite", result_ttl_seconds=True)  # type: ignore[arg-type]
 
 
 def test_parse_strategy_rejects_a_lone_surrogate_with_a_position() -> None:
