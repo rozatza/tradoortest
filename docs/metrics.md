@@ -1,6 +1,6 @@
 # Backtest metrics and the trade log
 
-`run_backtest` returns `metrics` and `trades` on the same result as the fills. `trade_log_csv` and `trade_log_json` encode the trades. `metrics_csv` and `metrics_json` encode the ratios. The formulas below are what the tests lock. Ratios are `Decimal` values or null, half-even to `1e-10`, computed in a local 50-digit context so the caller's precision does not change them. That context turns the `Inexact` trap off, so a caller that traps `Inexact` still gets the same ratios. It does not blank them as `overflow`. A ratio the definition leaves undefined is null, and `metrics.undefined` maps that field to a reason. The reasons are `too_few_returns`, `zero_variance`, `no_downside`, `no_drawdown`, `no_losses`, `no_wins`, `no_closed_trades`, `zero_initial`, `no_bars`, `too_short`, `annualization_overflow`, and `overflow`. `annualization_overflow` is only the annualized return and Calmar. A net return, Sharpe, Sortino, win rate, or payoff that the `1e-10` quantize cannot hold is `overflow`. A defined zero stays 0. No metric and no trade-log field is NaN or infinite, and a ratio never raises out of the run.
+`run_backtest` returns `metrics` and `trades` on the same result as the fills. `trade_log_csv` and `trade_log_json` encode the trades. `metrics_csv` and `metrics_json` encode the ratios. The formulas below are what the tests lock. Ratios are `Decimal` values or null, half-even to `1e-10`, computed in a fresh 50-digit context. The context is not copied from the caller. Its precision is 50, rounding is half-even, the exponent range is the full decimal range, and the only traps are `InvalidOperation`, `DivisionByZero`, and `Overflow`. The caller's precision, traps, and `Emax` do not change a ratio and cannot put NaN in the output. A ratio the definition leaves undefined is null, and `metrics.undefined` maps that field to a reason. The reasons are `too_few_returns`, `zero_variance`, `no_downside`, `no_drawdown`, `no_losses`, `no_wins`, `no_closed_trades`, `zero_initial`, `no_bars`, `too_short`, `annualization_overflow`, and `overflow`. `annualization_overflow` is only the annualized return and Calmar. A net return, Sharpe, Sortino, win rate, or payoff that the `1e-10` quantize cannot hold is `overflow`. A defined zero stays 0. No metric and no trade-log field is NaN or infinite, and a ratio never raises out of the run.
 
 The risk-free rate is 0. A 365-day year is the clock: `bars_per_year = 365 * 24 * 3600 // bar_seconds`. A 1m bar is 525600, a 5m bar is 105120, a 1d bar is 365. Every `engine.bar_size` divides the year evenly.
 
@@ -16,7 +16,7 @@ The bar return is the simple return
 r_i = (E_i - E_{i-1}) / E_{i-1}
 ```
 
-for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. These returns are the Sharpe and Sortino inputs. They are not re-rounded before the ratio.
+for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. The division is skipped. These returns are the Sharpe and Sortino inputs. Each return, and the sums of those returns, are carried at 50 decimal digits. The published ratio is still the half-even quantize of that result to `1e-10`. On the hand series the `1e-10` digit matches the exact rational.
 
 **Net return** is `(final - initial) / initial`. It uses the last mark, so an open long is in the number. Flat equity is a real 0. If `initial` quantizes to 0 the reason is `zero_initial`. An empty grid is `no_bars`. A net return the `1e-10` quantize cannot hold is null, reason `overflow`.
 
@@ -28,7 +28,7 @@ for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. These returns are the Sharp
 
 `N` here is the number of bar returns, which is `bar_count`.
 
-**Sharpe** is `mean(r) / s * sqrt(bars_per_year)`. `s` is the sample standard deviation: the square root of `sum((r - mean)^2) / (N - 1)`. That is `ddof = 1`, not the population divisor `N`. `N < 2` is null, reason `too_few_returns`, and the value is null rather than 0. A zero variance is null, reason `zero_variance`. A ratio the quantize cannot hold is null, reason `overflow`. A short 1m run still gets a Sharpe. `sqrt(525600)` can make an hour-long Sharpe a large number. That is this formula, not an annualized return.
+**Sharpe** is `mean(r) / s * sqrt(bars_per_year)`. `s` is the sample standard deviation: the square root of `sum((r - mean)^2) / (N - 1)`. The mean and both sums are 50-digit decimals. That is `ddof = 1`, not the population divisor `N`. `N < 2` is null, reason `too_few_returns`, and the value is null rather than 0. A zero variance is null, reason `zero_variance`. A ratio the quantize cannot hold is null, reason `overflow`. A short 1m run still gets a Sharpe. `sqrt(525600)` can make an hour-long Sharpe a large number. That is this formula, not an annualized return.
 
 **Sortino** uses the same mean and the same `sqrt(bars_per_year)`. The downside deviation is `sqrt(sum(min(r, 0)^2) / (N - 1))`. Every return is in the sum. A positive return contributes 0. The divisor is `N - 1`, not the count of negative returns. The target is 0, the same assumption as the risk-free rate. `N < 2` is `too_few_returns`. No negative return is null, reason `no_downside`.
 

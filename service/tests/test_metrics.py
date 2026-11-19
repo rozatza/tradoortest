@@ -13,7 +13,8 @@ import os
 import random
 import subprocess
 import sys
-from decimal import ROUND_HALF_EVEN, Decimal, Inexact, localcontext
+import time
+from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, localcontext
 from fractions import Fraction
 
 from app.backtest import (
@@ -1826,3 +1827,324 @@ def test_a_seeded_ema_and_rsi_across_an_outage_are_linted() -> None:
     assert result.metrics.suspect_outage is True
     assert "ema_3 on sol is computed across 2 suspect_outage bars" in result.lints
     assert "rsi_2 on sol is computed across 2 suspect_outage bars" in result.lints
+
+
+def _quality(bars: int) -> QualityCounts:
+    return QualityCounts(bars, 0, 0, 0, 0, 120, 0, 0, 0, 0)
+
+
+def _no_nan(metrics) -> None:
+    text = metrics_json(metrics)
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    for name in _RATIO_NAMES:
+        value = getattr(metrics, name)
+        if value is not None:
+            assert value.is_finite()
+            assert not value.is_nan()
+
+
+def test_a_caller_context_cannot_put_nan_in_a_ratio() -> None:
+    """InvalidOperation off used to quantize an overflow into Decimal('NaN').
+
+    Emax 30 used to null a finite annualized return, because the ratio context
+    copied the caller's exponent range.
+    """
+    overflow = {
+        "initial": Decimal("1"),
+        "curve": (Decimal("1E+45"),),
+        "closed_pnls": (),
+        "open_trades": 0,
+        "bar_seconds": 86_400,
+        "take_profit_limit_below_low": 0,
+        "quality": _quality(1),
+    }
+    plain_overflow = compute_metrics(**overflow)
+    with localcontext() as ctx:
+        ctx.traps[InvalidOperation] = False
+        trapped = compute_metrics(**overflow)
+    assert plain_overflow.net_return is None
+    assert trapped.net_return is None
+    assert trapped.undefined["net_return"] == "overflow"
+    assert trapped.undefined["annualized_return"] == "overflow"
+    _no_nan(trapped)
+
+    normal = {
+        "initial": Decimal("10000"),
+        "curve": (Decimal("10000"), Decimal("11000")),
+        "closed_pnls": (Decimal("1000"),),
+        "open_trades": 0,
+        "bar_seconds": 86_400,
+        "take_profit_limit_below_low": 0,
+        "quality": _quality(2),
+    }
+    grown = {
+        "initial": Decimal("10000"),
+        "curve": (Decimal("12500"),),
+        "closed_pnls": (),
+        "open_trades": 1,
+        "bar_seconds": 86_400,
+        "take_profit_limit_below_low": 0,
+        "quality": _quality(1),
+    }
+    base_normal = compute_metrics(**normal)
+    base_grown = compute_metrics(**grown)
+    assert base_grown.annualized_return is not None
+    with localcontext() as ctx:
+        ctx.traps[InvalidOperation] = False
+        ctx.Emax = 30
+        trapped_normal = compute_metrics(**normal)
+        trapped_grown = compute_metrics(**grown)
+    assert trapped_normal.sharpe == base_normal.sharpe
+    assert trapped_normal.annualized_return == base_normal.annualized_return
+    assert trapped_grown.annualized_return == base_grown.annualized_return
+    assert trapped_grown.annualized_return.is_finite()
+    _no_nan(trapped_normal)
+    _no_nan(trapped_grown)
+
+
+def test_metrics_on_twenty_thousand_bars_stay_within_a_few_seconds() -> None:
+    curve = tuple(Decimal(10000 + (index % 7) - 3) for index in range(20_000))
+    started = time.perf_counter()
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=curve,
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=60,
+        take_profit_limit_below_low=0,
+        quality=_quality(20_000),
+    )
+    elapsed = time.perf_counter() - started
+    assert elapsed < 5
+    assert metrics.bar_count == 20_000
+    assert metrics.sharpe is not None
+    assert metrics.sharpe.is_finite()
+
+
+def test_a_closed_trade_qty_is_the_entry_quantity() -> None:
+    """Two buys, then a full exit. qty is the sum of the entry fills, not 0."""
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "add", "expr": _eq("close", 150)},
+            {"id": "stop", "expr": _eq("close", 140)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "add_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "add_rule", "when": "add", "do": "add_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(
+        document, {"sol": [_bar(0, 100), _bar(60, 150), _bar(120, 140)]}
+    )
+    trade = result.trades[0]
+    bought = decimal_ratio(Fraction(250, 3))
+    assert trade.status == "closed"
+    assert trade.qty == bought
+    assert trade.qty != 0
+    assert [fill.qty for fill in result.fills if fill.side == "buy"] == [
+        Decimal("50"),
+        decimal_ratio(Fraction(100, 3)),
+    ]
+
+
+def test_a_nan_gap_lints_the_seeded_run_before_the_gap() -> None:
+    """The outage is only in the run that ends at the hole.
+
+    The bars after the hole are too short for EMA(3), so the lint has to come
+    from the run that the gap closed.
+    """
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "ema_3",
+                "kind": "indicator",
+                "indicator": "ema",
+                "source": "close",
+                "params": {"period": 3},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    bars = [
+        _bar(0, 10, synthetic=True),
+        _bar(60, 11, synthetic=True),
+        _bar(120, 12, synthetic=True),
+        _bar(240, 13),
+    ]
+    result = run_backtest(document, {"sol": bars}, long_no_trade_minutes=1)
+    assert "ema_3 on sol is computed across 3 suspect_outage bars" in result.lints
+
+
+def test_a_changed_open_basis_fails_the_run() -> None:
+    """A sub-cent basis error is in the book, not in the checker."""
+    import app.backtest.engine as engine
+
+    real = engine._note_buy
+
+    def planted(*args, **kwargs):
+        real(*args, **kwargs)
+        args[0][args[1]].basis += Fraction(1, 250)
+
+    engine._note_buy = planted
+    try:
+        document = _strategy(
+            costs={"commission_bps": 0, "slippage_bps": 0},
+            signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        )
+        document["actions"][0]["risk"] = _risk(100, 99)
+        try:
+            run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 100)]})
+        except BacktestError as exc:
+            assert "do not match the equity change" in str(exc)
+        else:
+            raise AssertionError("a 0.4 cent basis error was absorbed")
+    finally:
+        engine._note_buy = real
+
+
+def test_two_open_trades_share_a_two_cent_remainder() -> None:
+    def trade(asset: str, trade_id: int) -> Trade:
+        return Trade(
+            trade_id=trade_id,
+            asset_id=asset,
+            status="open",
+            entry_time=0,
+            exit_time=None,
+            qty=Decimal("1"),
+            entry_price=Decimal("1"),
+            exit_price=None,
+            entry_notional=Decimal("1.00"),
+            exit_notional=Decimal("0.00"),
+            commission=Decimal("0.00"),
+            realized_pnl=Decimal("0.00"),
+            unrealized_pnl=Decimal("1.00"),
+            limit_below_low=False,
+            overlaps_suspect_outage=False,
+            synthetic_bars=0,
+            missing_bars=0,
+            long_no_trade_bars=0,
+            long_no_trade_minutes=0,
+            suspect_outage_bars=0,
+            suspect_outage_minutes=0,
+        )
+
+    trades = (trade("sol", 1), trade("jup", 2))
+    # Rounded sum is 2.00. The equity change is 2.02, so each trade takes one cent.
+    spread = _spread_remainder(
+        trades, (Fraction("1.006"), Fraction("1.004")), Decimal("0"), Decimal("2.02")
+    )
+    assert spread[0].unrealized_pnl == Decimal("1.01")
+    assert spread[1].unrealized_pnl == Decimal("1.01")
+    assert abs(spread[0].unrealized_pnl - Decimal("1.00")) <= Decimal("0.01")
+    assert abs(spread[1].unrealized_pnl - Decimal("1.00")) <= Decimal("0.01")
+
+
+def test_a_net_return_past_the_quantize_is_overflow() -> None:
+    metrics = compute_metrics(
+        initial=Decimal("1"),
+        curve=(Decimal("1E+45"),),
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=_quality(1),
+    )
+    assert metrics.net_return is None
+    assert metrics.undefined["net_return"] == "overflow"
+    assert metrics.undefined["annualized_return"] == "overflow"
+    assert metrics.undefined["net_return"] != "annualization_overflow"
+
+
+def test_a_zero_previous_equity_contributes_a_zero_return() -> None:
+    metrics = compute_metrics(
+        initial=Decimal("100"),
+        curve=(Decimal("0"), Decimal("50")),
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=_quality(2),
+    )
+    assert metrics.sharpe is not None
+    assert metrics.sharpe.is_finite()
+    assert "too_few_returns" not in metrics.undefined.values()
+    assert metrics.sortino is not None
+    assert metrics.net_return == Decimal("-0.5")
+
+
+def test_a_half_tie_at_the_tenth_digit_rounds_half_even() -> None:
+    """1.00000000005 ends on an even digit. Half-up would publish 1.0000000001."""
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("20000.0000005"),),
+        closed_pnls=(),
+        open_trades=0,
+        bar_seconds=60,
+        take_profit_limit_below_low=0,
+        quality=_quality(1),
+    )
+    assert metrics.net_return == Decimal("1")
+    assert format(metrics.net_return, "f") == "1.0000000000"
+
+
+def test_calmar_overflows_while_the_annualized_return_stays_defined() -> None:
+    """Doubling in three days annualizes inside 50 digits. The tiny dip does not.
+
+    Calmar is that annualized return divided by a one-cent drawdown, which
+    the 1e-10 quantize cannot hold. Annualized return itself stays a number.
+    """
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("10000"), Decimal("9999.99"), Decimal("20000")),
+        closed_pnls=(),
+        open_trades=1,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=_quality(3),
+    )
+    assert metrics.annualized_return is not None
+    assert metrics.annualized_return.is_finite()
+    assert metrics.max_drawdown == Decimal("0.000001")
+    assert metrics.calmar is None
+    assert metrics.undefined["calmar"] == "annualization_overflow"
+    assert "annualized_return" not in metrics.undefined

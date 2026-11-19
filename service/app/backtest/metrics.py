@@ -1,10 +1,11 @@
 """Backtest metrics. Formulas and edge cases are in ``docs/metrics.md``.
 
-Ratios are half-even to 1e-10 inside a local 50-digit context. That context
-clears the caller's ``Inexact`` trap, so trapping ``Inexact`` does not blank
-a ratio. A ratio the definition leaves undefined is ``None``, and
-``undefined`` names the reason. A defined zero stays 0. Nothing here is NaN
-or infinite, and a ratio that the 1e-10 quantize cannot hold does not raise.
+Ratios are half-even to 1e-10 inside a fresh 50-digit context. That context
+is not a copy of the caller's: full exponents, and only ``InvalidOperation``,
+``DivisionByZero``, and ``Overflow`` trap. A ratio the definition leaves
+undefined is ``None``, and ``undefined`` names the reason. A defined zero
+stays 0. Nothing here is NaN or infinite, and a ratio that the 1e-10
+quantize cannot hold does not raise.
 
 ``annualization_overflow`` is only the annualized return and Calmar. A net
 return, Sharpe, Sortino, win rate, or payoff that will not quantize is
@@ -17,14 +18,15 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
     ROUND_HALF_EVEN,
-    Clamped,
+    Context,
     Decimal,
     DecimalException,
-    Inexact,
-    Rounded,
-    Subnormal,
-    Underflow,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
     localcontext,
 )
 from fractions import Fraction
@@ -119,23 +121,25 @@ def bars_per_year(bar_seconds: int) -> int:
     return _SECONDS_PER_YEAR // bar_seconds
 
 
+def _fresh_context() -> Context:
+    """50-digit half-even context with the module's full exponent range.
+
+    Built from scratch, not copied from the caller. A caller's traps, precision,
+    and ``Emax`` cannot turn a ratio into NaN or into a false overflow.
+    """
+    return Context(
+        prec=50,
+        rounding=ROUND_HALF_EVEN,
+        Emax=MAX_EMAX,
+        Emin=MIN_EMIN,
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
+
+
 @contextmanager
 def _local_ratio() -> Iterator[None]:
-    """50-digit half-even context that does not inherit an ``Inexact`` trap.
-
-    ``localcontext`` copies the caller's traps. A caller trapping ``Inexact``
-    would otherwise turn every quantize into an exception, and the overflow
-    handler would report a null ratio for an ordinary number. Informational
-    traps stay off. ``InvalidOperation`` still raises and becomes a null ratio.
-    """
-    with localcontext() as ctx:
-        ctx.prec = 50
-        ctx.rounding = ROUND_HALF_EVEN
-        ctx.traps[Inexact] = False
-        ctx.traps[Rounded] = False
-        ctx.traps[Subnormal] = False
-        ctx.traps[Underflow] = False
-        ctx.traps[Clamped] = False
+    """Run the block in :func:`_fresh_context`."""
+    with localcontext(_fresh_context()):
         yield
 
 
@@ -151,9 +155,10 @@ def compute_metrics(
 ) -> Metrics:
     """Ratios from the cent equity curve and the closed-trade pnl, in exit order.
 
-    The arithmetic runs in a local 50-digit context, so the caller's precision
-    and ``Inexact`` trap do not change a ratio. An overflow becomes a null
-    ratio. It does not raise.
+    The arithmetic runs in a fresh 50-digit context, so the caller's precision,
+    traps, and exponent range do not change a ratio. Bar-return sums for
+    Sharpe and Sortino are 50-digit decimals, not exact rationals. An overflow
+    becomes a null ratio. It does not raise.
     """
     with _local_ratio():
         return _compute(
@@ -252,16 +257,19 @@ def _blank_reason(periods: int, initial: Decimal) -> str | None:
     return None
 
 
-def _returns(initial: Decimal, curve: Sequence[Decimal]) -> list[Fraction]:
-    previous = Fraction(initial)
-    returns: list[Fraction] = []
+def _returns(initial: Decimal, curve: Sequence[Decimal]) -> list[Decimal]:
+    """One return per curve point, at the active 50-digit precision.
+
+    A previous equity of 0 contributes a 0 return. The division is not done.
+    """
+    previous = initial
+    returns: list[Decimal] = []
     for equity in curve:
-        current = Fraction(equity)
         if previous == 0:
-            returns.append(Fraction(0))
+            returns.append(_ZERO)
         else:
-            returns.append((current - previous) / previous)
-        previous = current
+            returns.append((equity - previous) / previous)
+        previous = equity
     return returns
 
 
@@ -298,25 +306,28 @@ def _drawdown(initial: Decimal, curve: Sequence[Decimal]) -> Decimal:
 
 
 def _risk_ratios(
-    returns: Sequence[Fraction], per_year: int, blank: str | None
+    returns: Sequence[Decimal], per_year: int, blank: str | None
 ) -> tuple[Decimal | None, str | None, Decimal | None, str | None]:
     if blank is not None:
         return None, blank, None, blank
     count = len(returns)
     if count < 2:
         return None, "too_few_returns", None, "too_few_returns"
-    mean = sum(returns, Fraction(0)) / count
-    variance = sum((item - mean) ** 2 for item in returns)
-    downside = sum(min(item, Fraction(0)) ** 2 for item in returns)
+    # 50-digit running sums. Exact rationals make the denominators grow with
+    # the curve, and a long run spends its time in gcd.
+    counted = Decimal(count)
+    mean = sum(returns, _ZERO) / counted
+    variance = sum(((item - mean) ** 2 for item in returns), _ZERO)
+    downside = sum((min(item, _ZERO) ** 2 for item in returns), _ZERO)
     try:
-        mean_dec = _decimal(mean)
         scale = _sqrt(Fraction(per_year))
     except DecimalException:
         return None, "overflow", None, "overflow"
+    divisor = Decimal(count - 1)
     if variance == 0:
         sharpe, sharpe_reason = None, "zero_variance"
     else:
-        sharpe = _scale(mean_dec, variance / (count - 1), scale)
+        sharpe = _scale(mean, variance / divisor, scale)
         sharpe_reason = None if sharpe is not None else "overflow"
     if downside == 0:
         sortino, sortino_reason = None, "no_downside"
@@ -324,15 +335,17 @@ def _risk_ratios(
         # Every return is in the sum. A positive return contributes 0.
         # The divisor is N - 1, the same sample divisor as Sharpe, not the
         # count of negative returns and not N.
-        sortino = _scale(mean_dec, downside / (count - 1), scale)
+        sortino = _scale(mean, downside / divisor, scale)
         sortino_reason = None if sortino is not None else "overflow"
     return sharpe, sharpe_reason, sortino, sortino_reason
 
 
-def _scale(mean: Decimal, second: Fraction, per_year_sqrt: Decimal) -> Decimal | None:
+def _scale(mean: Decimal, second: Decimal, per_year_sqrt: Decimal) -> Decimal | None:
     try:
         with _local_ratio():
-            deviation = _sqrt(second)
+            if second == 0:
+                return None
+            deviation = second.sqrt()
             if deviation == 0:
                 return None
             return _ratio(mean / deviation * per_year_sqrt)

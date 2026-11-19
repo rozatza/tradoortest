@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from app.backtest import BacktestError, move_oco, run_backtest
+from app.backtest import BacktestError, move_oco, run_backtest, trade_log_csv, trade_log_json
 from app.ohlcv.bars import Bar
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
@@ -834,6 +834,26 @@ def test_extreme_prices_price_to_the_cent() -> None:
     assert marked(1e12, 0.01, 1e15) == Decimal("1E+29")
     assert marked(10000, 1e-9, 1e15) == Decimal("1E+28")
     assert marked(10000, 2e-5, 1e9) == Decimal("5E+17")
+    # The open long is still marked at the far close. Serializing that cent in
+    # the default 28-digit context used to raise InvalidOperation.
+    for capital, buy, mark in ((1e12, 0.01, 1e15), (10000, 1e-9, 1e15)):
+        document = _strategy(
+            capital={"initial": capital, "currency": "USDC"},
+            costs={"commission_bps": 0, "slippage_bps": 0},
+            signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        )
+        with localcontext() as ctx:
+            ctx.prec = 28
+            result = run_backtest(
+                document,
+                {"sol": [_bar(0, buy), _bar(60, mark, synthetic=True)]},
+            )
+            csv_text = trade_log_csv(result.trades)
+            payload = json.loads(trade_log_json(result.trades))
+        assert "NaN" not in csv_text
+        assert payload["trades"][0]["unrealized_pnl"]
+        assert "E" not in payload["trades"][0]["unrealized_pnl"]
+        assert "E" not in payload["trades"][0]["entry_price"]
 
 
 def test_sizing_edges_and_a_zero_percent_message() -> None:

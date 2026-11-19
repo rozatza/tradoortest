@@ -13,9 +13,9 @@ import csv
 import io
 import json
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
-from app.backtest.metrics import Metrics, Trade
+from app.backtest.metrics import Metrics, Trade, _local_ratio
 
 SCHEMA = "tradoortest.trade_log.v1"
 METRICS_SCHEMA = "tradoortest.metrics.v1"
@@ -137,4 +137,10 @@ def _cell(trade: Trade, column: str) -> str | None:
 
 
 def _cents(amount: Decimal) -> Decimal:
-    return amount.quantize(Decimal("0.01"))
+    """Two decimal places in the fresh 50-digit context.
+
+    A far mark is already a cent. Quantizing it in the caller's precision
+    raises ``InvalidOperation`` once the number needs more than that precision.
+    """
+    with _local_ratio():
+        return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
