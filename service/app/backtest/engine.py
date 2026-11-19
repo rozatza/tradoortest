@@ -171,7 +171,7 @@ class _Acc:
     limit_below_low: bool = False
     exit_time: int | None = None
     # Open cost including the buy commission still attached to the open quantity.
-    # Exact cents still open, as a rational. A partial sale splits this exactly.
+    # A partial sale removes its share of this, half-even on a 1e-30 grid.
     basis: Fraction = Fraction(0)
     # Booked at each sell from the basis then open. Later buys do not rewrite it.
     realized_exact: Fraction = Fraction(0)
@@ -1079,6 +1079,25 @@ def _note_buy(
     acc.basis += Fraction(notional) + Fraction(commission)
 
 
+# A partial sale's share of basis, in units of 1e-30. Exact ``basis * qty /
+# previous`` multiplies a new denominator into the open basis on every trim.
+_BASIS_QUANTUM = 10**30
+
+
+def _sold_basis(basis: Fraction, qty: Decimal, previous: Decimal) -> Fraction:
+    """Basis removed by one sale.
+
+    A full close takes the basis still open. A partial sale takes
+    ``basis * qty / previous``, half-even to ``1e-30``. The same rounded
+    amount is booked as realized and removed from the open basis, so the
+    pnl identity stays exact and the denominator stays bounded.
+    """
+    if qty == previous:
+        return basis
+    share = basis * Fraction(qty) / Fraction(previous)
+    return Fraction(round(share * _BASIS_QUANTUM), _BASIS_QUANTUM)
+
+
 def _note_sell(
     open_acc: dict[str, _Acc],
     closed_acc: list[_Acc],
@@ -1092,7 +1111,7 @@ def _note_sell(
 ) -> None:
     acc = open_acc[asset_id]
     previous = acc.qty
-    sold_basis = acc.basis * Fraction(qty) / Fraction(previous)
+    sold_basis = _sold_basis(acc.basis, qty, previous)
     acc.realized_exact += Fraction(notional) - Fraction(commission) - sold_basis
     acc.basis -= sold_basis
     if qty == previous:

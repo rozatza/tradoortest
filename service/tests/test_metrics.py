@@ -1933,9 +1933,11 @@ def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
 
 
 def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
-    """20k bars: one asset adds every 10 bars and trims, the other round-trips.
+    """20k bars: one asset adds every bar and trims on four of every ten.
 
-    The budget is absolute. It is not a comparison of two clocks.
+    The other asset round-trips. The budget is absolute. It is not a
+    comparison of two clocks. A 50% trim halves the basis, so this guard
+    does not see a partial sale whose fraction does not terminate.
     """
     document = _strategy(
         costs={"commission_bps": 0, "slippage_bps": 0},
@@ -2015,8 +2017,8 @@ def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
     sol = []
     jup = []
     for index in range(20_000):
-        # Adds every bar. Trims while the close is above 105, which is every
-        # tenth bar, and the position stays open for the whole run.
+        # Adds every bar. The close is above 105 on four of every ten bars,
+        # and the position stays open for the whole run.
         sol_close = 100 + (index % 10)
         sol.append(_bar(60 * index, sol_close))
         jup_close = 110 if index % 2 == 0 else 90
@@ -2027,6 +2029,116 @@ def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
     assert elapsed < 3
     assert len(result.trades) > 500
     assert sum(fill.side == "buy" and fill.asset_id == "sol" for fill in result.fills) > 300
+
+
+def _dca_trim(count: int, *, close_out: bool = False) -> tuple[dict, list[Bar]]:
+    """Buy 1% of equity on every bar at 100 or 110. Trim 33.3% when the close is 110.
+
+    Index 0, 7, 14, … is the trim bar. A closing bar at 50 sells the rest.
+    """
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "add", "expr": _gt("close", 90)},
+            {"id": "trim", "expr": _eq("close", 110)},
+            {"id": "flat", "expr": _eq("close", 50)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 1},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "trim_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 33.3},
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "flat_rule", "when": "flat", "do": "exit_sol"},
+            {"id": "trim_rule", "when": "trim", "do": "trim_sol"},
+            {"id": "add_rule", "when": "add", "do": "enter_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    bars = [_bar(60 * index, 110 if index % 7 == 0 else 100) for index in range(count)]
+    if close_out:
+        bars.append(_bar(60 * count, 50))
+    return document, bars
+
+
+def test_a_partial_sale_keeps_basis_on_a_fixed_grid() -> None:
+    """33.3% trims. An exact split is past 30 denominator digits by the second sale."""
+    import app.backtest.engine as engine
+
+    seen: list[Fraction] = []
+    real = engine._note_sell
+
+    def record(*args, **kwargs):
+        real(*args, **kwargs)
+        asset_id = args[2]
+        acc = args[0].get(asset_id)
+        if acc is None:
+            acc = args[1][-1]
+        seen.append(acc.basis)
+        seen.append(acc.realized_exact)
+
+    engine._note_sell = record
+    try:
+        document, bars = _dca_trim(22, close_out=True)
+        result = run_backtest(document, {"sol": bars})
+    finally:
+        engine._note_sell = real
+    assert len(seen) >= 6
+    limit = 10**30
+    for amount in seen:
+        assert amount.denominator <= limit
+    assert result.final_positions == ()
+    reported = sum(
+        (trade.realized_pnl + trade.unrealized_pnl for trade in result.trades),
+        Decimal("0.00"),
+    )
+    assert reported == result.final_equity - result.metrics.initial_equity
+
+
+def test_repeated_one_third_trims_stay_within_four_seconds() -> None:
+    """Buy 1% every bar and trim 33.3% every seventh bar, for 20k bars.
+
+    A 50% trim only halves the basis. This fraction does not terminate, and
+    an exact split is already many seconds at this length. The budget is
+    absolute.
+    """
+    document, bars = _dca_trim(20_000)
+    started = time.perf_counter()
+    result = run_backtest(document, {"sol": bars})
+    elapsed = time.perf_counter() - started
+    assert elapsed < 4
+    sells = [fill for fill in result.fills if fill.side == "sell"]
+    assert len(sells) > 2_000
+    assert result.final_positions
 
 
 def test_a_closed_trade_qty_is_the_entry_quantity() -> None:

@@ -54,7 +54,7 @@ Closed trades are in exit order. An open trade is not a win, not a loss, and not
 
 **Win streak** and **loss streak** are the longest runs of wins and of losses in that exit order.
 
-Realized pnl is booked at each sell from the basis open at that fill. The basis is the open notional plus the buy commission still attached to the open quantity. A sell removes `sold / open_qty` of that basis. Realized increases by
+Realized pnl is booked at each sell from the basis open at that fill. The basis is the open notional plus the buy commission still attached to the open quantity. A full close removes the basis still open. A partial sale removes `sold / open_qty` of that basis, rounded half-even to `1e-30`, so a long run of partial sales does not grow the denominator without a bound. The same rounded amount is booked and removed. Realized increases by
 
 ```text
 sell_notional - sell_commission - basis_removed

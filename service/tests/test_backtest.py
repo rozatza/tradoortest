@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from app.backtest import BacktestError, move_oco, run_backtest, trade_log_csv, trade_log_json
-from app.backtest.money import floor_qty
+from app.backtest.engine import _between, _flag_prefix
+from app.backtest.money import decimal_ratio, floor_qty
 from app.ohlcv.bars import Bar
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
@@ -241,7 +242,10 @@ def test_hand_computed_round_trip_matches_to_the_cent() -> None:
     assert buy.price == _BUY_PRICE
     assert buy.notional == _BUY_NOTIONAL
     assert buy.commission == _BUY_COMMISSION
-    assert buy.qty == floor_qty(Fraction(_BUY_NOTIONAL) / Fraction(_BUY_PRICE))
+    # floor(4995 / 100.05 * 1e12) / 1e12, from integer division. This remainder
+    # is below one half, so the case that separates floor from half-even is
+    # the 5000 / 3 buy below.
+    assert buy.qty == Decimal("49.925037481259")
     assert buy.equity_after == _EQUITY_AFTER_BUY
     assert sell.side == "sell"
     assert sell.price == _SELL_PRICE
@@ -1789,6 +1793,279 @@ def test_a_pyramid_below_the_anchor_uses_the_first_fill() -> None:
     assert [fill.leg for fill in result.fills] == ["market", "market", "take_profit"]
     assert result.fills[2].price == Decimal("110")
     assert result.final_positions == ()
+
+
+def test_fill_quantity_rounds_down_not_half_even() -> None:
+    """5000 / 3 sits 2/3 of the way to the next 1e-12 unit. Half-even rounds up."""
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 3)]})
+    scaled = Fraction(5000) / Fraction(3) * 10**12
+    units = scaled.numerator // scaled.denominator
+    expected = Decimal((0, tuple(map(int, str(units))), -12))
+    # The remainder is 2/3 of a unit, so half-even is the next unit up.
+    rounded_up = Decimal((0, tuple(map(int, str(units + 1))), -12))
+    assert expected == Decimal("1666.666666666666")
+    assert rounded_up == Decimal("1666.666666666667")
+    assert result.fills[0].qty == expected
+    assert result.fills[0].notional == Decimal("5000.00")
+
+
+def test_floor_qty_stays_down_past_fifty_digits() -> None:
+    """A 61-digit unit count. ``scaleb`` in a 50-digit context would drop the tail."""
+    units = 10**60 + 5
+    floored = floor_qty(Fraction(units, 10**12))
+    exact = Decimal((0, tuple(map(int, str(units))), -12))
+    assert floored == exact
+    assert str(floored).endswith("000000000005")
+
+
+def test_commission_is_clamped_when_the_room_rounds_up() -> None:
+    """A one-cent budget at 9999 bps. The unclamped commission is the whole cent.
+
+    Room is half-even of 0.01 * 10000 / 19999, which rounds up to 0.01.
+    Notional is 0.01 and the rounded commission is another 0.01. The clamp
+    sets commission to zero so the account does not go negative.
+    """
+    document = _strategy(
+        capital={"initial": 0.01, "currency": "USDC"},
+        costs={"commission_bps": 9999, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 1)]})
+    assert result.fills[0].notional == Decimal("0.01")
+    assert result.fills[0].commission == Decimal("0.00")
+    assert result.final_cash == Decimal("0.00")
+    assert min(point.cash for point in result.equity_curve) == Decimal("0.00")
+
+
+def test_trade_span_counts_the_entry_bar_and_not_the_bar_before_it() -> None:
+    """The flagged bar before the entry is outside the trade. The entry bar is inside."""
+    grid = [0, 60, 120, 180, 240]
+    # Before the entry, the entry, a quiet middle, the exit, and nothing past it.
+    prefix = _flag_prefix([False, True, True, False, True])
+    assert _between(prefix, grid, 120, 240) == 2
+
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "stop", "expr": _eq("close", 110)},
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    result = run_backtest(
+        document,
+        {
+            "sol": [
+                _bar(0, 50),
+                _bar(120, 100),
+                _bar(180, 100, synthetic=True),
+                _bar(240, 110),
+            ]
+        },
+    )
+    trade = result.trades[0]
+    assert trade.entry_time == _START + 120
+    assert trade.exit_time == _START + 240
+    assert trade.missing_bars == 0
+    assert trade.synthetic_bars == 1
+
+
+def _entry_band(low: int, high: int, close: int) -> dict:
+    """True when ENTRY_PRICE is inside (low, high) and the close matches."""
+    entry = {"op": "entry_price", "args": []}
+    return {
+        "op": "and",
+        "left": {
+            "op": "and",
+            "left": {"op": "gt", "left": entry, "right": {"op": "lit", "value": low}},
+            "right": {"op": "lt", "left": entry, "right": {"op": "lit", "value": high}},
+        },
+        "right": _eq("close", close),
+    }
+
+
+def test_entry_price_updates_after_an_add() -> None:
+    """50 at 100, then 40 at 125. The average is 10000/90, not 100 and not 125.
+
+    The take-profit is 200, so the add at 125 does not close the long. The
+    next bar sells only when ENTRY_PRICE is between 105 and 120.
+    """
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "add", "expr": _eq("close", 125)},
+            {"id": "check", "expr": _entry_band(105, 120, 130)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "add_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "add_rule", "when": "add", "do": "add_sol"},
+            {"id": "check_rule", "when": "check", "do": "exit_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    held = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 125)]})
+    position = held.final_positions[0]
+    assert position.qty == Decimal("90")
+    assert position.entry_price == decimal_ratio(Fraction(10000) / Fraction(90))
+    checked = run_backtest(
+        document, {"sol": [_bar(0, 100), _bar(60, 125), _bar(120, 130)]}
+    )
+    assert [fill.side for fill in checked.fills] == ["buy", "buy", "sell"]
+    assert checked.final_positions == ()
+
+
+def test_entry_price_stays_the_average_after_a_partial_trim() -> None:
+    """Selling 25% leaves the average at 100. Leaving the cost unreduced makes it 133.33.
+
+    The next bar sells only when ENTRY_PRICE is still between 50 and 110.
+    """
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "trim", "expr": _eq("close", 130)},
+            {"id": "check", "expr": _entry_band(50, 110, 140)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "trim_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 25},
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "trim_rule", "when": "trim", "do": "trim_sol"},
+            {"id": "check_rule", "when": "check", "do": "exit_sol"},
+        ],
+    )
+    held = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 130)]})
+    position = held.final_positions[0]
+    assert position.qty == Decimal("75")
+    assert position.entry_price == Decimal("100")
+    checked = run_backtest(
+        document, {"sol": [_bar(0, 100), _bar(60, 130), _bar(120, 140)]}
+    )
+    assert [fill.qty for fill in checked.fills] == [
+        Decimal("100"),
+        Decimal("25"),
+        Decimal("75"),
+    ]
+    assert checked.final_positions == ()
+
+
+def test_a_partial_exit_that_rounds_to_zero_leaves_the_dust_open() -> None:
+    """One 1e-12 unit. Half of it floors to zero, so the exit is no_position."""
+    document = _strategy(
+        capital={"initial": 1, "currency": "USDC"},
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": {"op": "lit", "value": True}},
+            {"id": "trim", "expr": {"op": "lit", "value": True}},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "trim_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 50},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "trim_rule", "when": "trim", "do": "trim_sol"},
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 1_000_000_000_000)]})
+    assert result.fills[0].qty == Decimal("0.000000000001")
+    assert [item.reason for item in result.skipped] == ["no_position"]
+    assert result.final_positions[0].qty == Decimal("0.000000000001")
 
 
 def test_a_same_bar_reenter_after_an_oco_fill_anchors_a_new_pair() -> None:
