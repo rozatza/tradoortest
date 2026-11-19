@@ -36,8 +36,17 @@ class FetchPage:
 
     ``provider_empty`` is true only when the provider returned no candles at
     all. A page that returned older candles is not empty: ``seed`` is the
-    latest of those candles, and it is the prior close for the quiet range.
+    latest usable older candle, and it is the prior close for the quiet range.
+    A rejected candle and a conflicting timestamp are not that seed.
     ``seed`` sits before ``start``. It is not one of ``bars``.
+
+    A source that never sets ``provider_empty`` cannot report an empty-page
+    gap. The flag defaults to false, including the one-page result from a
+    source that only implements ``fetch_bars``. An empty response is then an
+    ordinary fetched span. A prior close already stored in an abutting span
+    is copied across it as synthetic bars, and the report does not call that
+    range a gap. A later source has to set the flag when the provider
+    returned no candles.
     """
 
     bars: list[Bar]
@@ -75,4 +84,6 @@ def iter_pages(
         yield from fetch_pages(mint, timeframe, start, end)
         return
     result = source.fetch_bars(mint, timeframe, start, end)
+    # No provider_empty and no seed. This source cannot tell a quiet page
+    # from a provider that returned nothing, so it cannot report that gap.
     yield FetchPage(list(result.bars), list(result.rejected), start, end)

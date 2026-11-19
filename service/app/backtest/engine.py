@@ -8,7 +8,10 @@ market order on that bar is skipped. It is not queued for a later real bar.
 
 Fills happen at that bar's close (``fill_price_mode=on_close``) after
 slippage. The book is long-only spot: cash plus open longs, in USDC cents.
-``risk`` on an entry is ignored. Take-profit and stop-loss are a later task.
+An entry's OCO pair is attached at the fill and is not read on that bar.
+Take-profit fills at its limit. Stop-loss fills at the stop, or at the open
+when the bar gaps through the stop. A synthetic bar cannot touch a leg, the
+same as a missing bar. The next real bar is read on its own.
 
 The decision for bar ``i`` reads bars ``0..i`` only. Indicator functions are
 the causal library in ``app.indicators``, called on the grid with holes left
@@ -55,7 +58,11 @@ _BUILTINS = ("open", "high", "low", "close", "volume")
 
 @dataclass(frozen=True, slots=True)
 class Fill:
-    """One simulated market fill. ``side`` is buy to open or sell to close a long."""
+    """One simulated fill. ``side`` is buy to open or sell to close a long.
+
+    ``leg`` is ``market`` for a rule, or ``take_profit`` / ``stop_loss`` for
+    the OCO pair attached at the entry fill.
+    """
 
     open_time: int
     asset_id: str
@@ -65,6 +72,7 @@ class Fill:
     notional: Decimal
     commission: Decimal
     equity_after: Decimal
+    leg: str = "market"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +127,20 @@ class _Position:
 
 
 @dataclass
+class _Oco:
+    """Levels anchored to the first entry fill."""
+
+    take_profit: Decimal
+    stop_loss: Decimal
+    attached_at: int
+    anchor: Decimal
+
+
+@dataclass
 class _Book:
     cash: Decimal
     positions: dict[str, _Position]
+    ocos: dict[str, _Oco]
 
 
 @dataclass
@@ -131,6 +150,32 @@ class _Frame:
     by_time: dict[int, Bar]
     series: dict[str, list[float]]
     present: list[bool]
+
+
+def move_oco(
+    take_profit: Decimal,
+    stop_loss: Decimal,
+    new_take_profit: Decimal,
+    new_stop_loss: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """Return tightened long levels, or raise when a leg would loosen.
+
+    The stop may stay or move up. The target may stay or move down. Moving
+    either the other way rejects the whole change: the caller keeps both
+    previous prices. A target that is not strictly above the stop is rejected
+    too.
+    """
+    looser: list[str] = []
+    if new_stop_loss < stop_loss:
+        looser.append("stop_loss")
+    if new_take_profit > take_profit:
+        looser.append("take_profit")
+    if looser:
+        names = " and ".join(looser)
+        raise BacktestError(f"tighten_only rejected a looser {names}")
+    if new_stop_loss <= 0 or new_take_profit <= new_stop_loss:
+        raise BacktestError("tighten_only rejected a take-profit that is not above the stop")
+    return new_take_profit, new_stop_loss
 
 
 def run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]]) -> BacktestResult:
@@ -171,11 +216,9 @@ def _run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]]
         return BacktestResult((), (), (), initial, initial, ())
     grid = list(range(min(times), max(times) + step, step))
     _align(frames, grid)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", IndicatorLint)
-        _derive(document["derived_series"], frames)
-    lints = _series_lints(document["derived_series"], frames, len(grid))
-    lints = lints + _indicator_lints(caught)
+    indicator_lints = _derive(document["derived_series"], frames)
+    lints = list(_series_lints(document["derived_series"], frames, len(grid)))
+    lints.extend(indicator_lints)
     return _walk(document, frames, grid, warmup, initial, lints)
 
 
@@ -247,13 +290,34 @@ def _align(frames: dict[str, _Frame], grid: list[int]) -> None:
         frame.present = present
 
 
-def _derive(specs: Sequence[Mapping[str, Any]], frames: dict[str, _Frame]) -> None:
+def _derive(specs: Sequence[Mapping[str, Any]], frames: dict[str, _Frame]) -> tuple[str, ...]:
+    """Write derived series and return indicator warnings moved onto the result.
+
+    ``catch_warnings`` takes the warning off the caller's filter, so it is
+    not also emitted. The text names the series and the asset.
+    """
+    notes: list[str] = []
+    seen: set[str] = set()
     for spec in specs:
-        for frame in frames.values():
+        series_id = str(spec["id"])
+        for asset_id, frame in frames.items():
             source = frame.series.get(spec["source"])
             if source is None:
                 raise BacktestError(f"unknown series {spec['source']}")
-            frame.series[spec["id"]] = _indicator(spec, source, frame)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", IndicatorLint)
+                frame.series[series_id] = _indicator(spec, source, frame)
+            for item in caught:
+                if not issubclass(item.category, IndicatorLint):
+                    continue
+                text = str(item.message).strip()
+                if not text:
+                    continue
+                note = f"{series_id} on {asset_id}: {text}"
+                if note not in seen:
+                    seen.add(note)
+                    notes.append(note)
+    return tuple(notes)
 
 
 def _indicator(spec: Mapping[str, Any], source: Sequence[float], frame: _Frame) -> list[float]:
@@ -311,29 +375,15 @@ def _series_lints(
     return tuple(notes)
 
 
-def _indicator_lints(caught: list[warnings.WarningMessage]) -> tuple[str, ...]:
-    """Indicator library warnings, once each, on the result a caller reads."""
-    notes: list[str] = []
-    seen: set[str] = set()
-    for item in caught:
-        if not issubclass(item.category, IndicatorLint):
-            continue
-        text = str(item.message).strip()
-        if text and text not in seen:
-            seen.add(text)
-            notes.append(text)
-    return tuple(notes)
-
-
 def _walk(
     document: Mapping[str, Any],
     frames: dict[str, _Frame],
     grid: list[int],
     warmup: int,
     initial: Decimal,
-    lints: tuple[str, ...],
+    lints: list[str],
 ) -> BacktestResult:
-    book = _Book(cash=initial, positions={})
+    book = _Book(cash=initial, positions={}, ocos={})
     signals = {signal["id"]: signal["expr"] for signal in document["signals"]}
     actions = {action["id"]: action for action in document["actions"]}
     rules = list(document["rules"])
@@ -355,6 +405,15 @@ def _walk(
         _mark_bar(frames, grid, index, marks, last_mark)
         truth = _snapshot(pairs, signals, frames, memory, book, index)
         if index >= warmup:
+            _settle_ocos(
+                book,
+                frames,
+                open_time,
+                fills,
+                marks,
+                commission_bps=commission_bps,
+                slippage_bps=slippage_bps,
+            )
             for rule in rules:
                 action = actions[rule["do"]]
                 asset_id = action["asset"]
@@ -383,6 +442,10 @@ def _walk(
                     skipped.append(SkippedOrder(open_time, asset_id, action["id"], outcome))
                     continue
                 side, qty, price, notional, commission = outcome
+                if side == "buy":
+                    _arm_oco(book, action, price, open_time, lints)
+                elif asset_id not in book.positions:
+                    book.ocos.pop(asset_id, None)
                 fills.append(
                     Fill(
                         open_time,
@@ -393,6 +456,7 @@ def _walk(
                         notional,
                         commission,
                         _equity(book, marks),
+                        "market",
                     )
                 )
         curve.append(EquityPoint(open_time, _equity(book, marks), book.cash))
@@ -408,7 +472,7 @@ def _walk(
         final_equity,
         book.cash,
         positions,
-        lints,
+        tuple(lints),
     )
 
 
@@ -462,6 +526,140 @@ def _snapshot(
         )
         truth[(signal_id, asset_id)] = value is True
     return truth
+
+
+def _settle_ocos(
+    book: _Book,
+    frames: dict[str, _Frame],
+    open_time: int,
+    fills: list[Fill],
+    marks: dict[str, Decimal],
+    *,
+    commission_bps: Decimal,
+    slippage_bps: Decimal,
+) -> None:
+    """Fill a touched OCO leg before this bar's rules.
+
+    The entry bar is skipped: the pair is attached later in the bar, and a
+    pair whose ``attached_at`` is this bar is not read. A missing bar and a
+    synthetic bar are not touches. The next real bar is evaluated on its own
+    high and low.
+    """
+    for asset_id in frames:
+        oco = book.ocos.get(asset_id)
+        if oco is None or asset_id not in book.positions:
+            book.ocos.pop(asset_id, None)
+            continue
+        if oco.attached_at == open_time:
+            continue
+        bar = frames[asset_id].by_time.get(open_time)
+        if bar is None or bar.synthetic:
+            continue
+        leg = _oco_leg(bar, oco)
+        if leg is None:
+            continue
+        _fill_oco(
+            book,
+            asset_id,
+            leg,
+            _live_price(bar, oco, leg),
+            open_time,
+            fills,
+            marks,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
+
+
+def _oco_leg(bar: Bar | None, oco: _Oco) -> str | None:
+    """Stop wins when one bar touches both levels. A hole touches neither."""
+    if bar is None:
+        return None
+    if _price(bar.low) <= oco.stop_loss:
+        return "stop_loss"
+    if _price(bar.high) >= oco.take_profit:
+        return "take_profit"
+    return None
+
+
+def _live_price(bar: Bar, oco: _Oco, leg: str) -> Decimal:
+    """Limit at the target. Stop at the stop, or at the open when gapped through."""
+    opened = _price(bar.open)
+    if leg == "stop_loss" and opened <= oco.stop_loss:
+        return opened
+    if leg == "stop_loss":
+        return oco.stop_loss
+    return oco.take_profit
+
+
+def _fill_oco(
+    book: _Book,
+    asset_id: str,
+    leg: str,
+    raw_price: Decimal,
+    open_time: int,
+    fills: list[Fill],
+    marks: dict[str, Decimal],
+    *,
+    commission_bps: Decimal,
+    slippage_bps: Decimal,
+) -> None:
+    outcome = _exit(
+        asset_id,
+        Decimal(100),
+        raw_price,
+        book,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+    )
+    book.ocos.pop(asset_id, None)
+    if isinstance(outcome, str):
+        return
+    side, qty, price, notional, commission = outcome
+    fills.append(
+        Fill(
+            open_time,
+            asset_id,
+            side,
+            qty,
+            price,
+            notional,
+            commission,
+            _equity(book, marks),
+            leg,
+        )
+    )
+
+
+def _arm_oco(
+    book: _Book,
+    action: Mapping[str, Any],
+    fill_price: Decimal,
+    open_time: int,
+    lints: list[str],
+) -> None:
+    """Attach the pair on the first fill. A later enter may only tighten it."""
+    asset_id = action["asset"]
+    current = book.ocos.get(asset_id)
+    if current is None:
+        take_profit, stop_loss = _oco_levels(fill_price, action["risk"])
+        book.ocos[asset_id] = _Oco(take_profit, stop_loss, open_time, fill_price)
+        return
+    take_profit, stop_loss = _oco_levels(current.anchor, action["risk"])
+    try:
+        tightened = move_oco(current.take_profit, current.stop_loss, take_profit, stop_loss)
+    except BacktestError as exc:
+        lints.append(str(exc))
+        return
+    current.take_profit, current.stop_loss = tightened
+
+
+def _oco_levels(anchor: Decimal, risk: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
+    take_pct = _dec(risk["take_profit"]["percent"])
+    stop_pct = _dec(risk["stop_loss"]["percent"])
+    take_profit = anchor * (Decimal(100) + take_pct) / Decimal(100)
+    stop_loss = anchor * (Decimal(100) - stop_pct) / Decimal(100)
+    return take_profit, stop_loss
 
 
 def _fill(

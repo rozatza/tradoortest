@@ -15,7 +15,7 @@ from app.auth import LOCAL_USER_ID
 from app.ohlcv.adapters import open_source
 from app.ohlcv.adapters.geckoterminal import GeckoTerminalSource
 from app.ohlcv.backfill import main, plan_window, run_backfill
-from app.ohlcv.bars import Bar, BarRejection
+from app.ohlcv.bars import Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, StoreError
 from app.ohlcv.registry import MAJORS, SOL_MINT
 from app.ohlcv.source import FetchPage, FetchResult
@@ -1499,6 +1499,243 @@ def test_a_quiet_run_one_minute_past_the_threshold_is_flagged(tmp_path: Path) ->
                 "end": "2026-01-01T02:02:00Z",
                 "minutes": 121,
             }
+        ]
+    finally:
+        store.close()
+
+
+def _orders(
+    path: Path,
+    candles: list[list[object]],
+    windows: list[tuple[int, int]],
+    *,
+    load_start: int,
+    load_end: int,
+) -> tuple[list[tuple[int, float, bool]], list[tuple[int | None, tuple[str, ...]]]]:
+    """Store the same candles once per window order. The caller compares them."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        before = int(request.url.params["before_timestamp"])
+        limit = int(request.url.params["limit"])
+        page = sorted(
+            (row for row in candles if int(row[0]) <= before),
+            key=lambda row: int(row[0]),
+            reverse=True,
+        )[:limit]
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(client, min_interval=0, sleep=lambda _seconds: None)
+    store = SqliteBarStore(path)
+    try:
+        for start, end in windows:
+            run_backfill(
+                source=source,
+                store=store,
+                assets=(MAJORS[0],),
+                start=start,
+                end=end,
+                timeframes=("1m",),
+                user_id=LOCAL_USER_ID,
+                generated_at=end,
+            )
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=load_start,
+            end=load_end,
+        )
+        rejected = store.rejections(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=load_start,
+            end=load_end,
+        )
+        bars = [(bar.open_time, bar.close, bar.synthetic) for bar in stored]
+        flags = [(item.open_time, item.reasons) for item in rejected]
+        return bars, flags
+    finally:
+        store.close()
+        client.close()
+
+
+def test_a_conflicting_prior_candle_is_not_the_seed(tmp_path: Path) -> None:
+    """A duplicate timestamp must not become the prior close in either order.
+
+    The conflicting minute stays rejected. Synthetic bars copy the older
+    real close of 1.5, not 8 or 9, and the rejection row is not deleted.
+    """
+    t0 = _START
+    t1 = _START + 60
+    t2 = _START + 120
+    t4 = _START + 240
+    candles: list[list[object]] = [
+        _candle(t0, 1.5),
+        [t1, 1.0, 2.0, 0.5, 9.0, 1.0],
+        [t1, 1.0, 2.0, 0.5, 8.0, 1.0],
+    ]
+    windows = [(t0, t4), (t2, t4)]
+    runs = [
+        _orders(
+            tmp_path / f"order-{index}.sqlite",
+            candles,
+            list(order),
+            load_start=t0,
+            load_end=t4,
+        )
+        for index, order in enumerate(itertools.permutations(windows))
+    ]
+    assert runs[0] == runs[1]
+    narrow = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t2, t4)],
+        load_start=t0,
+        load_end=t4,
+    )
+    assert narrow == runs[0]
+    bars, rejected = runs[0]
+    assert (t0, 1.5, False) in bars
+    assert all(open_time != t1 for open_time, _close, _synthetic in bars)
+    assert (t2, 1.5, True) in bars
+    assert (t2 + 60, 1.5, True) in bars
+    assert all(close not in (8.0, 9.0) for _open_time, close, _synthetic in bars)
+    assert rejected == [(t1, ("conflicting candles for the same open_time",))]
+
+
+@pytest.mark.parametrize(
+    ("bad", "reason"),
+    [
+        ([_START + 60, "nope", 2.0, 0.5, 1.5, 1.0], "not a number"),
+        ([_START + 60, 1.0, 1.0, 0.5, 9.0, 1.0], "high is below"),
+    ],
+)
+def test_an_unparseable_newest_candle_is_not_synthetic_in_either_order(
+    tmp_path: Path, bad: list[object], reason: str
+) -> None:
+    """The newest candle cannot be parsed. It must not become a flat bar.
+
+    A later window on its own used to extend the seed span across that
+    minute and copy the older close into it. The wide window rejected it.
+    Both orders now leave the minute rejected and copy 1.5 only after it.
+    """
+    t0 = _START
+    t1 = _START + 60
+    t2 = _START + 120
+    t4 = _START + 240
+    candles: list[list[object]] = [_candle(t0, 1.5), bad]
+    windows = [(t0, t4), (t2, t4)]
+    runs = [
+        _orders(
+            tmp_path / f"order-{index}.sqlite",
+            candles,
+            list(order),
+            load_start=t0,
+            load_end=t4,
+        )
+        for index, order in enumerate(itertools.permutations(windows))
+    ]
+    assert runs[0] == runs[1]
+    narrow = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t2, t4)],
+        load_start=t0,
+        load_end=t4,
+    )
+    assert narrow == runs[0]
+    bars, rejected = runs[0]
+    assert (t0, 1.5, False) in bars
+    assert all(open_time != t1 for open_time, _close, _synthetic in bars)
+    assert (t2, 1.5, True) in bars
+    assert all(close != 9.0 for _open_time, close, _synthetic in bars)
+    assert len(rejected) == 1
+    assert rejected[0][0] == t1
+    assert any(reason in item for item in rejected[0][1])
+
+
+def test_a_narrow_window_alone_seeds_the_latest_valid_older_close(tmp_path: Path) -> None:
+    """The seed is the newest older candle that passed, not an earlier one.
+
+    t0 close 1.5 and t1 close 4 are both valid. The window starts at t3, so
+    the seed is t1. The invalid minute between them stays rejected. A wide
+    window is not required to reach that result.
+    """
+    t0 = _START
+    t1 = _START + 60
+    t2 = _START + 120
+    t3 = _START + 180
+    t5 = _START + 300
+    candles: list[list[object]] = [
+        _candle(t0, 1.5),
+        [t1, 4.0, 5.0, 3.0, 4.0, 1.0],
+        [t2, 1.0, 1.0, 0.5, 9.0, 1.0],
+    ]
+    bars, rejected = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t3, t5)],
+        load_start=t0,
+        load_end=t5,
+    )
+    assert (t1, 4.0, False) in bars
+    assert all(open_time != t0 for open_time, _close, _synthetic in bars)
+    assert all(open_time != t2 for open_time, _close, _synthetic in bars)
+    assert (t3, 4.0, True) in bars
+    assert (t3 + 60, 4.0, True) in bars
+    assert all(close == 4.0 for _open_time, close, synthetic in bars if synthetic)
+    assert len(rejected) == 1
+    assert rejected[0][0] == t2
+    assert any("high is below" in item for item in rejected[0][1])
+
+
+def test_an_invalid_seed_is_dropped_and_the_page_still_commits(tmp_path: Path) -> None:
+    """``_seed_bar`` refuses a candle that fails ``validate_bar``.
+
+    The page is still committed, as a leading gap with no synthetic bars.
+    Without that check the store rejects the whole page.
+    """
+    end = _START + 180
+    bad = Bar(_MINT, "1m", _START - 60, 1.0, 1.0, 0.5, 4.0, 1.0)
+    assert validate_bar(bad)
+
+    class BadSeed:
+        name = "memory"
+
+        def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+            raise AssertionError("pages")
+
+        def fetch_pages(self, mint: str, timeframe: str, start: int, end: int):
+            yield FetchPage([], [], _START, end, False, bad)
+
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=BadSeed(),
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=_START - 60,
+            end=end,
+        )
+        assert stored == []
+        section = report["series"][0]
+        assert section["real"] == 0
+        assert section["synthetic"] == 0
+        assert section["unfetched"] == 0
+        assert section["gaps"] == [
+            {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:03:00Z", "missing": 3}
         ]
     finally:
         store.close()

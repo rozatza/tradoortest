@@ -78,7 +78,7 @@ engine:
   warmup_bars: 14
 ```
 
-Evaluation uses only data through the close of the current bar. The fill price is that close, then costs are applied (see costs). Bars inside the warmup window do not fire rules. Indicator outputs are empty during their own warmup; this schema does not invent those values. `docs/backtest.md` is how the engine applies this section. It does not fill the entry `risk` pair. That pair is a later task.
+Evaluation uses only data through the close of the current bar. A rule's fill price is that close, then costs are applied (see costs). Bars inside the warmup window do not fire rules. Indicator outputs are empty during their own warmup; this schema does not invent those values. `docs/backtest.md` is how the engine applies this section, including the entry `risk` pair.
 
 ## capital
 
@@ -378,11 +378,17 @@ Levels are anchored to the entry fill price `F` (after slippage):
 - take-profit price = `F * (1 + take_profit.percent / 100)`
 - stop-loss price = `F * (1 - stop_loss.percent / 100)`
 
-The pair is attached when the entry fills. Cancelling one leg cancels the other. `movement: tighten_only` means a later change may only move the stop up or the target down, closer to price. A change that widens the stop or pushes the target further away is rejected. v1 documents store the initial percents; they cannot select another movement policy.
+The pair is attached when the entry fills. Cancelling one leg cancels the other. `movement: tighten_only` means a later change may only move the stop up or the target down, closer to price. A change that widens the stop or pushes the target further away is rejected. v1 documents store the initial percents; they cannot select another movement policy. The anchor stays the first entry fill. A later enter may replace the levels with its own percents on that same anchor only when both legs stay put or tighten. `move_oco` raises `BacktestError` when a proposed stop is lower or a proposed target is higher. The engine applies that check to the later enter: the open long keeps the previous levels, the added quantity still fills, and the rejection is recorded on the run's `lints`. The updated levels are first read on the following bar.
 
 #### Intrabar OCO resolution
 
 On a long, if one bar's low is at or below the stop and the same bar's high is at or above the take-profit, the stop fills and the take-profit is cancelled. The stop wins because that is the conservative resolution when the path inside the bar is unknown.
+
+The pair is not read on the bar the entry fills. That bar's high and low do not touch either leg. The next bar is the first one that can.
+
+A take-profit is a limit sell. Its price is the take-profit level, including when the bar opens above the level. A stop-loss fills at the stop when the bar opens above the stop, and at the open when the bar opens at or below the stop. Sell slippage and commission then apply as they do on a market sell.
+
+A synthetic bar is not a trade print. For the OCO pair it is the same as a missing bar: it does not touch either leg and it does not arm one. The next real bar is read under the live rules above. If the run ends on the synthetic bar, the long stays open. `docs/backtest.md` has the cents.
 
 ```text
   risk oco:
