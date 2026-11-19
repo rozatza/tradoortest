@@ -183,6 +183,83 @@ def test_deep_series_formula_is_positioned_expr_too_deep() -> None:
     assert caught.value.offset == source.index(expr)
 
 
+def _inject_signal(text: str, expr: str) -> str:
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.startswith("signal "):
+            lines.insert(index + 1, f"signal extra = {expr}\n")
+            return "".join(lines)
+    raise AssertionError("example has no signal")
+
+
+def _file_position(source: str, offset: int) -> tuple[int, int]:
+    line = source.count("\n", 0, offset) + 1
+    column = offset - source.rfind("\n", 0, offset)
+    return line, column
+
+
+def _parse_error(source: str) -> StrategyError:
+    """Every failure from `parse_strategy` is a StrategyError at a file offset."""
+    with pytest.raises(StrategyError) as caught:
+        parse_strategy(source)
+    error = caught.value
+    assert error.code
+    assert 0 <= error.offset <= len(source)
+    assert (error.line, error.column) == _file_position(source, error.offset)
+    return error
+
+
+@pytest.mark.parametrize(
+    "expr",
+    ["RSI(close, period=14) < 30", "close > EMA(close, period=3)"],
+)
+def test_inline_indicator_in_a_signal_is_a_file_error(expr: str) -> None:
+    source = _inject_signal(_rsi_text(), expr)
+    error = _parse_error(source)
+    assert error.code == "invalid_expr"
+    assert (error.line, error.column) != (1, 1)
+    name = "RSI" if expr.startswith("RSI") else "EMA"
+    formula = source.index(f"signal extra = {expr}") + len("signal extra = ")
+    assert error.offset == formula + expr.index(name)
+
+
+_BAD_SIGNALS = (
+    "RSI(close, period=14) < 30",
+    "close > EMA(close, period=3)",
+    "CROSS_ABOVE(EMA(close, period=3), close)",
+    "BOLLINGER(close, period=20, stddev=2).lower > close",
+    "nope",
+    "((",
+    "close",
+    "1" * 1001 + " > 0",
+)
+
+
+@pytest.mark.parametrize("path", _examples(), ids=lambda path: path.name)
+@pytest.mark.parametrize("expr", _BAD_SIGNALS)
+def test_strategy_errors_keep_a_file_position(path: Path, expr: str) -> None:
+    source = _inject_signal(format_strategy(_load(path)), expr)
+    error = _parse_error(source)
+    assert error.line > 1
+
+
+def test_series_formula_errors_stay_strategy_errors() -> None:
+    text = _rsi_text()
+    added = text.replace(
+        "series rsi_14 = RSI(close, period=14)\n",
+        "series rsi_14 = RSI(close, period=14)\nseries extra = close + 1\n",
+        1,
+    )
+    assert _parse_error(added).code == "invalid_series"
+    nested = text.replace(
+        "series rsi_14 = RSI(close, period=14)\n",
+        "series rsi_14 = RSI(close, period=14)\n"
+        "series nested = RSI(EMA(close, period=3), period=14)\n",
+        1,
+    )
+    assert _parse_error(nested).code == "invalid_series"
+
+
 def test_long_signal_literal_keeps_the_bad_number_code() -> None:
     expr = "1" * 1001 + " > 0"
     source = _rsi_text().replace("CROSS_BELOW(rsi_14, 70)", expr, 1)

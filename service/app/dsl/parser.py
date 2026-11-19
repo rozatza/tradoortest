@@ -311,7 +311,10 @@ class _StrategyParser:
         except ExprError as err:
             raise self._shift(err, expr_offset) from None
         self._reject_deep_expr(node, expr_offset)
-        expr = to_ir(node)
+        try:
+            expr = to_ir(node)
+        except ExprError as err:
+            raise self._shift(err, expr_offset) from None
         self.names[ident] = ExprType.BOOLEAN
         self.bound.add(ident)
         return {"id": ident, "expr": expr}

@@ -304,6 +304,7 @@ def test_indicator_is_not_an_ir_expression_operator() -> None:
     node = parse("rsi(close, 14)")
     err = _err_node(node)
     assert err.message == "indicator call is not an IR expression operator"
+    assert err.code == "invalid_expr"
     assert err.offset == node.span.offset
     assert parse_condition("rsi(close, 14) > 30").result_type is ExprType.BOOLEAN
 

@@ -148,18 +148,18 @@ class Lexer:
             exp_digits = self.index
             self._digits()
             if self.index == exp_digits:
-                self._fail("bad number", offset, line, column)
+                self._fail("bad number", offset, line, column, code="bad_number")
         lexeme = self.source[start : self.index]
         digits = sum(ch.isascii() and ch.isdigit() for ch in lexeme)
         if digits > MAX_NUMBER_LITERAL_DIGITS:
-            self._fail("bad number", offset, line, column)
+            self._fail("bad number", offset, line, column, code="bad_number")
         if any(mark in lexeme for mark in ".eE"):
             try:
                 value: int | float = float(lexeme)
             except ValueError:
-                self._fail("bad number", offset, line, column)
+                self._fail("bad number", offset, line, column, code="bad_number")
             if not math.isfinite(value):
-                self._fail("bad number", offset, line, column)
+                self._fail("bad number", offset, line, column, code="bad_number")
         else:
             value = int(lexeme)
         return Token(TokenKind.NUMBER, lexeme, offset, self.index, line, column, value)
@@ -181,8 +181,15 @@ class Lexer:
         while self.index < self.length and _is_digit(self.source[self.index]):
             self._bump()
 
-    def _fail(self, message: str, offset: int, line: int, column: int) -> None:
-        code = "bad_number" if message == "bad number" else None
+    def _fail(
+        self,
+        message: str,
+        offset: int,
+        line: int,
+        column: int,
+        *,
+        code: str | None = None,
+    ) -> None:
         raise ExprError(message, offset=offset, line=line, column=column, code=code)
 
 

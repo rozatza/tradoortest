@@ -384,7 +384,7 @@ portfolio:
 
 `parse_strategy` reads the text form and returns canonical IR with `ir_version` `"1.0"`. `format_strategy` prints that IR. Formatting the parse of that text is the same string. The three examples in `schemas/examples/` round-trip this way.
 
-Top-level declarations may appear in any order. Blank lines and `#` comments (outside quoted strings) are ignored. A space, tab, or non-breaking space before `#`, and the same characters at the end of a line, are ignored too. Indentation is spaces, in multiples of 2. The canonical text uses one blank line between sections and this order: strategy, engine, capital, costs, assets, derived series, signals, actions, rules, portfolio.
+Top-level declarations may appear in any order. Blank lines and `#` comments (outside quoted strings) are ignored. After the comment is removed, all Unicode whitespace at the end of the line is stripped, including a space before `#`. Indentation is spaces, in multiples of 2. The canonical text uses one blank line between sections and this order: strategy, engine, capital, costs, assets, derived series, signals, actions, rules, portfolio.
 
 ```text
 strategy rsi_cross_sol:
@@ -451,7 +451,7 @@ portfolio:
 
 `sizing: 25% equity` is `percent_equity`. `sizing: 100% position` is `percent_position`. An enter action's `risk oco` block is the OCO pair. An exit action omits it.
 
-File errors use `StrategyError`. `code` is the expression code when the failure is inside a formula (`type_error`, `unknown_series`, `expr_too_deep`, `bad_number`, and the other expression errors), or `syntax`, `missing_section`, `missing_field`, `unknown_field`, `duplicate_section`, `duplicate_field`, `duplicate_id`, `reserved_series`, or `invalid_series`. The offset is into the strategy file.
+File errors use `StrategyError`. `code` is the expression code when the failure is inside a formula (`type_error`, `unknown_series`, `expr_too_deep`, `bad_number`, `invalid_expr`, and the other expression errors), or `syntax`, `missing_section`, `missing_field`, `unknown_field`, `duplicate_section`, `duplicate_field`, `duplicate_id`, `reserved_series`, or `invalid_series`. The offset is into the strategy file.
 
 ## Canonical IR and hash
 
@@ -483,7 +483,7 @@ File errors use `StrategyError`. `code` is the expression code when the failure 
 | `missing_entry` | no rule invokes an action whose `type` is `enter` |
 | `type_error` | a signal expression is not `BOOLEAN`, or an operator's operand has the wrong type. Series names are `NUMERIC`. Earlier signal names are `BOOLEAN`. The check runs inside `from_ir` with that map |
 | `expr_too_deep` | a signal expression is nested deeper than 80 IR nodes. `from_ir` reports it, and `parse_strategy` rejects the formula at its first character |
-| `invalid_expr` | an IR expression is not an object, uses an unknown `op`, or is missing a child or a literal. `from_ir` raises it and `validate_ir` reports it |
+| `invalid_expr` | an IR expression is not an object, uses an unknown `op`, or is missing a child or a literal. `from_ir` raises it and `validate_ir` reports it. A signal formula that contains an indicator call is the same code: the indicator belongs in a `series` line. `parse_strategy` reports it at that call in the file |
 | `expression_too_long` | a formula is longer than 10000 code points. The expression parser and `parse_strategy` raise this. It is not a code on an IR document |
 
 `format_issues` renders one line per issue: `path: message [keyword]`.

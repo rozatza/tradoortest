@@ -159,6 +159,7 @@ def to_ir(node: Expr) -> dict[str, Any]:
             offset=node.span.offset,
             line=node.span.line,
             column=node.span.column,
+            code="invalid_expr",
         )
     raise TypeError(f"unknown expression node {type(node).__name__}")
 
