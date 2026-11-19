@@ -2,7 +2,8 @@
 
 This document is the contract for a strategy. The canonical artifact is JSON IR
 validated by `schemas/strategy-ir-v1.schema.json`. The text sketches below show
-the intended DSL surface. Nothing in this repository parses that text yet.
+the intended DSL surface. Expression text is parsed by `service/app/expr`.
+The rest of a strategy file is not parsed yet.
 
 ## Scope
 
@@ -168,7 +169,7 @@ Numeric indicator definitions are not part of this schema. Call names and parame
 
 ## Expressions
 
-Signals carry a boolean expression in canonical IR form. This repository does not parse expression text. The IR is the tree a later parser must emit. Operators and calls:
+Signals carry a boolean expression in canonical IR form. `service/app/expr` parses expression text and `to_ir` emits this tree. Operators and calls:
 
 | IR `op` | Arity | DSL text |
 | --- | --- | --- |
@@ -185,7 +186,7 @@ Signals carry a boolean expression in canonical IR form. This repository does no
 
 `CROSS_ABOVE(a, b)` is true on the bar where `a` moves from `<= b` to `> b`. `CROSS_BELOW` is the opposite. `BARS_SINCE(cond)` is the number of bars since `cond` was last true, or empty if it has never been true. `ENTRY_PRICE()` is the fill price of the open long, and empty when flat.
 
-Text grammar, for the later parser:
+Text grammar:
 
 ```text
 expr     := or_expr
@@ -198,10 +199,66 @@ add_expr := mul_expr (("+" | "-") mul_expr)*
 mul_expr := unary (("*" | "/") unary)*
 unary    := "-" unary | primary
 primary  := number | "true" | "false" | ident | call | "(" expr ")"
-call     := ident "(" args? ")"
+call     := ident "(" args? ")" ("." ident)?
+args     := arg ("," arg)*
+arg      := ident "=" expr | expr
 ```
 
-A `ref` name must be a built-in series, a derived series, or an earlier signal id. Indicator calls belong in `derived_series`, not inside a signal expression.
+`AND`, `OR`, and `NOT` associate as written above: `OR` is loosest, then `AND`, then `NOT`. `+` and `-` are left-associative, as are `*` and `/`. Unary `-` is right-associative and binds tighter than `*`. A comparison is not associative: `a > b > c` is an error. `NOT a > b` is `NOT (a > b)` because a comparison binds tighter than `NOT`.
+
+A `ref` name must be a built-in series, a derived series, or an earlier signal id. Indicator calls belong in `derived_series`, not inside a signal expression. The parser still accepts an indicator call, so a derived-series formula can be checked, but `to_ir` rejects it: a signal expression has no indicator operator.
+
+### Parser
+
+`service/app/expr` is the expression parser. It does not evaluate expressions. There is no `eval`, `exec`, or `compile`.
+
+| Entry point | Result |
+| --- | --- |
+| `parse(source)` | any expression |
+| `parse_condition(source)` | expression whose type is `BOOLEAN` |
+| `parse_numeric(source)` | expression whose type is `NUMERIC` |
+| `to_ir(node)` | canonical signal IR, or an error for an indicator call |
+| `from_ir(tree)` / `format_expr(node)` | the inverse direction for canonical ops |
+
+Every error includes a 0-based `offset` into the source string and a 1-based `line` and `column`. A tab counts as one column. `str(error)` is `line:column: message (offset N)`.
+
+The following points are fixed here because the grammar above does not state them.
+
+**Layout.** Spaces, tabs, and newlines separate tokens. `#` comments run to the end of the line. Operators are single tokens (`>=`, not `> =`). There is no unary `+`, no `**`, no string literal, and no trailing comma.
+
+**Numbers.** A number is digits, optionally `.` and more digits, optionally an exponent `[eE][+-]?` digits. The token must start with a digit (`.5` is not a number). No decimal point and no exponent means an integer literal, so `30` stays `30` in IR. A decimal or an exponent is a float, including `1e2`. A non-finite value is a bad number. Unary minus is the `neg` operator, not part of the literal: `-30` is `{"op":"neg","arg":{"op":"lit","value":30}}`.
+
+**Names.** A series reference matches `^[a-z][a-z0-9_]{0,63}$`. `AND`, `OR`, `NOT`, `true`, and `false` are reserved and case-insensitive. Call names are case-insensitive: `CROSS_ABOVE`, `CROSS_BELOW`, `BARS_SINCE`, `ENTRY_PRICE`, and the indicator names below. `bb` is an alias of `bollinger`. A known call name written in identifier form without `(` is a reference (`cross_above`); the uppercase spelling without `(` is an error because it is not an identifier.
+
+**Calls.** `CROSS_ABOVE` and `CROSS_BELOW` take two positional arguments. `BARS_SINCE` takes one. `ENTRY_PRICE` takes none. Keyword arguments are only for indicators. Indicator parameters may be positional after the source or `name=expr`, and keyword names are case-insensitive. The canonical parameter order is stored on the AST.
+
+| Indicator | Arguments after `source` | Output suffix |
+| --- | --- | --- |
+| `sma`, `ema`, `atr`, `rsi` | `period` | none |
+| `macd` | `fast`, `slow`, `signal` | `.macd`, `.signal`, or `.histogram` |
+| `bollinger` (`bb`) | `period`, `stddev` | `.lower`, `.middle`, or `.upper` |
+| `stochastic` | `k_period`, `d_period` | `.k` or `.d` |
+
+The output suffix is part of the call (`BOLLINGER(close, period=20, stddev=2).lower`), not of a surrounding parenthesized group. Output names are case-insensitive and stored in lowercase. `macd`, `bollinger`, and `stochastic` require an output. The others reject one. Period ranges (`1–500` and the rest of the indicator table above) are checked when a derived series is validated, not by this parser. Argument expressions must be numeric; they are not required to be literals.
+
+**Types.** Each node is `NUMERIC` or `BOOLEAN`.
+
+| Form | Type | Rule |
+| --- | --- | --- |
+| number | `NUMERIC` | |
+| `true`, `false` | `BOOLEAN` | |
+| identifier | `NUMERIC` | a bare name is a series reference |
+| `-x`, `+ - * /` | `NUMERIC` | each operand is `NUMERIC` |
+| comparison | `BOOLEAN` | both operands are `NUMERIC`, including `==` and `!=` |
+| `NOT`, `AND`, `OR` | `BOOLEAN` | each operand is `BOOLEAN` |
+| `CROSS_ABOVE`, `CROSS_BELOW` | `BOOLEAN` | both arguments are `NUMERIC` |
+| `BARS_SINCE` | `NUMERIC` | the argument is `BOOLEAN` |
+| `ENTRY_PRICE` | `NUMERIC` | |
+| indicator call | `NUMERIC` | every argument is `NUMERIC` |
+
+This parser does not look up names. A bare identifier is `NUMERIC` even when a later pass would resolve it to a signal. Declared-series checks, signal references, and indicator parameter ranges belong to semantic validation, not this parser.
+
+**Errors.** Messages name the problem and carry a position: `empty input`, `unexpected token`, `unexpected character`, `unterminated paren`, `unknown function`, `wrong arity`, `trailing input`, `bad number`, `invalid identifier`, and `type error`. A chained comparison is reported as an unexpected token.
 
 ## signals
 
@@ -342,4 +399,4 @@ Each example is SOL spot on Solana, long-only, with an OCO take-profit and stop-
 
 ## Non-goals
 
-This spec does not define a text parser, indicator math, historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps.
+This spec does not define the strategy-file parser, indicator math, historical data, a backtester, or any order route. It does not define wallets, keys, signing, or swaps. Expression text is parsed by `service/app/expr`.
