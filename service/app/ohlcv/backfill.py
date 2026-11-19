@@ -16,8 +16,11 @@ close in the span are a leading gap when history starts inside the window
 or a short page does not reach back past the window start. An empty page is
 a gap, and a prior close does not cross it. The prior close is seeded from
 the fetched span even when that close sits before the current window, and
-it does not cross an unfetched hole. Higher timeframes are native
-GeckoTerminal aggregates. They are not built from 1m bars. A missing native
+it does not cross an unfetched hole. The seed is the latest older candle
+that parsed, passed the bar checks, and is not a conflicting timestamp.
+A skipped candle between that close and the window stays rejected, so a
+later window and a wider window store the same series. Higher timeframes
+are native GeckoTerminal aggregates. They are not built from 1m bars. A missing native
 bucket after history has started in the merged span is a no-trade count,
 not a gap range. Rejected candles stay rejected and are not repaired.
 """
@@ -212,7 +215,12 @@ def _say(progress: Callable[[str], None] | None, message: str) -> None:
 
 
 def _seed_bar(page: FetchPage, asset: Asset, timeframe: str) -> Bar | None:
-    """The latest older candle, when it is a real bar this series can store."""
+    """The latest older candle, when it is a real bar this series can store.
+
+    ``validate_bar`` is the gate. An invalid seed is dropped and the page
+    still commits. Removing the check lets that candle through, and the
+    store then refuses the whole page.
+    """
     if page.provider_empty:
         return None
     seed = page.seed

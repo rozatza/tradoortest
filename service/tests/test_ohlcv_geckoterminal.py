@@ -335,6 +335,53 @@ def test_a_failed_later_page_keeps_the_page_already_parsed() -> None:
     assert calls["n"] == 6
 
 
+@pytest.mark.parametrize("status", [400, 403, 404, 422])
+def test_other_4xx_responses_are_not_retried(status: int) -> None:
+    sleeps, _clock_state, sleep, monotonic = _clock()
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(status, text="secret-token-should-not-leak")
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleep,  # type: ignore[arg-type]
+        monotonic=monotonic,  # type: ignore[arg-type]
+    )
+    with pytest.raises(SourceError, match=f"HTTP {status}") as caught:
+        source.fetch_bars(SOL_MINT, "1m", 1_700_000_040, 1_700_000_100)
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert "secret-token-should-not-leak" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.ProxyError],
+)
+def test_config_errors_are_not_retried(error: type[Exception]) -> None:
+    sleeps, _clock_state, sleep, monotonic = _clock()
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise error("secret-token-should-not-leak")
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleep,  # type: ignore[arg-type]
+        monotonic=monotonic,  # type: ignore[arg-type]
+    )
+    with pytest.raises(SourceError, match="request failed") as caught:
+        source.fetch_bars(SOL_MINT, "1m", 1_700_000_040, 1_700_000_100)
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert "secret-token-should-not-leak" not in str(caught.value)
+
+
 def test_non_json_body_does_not_echo_the_payload() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="secret-token-should-not-leak")

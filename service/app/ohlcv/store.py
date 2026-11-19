@@ -429,12 +429,28 @@ class SqliteBarStore:
         stored_at = int(self._now())
         rows = [_row(user_id, bar, stored_at) for bar in bars]
         stored_times = {bar.open_time for bar in bars}
+        span_start = start
+        if seed is not None:
+            if provider_empty:
+                raise StoreError("an empty provider page cannot carry a prior close")
+            if seed.mint != mint or seed.timeframe != timeframe or seed.synthetic:
+                raise StoreError("prior close does not match the fetched series")
+            if isinstance(seed.open_time, bool) or not isinstance(seed.open_time, int):
+                raise StoreError("prior close must sit before the fetched page")
+            if seed.open_time >= start:
+                raise StoreError("prior close must sit before the fetched page")
+            span_start = seed.open_time
         rejection_rows: list[tuple[object, ...]] = []
         for item in rejections:
             stamp = item.open_time
             if isinstance(stamp, bool) or not isinstance(stamp, int):
                 continue
-            if stamp < start or stamp >= end or stamp in stored_times:
+            # The span starts at the seed, so a bad candle between the seed
+            # and this page is part of the span. Leaving it out makes the
+            # synthetic rewrite copy the seed into that minute.
+            if stamp < span_start or stamp >= end or stamp in stored_times:
+                continue
+            if seed is not None and stamp == seed.open_time:
                 continue
             if item.mint != mint or item.timeframe != timeframe:
                 raise StoreError("page rejection does not match the fetched series")
@@ -463,15 +479,7 @@ class SqliteBarStore:
                     """,
                     rejection_rows,
                 )
-            span_start = start
             if seed is not None:
-                if provider_empty:
-                    raise StoreError("an empty provider page cannot carry a prior close")
-                if seed.mint != mint or seed.timeframe != timeframe or seed.synthetic:
-                    raise StoreError("prior close does not match the fetched series")
-                if seed.open_time >= start:
-                    raise StoreError("prior close must sit before the fetched page")
-                span_start = seed.open_time
                 self._conn.execute(_UPSERT, _row(user_id, seed, stored_at))
                 self._conn.execute(
                     """

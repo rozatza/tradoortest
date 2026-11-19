@@ -6,8 +6,10 @@ call, and about six months of history on the free tier. This client spaces
 calls 12 seconds apart and never sends ``include_empty_intervals`` (that
 flag copies the previous close forward). Empty minutes stay missing.
 HTTP 429, HTTP 5xx, timeouts, and transport errors (connect, read, write,
-and protocol) retry with a bounded backoff. After five attempts the call
-is a ``SourceError``. The public API only serves about 180 days; a 401 is
+and remote protocol) retry with a bounded backoff. After five attempts the
+call is a ``SourceError``. Other 4xx responses are not retried. A bad
+proxy, an unsupported URL scheme, and a local protocol error are not
+retried either. The public API only serves about 180 days; a 401 is
 reported as that limit.
 
 Every timeframe is a native aggregate: minute 1/5/15, hour 1/4, and day.
@@ -30,7 +32,7 @@ from typing import Any
 
 import httpx
 
-from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection
+from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, UnknownMint
 from app.ohlcv.registry import BONK_MINT, JTO_MINT, JUP_MINT, SOL_MINT, WIF_MINT
 from app.ohlcv.source import FetchPage, FetchResult
@@ -60,6 +62,8 @@ POOLS: dict[str, str] = {
 
 _PAGE_LIMIT = 1000
 _ATTEMPTS = 5
+# Misconfiguration, not a blip. Retrying cannot make the URL or the proxy valid.
+_NO_RETRY = (httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.ProxyError)
 # Live probe on 2026-11-19: a window of 181 days returned 200, and 185 days
 # returned 401. ``--days`` above this fails before any request.
 PUBLIC_HISTORY_DAYS = 180
@@ -178,17 +182,18 @@ class GeckoTerminalSource:
             cover_lo = start if finished else parsed.oldest
             page = _page_in_range(parsed, cover_lo, page_hi)
             if finished and parsed.oldest < start:
-                # The page reached before the window. The latest older candle
-                # is the prior close. Dropping it made a quiet window look empty.
-                prior_time = max((stamp for stamp in parsed.bars if stamp < start), default=None)
-                if prior_time is not None:
+                # The page reached before the window. The latest usable older
+                # candle is the prior close. A conflict or a rejected candle
+                # is not that close, and it is not copied into a synthetic bar.
+                seed, older_rejected = _prior_close(parsed, start)
+                if seed is not None:
                     page = FetchPage(
                         page.bars,
-                        page.rejected,
+                        [*page.rejected, *older_rejected],
                         page.start,
                         page.end,
                         False,
-                        parsed.bars[prior_time],
+                        seed,
                     )
             yield page
             if finished:
@@ -226,6 +231,10 @@ class GeckoTerminalSource:
             except httpx.TransportError as exc:
                 # ConnectError, ReadError, WriteError, RemoteProtocolError.
                 # One blip used to abort a 90-day run. Same bound as timeouts.
+                # UnsupportedProtocol, LocalProtocolError, and ProxyError are
+                # config errors and fail on the first attempt.
+                if isinstance(exc, _NO_RETRY):
+                    raise SourceError("GeckoTerminal request failed") from exc
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request failed") from exc
                 self._sleep(backoff)
@@ -318,6 +327,54 @@ def _page_in_range(parsed: _ParsedPage, start: int, end: int) -> FetchPage:
         kept[open_time] = bar
     ordered = [kept[key] for key in sorted(kept)]
     return FetchPage(ordered, rejected, start, end)
+
+
+def _prior_close(parsed: _ParsedPage, start: int) -> tuple[Bar | None, list[BarRejection]]:
+    """Latest older candle that can seed a close, and the bad candles after it.
+
+    Every older candle is considered. A conflicting timestamp, a candle that
+    did not parse, and a candle that fails ``validate_bar`` are skipped.
+    Skipped candles that sit strictly after the chosen seed are returned so
+    the fetched span keeps them as rejections instead of synthetic bars.
+    Without a usable seed there is no span to protect, and the list is empty.
+    """
+    skipped: list[BarRejection] = []
+    for item in parsed.rejected:
+        stamp = item.open_time
+        if isinstance(stamp, bool) or not isinstance(stamp, int) or stamp >= start:
+            continue
+        skipped.append(item)
+    candidates: list[Bar] = []
+    for open_time, bar in parsed.bars.items():
+        if open_time >= start:
+            continue
+        if open_time in parsed.conflicts:
+            skipped.append(
+                BarRejection(
+                    bar.mint,
+                    bar.timeframe,
+                    open_time,
+                    ("conflicting candles for the same open_time",),
+                )
+            )
+            continue
+        reasons = validate_bar(bar)
+        if reasons:
+            skipped.append(BarRejection(bar.mint, bar.timeframe, open_time, tuple(reasons)))
+            continue
+        candidates.append(bar)
+    if not candidates:
+        return None, []
+    seed = max(candidates, key=lambda bar: bar.open_time)
+    between = [
+        item
+        for item in skipped
+        if isinstance(item.open_time, int)
+        and not isinstance(item.open_time, bool)
+        and seed.open_time < item.open_time < start
+    ]
+    between.sort(key=lambda item: item.open_time if isinstance(item.open_time, int) else 0)
+    return seed, between
 
 
 def _ohlcv_list(payload: dict[str, Any]) -> list[Any]:
