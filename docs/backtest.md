@@ -152,4 +152,4 @@ Sell fill = 92 × 9995 / 10000 = 91.954. Notional = 9181.62. Commission = 9.18. 
 
 ## What this does not do
 
-The ratios, the drawdown, and the trade log are `docs/metrics.md`. The engine does not write a result file and it does not draw a chart. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
+The ratios, the drawdown, and the trade log are `docs/metrics.md`. A ratio that is undefined, or that the cent report cannot quantize, is null on that result. It does not fail the run and it does not raise `BacktestError`. The engine does not write a result file and it does not draw a chart. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.

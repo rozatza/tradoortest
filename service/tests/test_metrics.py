@@ -9,12 +9,26 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import random
+import subprocess
+import sys
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from fractions import Fraction
 
-from app.backtest import TRADE_COLUMNS, run_backtest, trade_log_csv, trade_log_json
-from app.backtest.log import SCHEMA
+from app.backtest import (
+    METRIC_COLUMNS,
+    TRADE_COLUMNS,
+    metrics_csv,
+    metrics_json,
+    run_backtest,
+    trade_log_csv,
+    trade_log_json,
+)
+from app.backtest.log import METRICS_SCHEMA, SCHEMA
+from app.backtest.metrics import compute_metrics
 from app.backtest.money import quantize_cents
+from app.backtest.quality import QualityCounts
 from app.ohlcv.bars import Bar
 from test_backtest import (
     _FINAL_EQUITY,
@@ -45,10 +59,31 @@ _RATIO_NAMES = (
 
 def _finite(result) -> None:
     for name in _RATIO_NAMES:
-        assert getattr(result.metrics, name).is_finite()
+        value = getattr(result.metrics, name)
+        if value is None:
+            assert result.metrics.undefined[name]
+        else:
+            assert value.is_finite()
+            assert name not in result.metrics.undefined
+            assert "E" not in format(value, "f")
     for trade in result.trades:
         assert trade.realized_pnl.is_finite()
         assert trade.unrealized_pnl.is_finite()
+
+
+def _logs_agree(csv_text: str, payload_rows: list[dict]) -> None:
+    """An empty CSV cell is the JSON null. Every other cell is the same string."""
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    assert len(rows) == len(payload_rows)
+    assert "\r" not in csv_text
+    for csv_row, json_row in zip(rows, payload_rows, strict=True):
+        assert list(csv_row) == list(TRADE_COLUMNS)
+        assert list(json_row) == list(TRADE_COLUMNS)
+        for column in TRADE_COLUMNS:
+            if json_row[column] is None:
+                assert csv_row[column] == ""
+            else:
+                assert csv_row[column] == json_row[column]
 
 
 def _flat(**overrides: object) -> dict:
@@ -182,7 +217,11 @@ def test_hand_round_trip_metrics_and_trade_log() -> None:
     assert result.metrics.win_rate == Decimal("1")
     assert result.metrics.win_streak == 1
     assert result.metrics.loss_streak == 0
-    assert result.metrics.payoff_ratio == Decimal("0")
+    assert result.metrics.payoff_ratio is None
+    assert result.metrics.undefined["payoff_ratio"] == "no_losses"
+    assert result.metrics.annualized_return is None
+    assert result.metrics.undefined["annualized_return"] == "too_short"
+    assert result.metrics.undefined["calmar"] == "too_short"
     assert result.metrics.suspect_outage is False
     trade = result.trades[0]
     assert trade.status == "closed"
@@ -204,7 +243,7 @@ def test_csv_and_json_trade_logs_agree() -> None:
     assert payload["schema"] == SCHEMA
     assert list(rows[0]) == list(TRADE_COLUMNS)
     assert list(payload["trades"][0]) == list(TRADE_COLUMNS)
-    assert rows == payload["trades"]
+    _logs_agree(csv_text, payload["trades"])
     assert rows[0]["realized_pnl"] == "1480.52"
     assert rows[0]["limit_below_low"] == "false"
     assert rows[0]["entry_time"] == str(_START + 60)
@@ -223,25 +262,27 @@ def test_zero_trades_and_zero_variance_are_finite_zeros() -> None:
     _finite(result)
     assert result.fills == ()
     assert result.metrics.net_return == Decimal("0")
-    assert result.metrics.annualized_return == Decimal("0")
     assert result.metrics.max_drawdown == Decimal("0")
-    assert result.metrics.sharpe == Decimal("0")
-    assert result.metrics.sortino == Decimal("0")
-    assert result.metrics.calmar == Decimal("0")
-    assert result.metrics.win_rate == Decimal("0")
-    assert result.metrics.payoff_ratio == Decimal("0")
+    assert result.metrics.undefined["sharpe"] == "zero_variance"
+    assert result.metrics.undefined["sortino"] == "no_downside"
+    assert result.metrics.undefined["annualized_return"] == "too_short"
+    assert result.metrics.undefined["calmar"] == "too_short"
+    assert result.metrics.undefined["win_rate"] == "no_closed_trades"
+    assert result.metrics.undefined["payoff_ratio"] == "no_closed_trades"
+    assert "0E-10" not in metrics_json(result.metrics)
+    assert format(result.metrics.net_return, "f") in metrics_json(result.metrics)
     assert result.metrics.win_streak == 0
     assert result.metrics.loss_streak == 0
     assert result.metrics.closed_trades == 0
     assert result.metrics.bar_count == 3
 
 
-def test_no_losses_report_zero_payoff_sortino_and_calmar() -> None:
-    """One winning sale. Equity never drops, and no bar return is negative.
+def test_no_losses_leave_payoff_sortino_undefined() -> None:
+    """One winning sale on two minutes. Equity never drops, and no return is negative.
 
-    Payoff has no loss to divide by. Sortino's downside deviation is 0.
-    Calmar's drawdown is 0. Each of those is 0, not an infinity. Sharpe is
-    defined: the two returns are 0 and 0.1.
+    Payoff has no loss to divide by. Sortino has no downside. The run is
+    shorter than a day, so Calmar is too_short rather than no_drawdown.
+    Sharpe is defined: the two returns are 0 and 0.1.
     """
     document = _strategy(
         costs={"commission_bps": 0, "slippage_bps": 0},
@@ -259,9 +300,9 @@ def test_no_losses_report_zero_payoff_sortino_and_calmar() -> None:
     _finite(result)
     assert result.metrics.closed_trades == 1
     assert result.metrics.win_rate == Decimal("1")
-    assert result.metrics.payoff_ratio == Decimal("0")
-    assert result.metrics.sortino == Decimal("0")
-    assert result.metrics.calmar == Decimal("0")
+    assert result.metrics.undefined["payoff_ratio"] == "no_losses"
+    assert result.metrics.undefined["sortino"] == "no_downside"
+    assert result.metrics.undefined["calmar"] == "too_short"
     assert result.metrics.max_drawdown == Decimal("0")
     assert result.metrics.net_return == Decimal("0.1")
     assert result.metrics.sharpe > 0
@@ -278,7 +319,7 @@ def test_an_open_position_is_marked_and_left_out_of_the_trade_stats() -> None:
     _finite(result)
     assert result.metrics.closed_trades == 0
     assert result.metrics.open_trades == 1
-    assert result.metrics.win_rate == Decimal("0")
+    assert result.metrics.undefined["win_rate"] == "no_closed_trades"
     assert result.metrics.win_streak == 0
     assert result.metrics.loss_streak == 0
     assert result.metrics.net_return == Decimal("0.1")
@@ -290,8 +331,8 @@ def test_an_open_position_is_marked_and_left_out_of_the_trade_stats() -> None:
     assert trade.unrealized_pnl == Decimal("1000.00")
     row = json.loads(trade_log_json(result.trades))["trades"][0]
     assert row["status"] == "open"
-    assert row["exit_time"] == ""
-    assert row["exit_price"] == ""
+    assert row["exit_time"] is None
+    assert row["exit_price"] is None
     assert row["unrealized_pnl"] == "1000.00"
 
 
@@ -319,7 +360,7 @@ def test_a_scratch_breaks_streaks_and_is_not_a_win() -> None:
     assert result.metrics.closed_trades == 1
     assert result.trades[0].realized_pnl == Decimal("0.00")
     assert result.metrics.win_rate == Decimal("0")
-    assert result.metrics.payoff_ratio == Decimal("0")
+    assert result.metrics.undefined["payoff_ratio"] == "no_wins"
     assert result.metrics.win_streak == 0
     assert result.metrics.loss_streak == 0
 
@@ -379,6 +420,26 @@ def test_streaks_payoff_and_drawdown_match_the_hand_series() -> None:
         sharpe = (mean_dec / std * Decimal(365).sqrt()).quantize(Decimal("1e-10"))
     assert result.metrics.sharpe == sharpe
     assert result.metrics.sharpe < 0
+    downside = sum(min(item, Fraction(0)) ** 2 for item in returns) / 2
+    with localcontext() as ctx:
+        ctx.prec = 50
+        ctx.rounding = ROUND_HALF_EVEN
+        deviation = (Decimal(downside.numerator) / Decimal(downside.denominator)).sqrt()
+        sortino = (mean_dec / deviation * Decimal(365).sqrt()).quantize(Decimal("1e-10"))
+        grown = (Decimal("0.9") ** (Decimal(365) / Decimal(3))) - 1
+        annualized = grown.quantize(Decimal("1e-10"))
+        by_next = (Decimal("0.9") ** (Decimal(365) / Decimal(4))) - 1
+    assert result.metrics.sortino == sortino
+    assert result.metrics.undefined.get("sortino") is None
+    assert result.metrics.annualized_return == annualized
+    assert result.metrics.annualized_return != by_next.quantize(Decimal("1e-10"))
+    assert result.metrics.calmar == (annualized / result.metrics.max_drawdown).quantize(
+        Decimal("1e-10")
+    )
+    net_calmar = (result.metrics.net_return / result.metrics.max_drawdown).quantize(
+        Decimal("1e-10")
+    )
+    assert result.metrics.calmar != net_calmar
 
 
 def test_win_and_loss_streaks_follow_closed_trades_only() -> None:
@@ -424,8 +485,10 @@ def test_a_zero_initial_cent_does_not_divide_by_zero() -> None:
     )
     _finite(result)
     assert result.metrics.initial_equity == Decimal("0.00")
-    assert result.metrics.net_return == Decimal("0")
-    assert result.metrics.sharpe == Decimal("0")
+    assert result.metrics.undefined["net_return"] == "zero_initial"
+    assert result.metrics.undefined["sharpe"] == "zero_initial"
+    assert result.metrics.undefined["annualized_return"] == "zero_initial"
+    assert result.metrics.undefined["calmar"] == "zero_initial"
 
 
 def test_a_take_profit_gap_above_the_low_is_flagged() -> None:
@@ -601,3 +664,699 @@ def _sma(period: int = 2, level: int = 0) -> dict:
         ],
         signals=[{"id": "go", "expr": _gt(f"sma_{period}", level)}],
     )
+
+
+_TRADE_HEADER = (
+    "trade_id,asset_id,status,entry_time,exit_time,qty,entry_price,exit_price,"
+    "entry_notional,exit_notional,commission,realized_pnl,unrealized_pnl,"
+    "limit_below_low,overlaps_suspect_outage,synthetic_bars,missing_bars,"
+    "long_no_trade_bars,long_no_trade_minutes,suspect_outage_bars,suspect_outage_minutes"
+)
+
+
+def test_the_trade_log_column_order_is_fixed() -> None:
+    assert TRADE_COLUMNS == tuple(_TRADE_HEADER.split(","))
+    assert trade_log_csv(()).splitlines() == [_TRADE_HEADER]
+    assert "\r" not in trade_log_csv(())
+
+
+def test_metric_csv_and_json_agree_and_print_zero_in_full() -> None:
+    result = run_backtest(_flat(), {"sol": [_bar(0, 1), _bar(60, 1), _bar(120, 1)]})
+    payload = json.loads(metrics_json(result.metrics))
+    row = next(csv.DictReader(io.StringIO(metrics_csv(result.metrics))))
+    assert payload["schema"] == METRICS_SCHEMA
+    assert list(row) == list(METRIC_COLUMNS)
+    assert list(payload["values"]) == list(METRIC_COLUMNS)
+    for column in METRIC_COLUMNS:
+        value = payload["values"][column]
+        if value is None:
+            assert row[column] == ""
+            assert column in payload["undefined"]
+        else:
+            assert row[column] == value
+            assert "E" not in value
+            assert "e" not in value
+    assert payload["values"]["net_return"] == format(result.metrics.net_return, "f")
+    assert payload["values"]["net_return"] != "0E-10"
+    assert payload["undefined"]["sharpe"] == "zero_variance"
+
+
+def test_logs_are_byte_identical_across_hash_seeds() -> None:
+    script = """
+from app.backtest import metrics_csv, metrics_json, run_backtest, trade_log_csv, trade_log_json
+from app.ohlcv.bars import Bar
+
+start = 1767225600
+mint = "SyntheticMint111111111111111111111111111"
+bars = [Bar(mint, "1m", start + 60 * i, 100, 100, 100, 100, 1, False) for i in range(3)]
+document = {
+    "ir_version": "1.0",
+    "strategy": {"id": "hand", "name": "Hand"},
+    "engine": {
+        "bar_size": "1m", "event": "bar_close", "fill_price_mode": "on_close", "warmup_bars": 0
+    },
+    "capital": {"initial": 10000, "currency": "USDC"},
+    "costs": {"commission_bps": 0, "slippage_bps": 0},
+    "assets": [
+        {"id": "sol", "symbol": "SOL", "chain": "solana", "market": "spot", "quote": "USDC"}
+    ],
+    "derived_series": [],
+    "signals": [{"id": "go", "expr": {"op": "lit", "value": False}}],
+    "actions": [{
+        "id": "enter_sol", "type": "enter", "side": "long", "asset": "sol",
+        "order": {"type": "market"}, "sizing": {"mode": "percent_equity", "percent": 100},
+        "risk": {"type": "oco", "evaluation": "on_entry_fill", "movement": "tighten_only",
+                 "take_profit": {"mode": "percent", "percent": 6},
+                 "stop_loss": {"mode": "percent", "percent": 3}},
+    }],
+    "rules": [{"id": "enter_rule", "when": "go", "do": "enter_sol"}],
+    "portfolio": {"mode": "spot", "direction": "long_only", "chain": "solana",
+                  "max_positions": 1, "allow_pyramiding": False, "quote_currency": "USDC"},
+}
+result = run_backtest(document, {"sol": bars})
+print(trade_log_csv(result.trades), end="")
+print(trade_log_json(result.trades), end="")
+print(metrics_csv(result.metrics), end="")
+print(metrics_json(result.metrics), end="")
+"""
+    root = str(__file__).rsplit("/tests/", 1)[0]
+    first = _run_seed(script, root, "1")
+    second = _run_seed(script, root, "777")
+    assert first == second
+    assert "0E-10" not in first
+
+
+def _run_seed(script: str, root: str, seed: str) -> str:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = root
+    env["PYTHONHASHSEED"] = seed
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return completed.stdout
+
+
+def test_case_g_does_not_crash_on_a_short_calmar() -> None:
+    """60 one-minute bars, buy and hold, +0.95% with one 0.017 dip.
+
+    Annualizing that hour overflows the 1e-10 quantize. The run is shorter
+    than a day, so annualized return and Calmar are null, and the book still
+    finishes.
+    """
+    bars = []
+    for index in range(60):
+        price = round(100 + (100.95 - 100) * index / 59, 6)
+        if index == 30:
+            price = round(price - 0.017, 6)
+        bars.append(_bar(60 * index, price))
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(50, 50)
+    result = run_backtest(document, {"sol": bars})
+    _finite(result)
+    assert result.metrics.bar_count == 60
+    assert result.metrics.net_return is not None
+    assert result.metrics.net_return > 0
+    assert result.metrics.undefined["annualized_return"] == "too_short"
+    assert result.metrics.undefined["calmar"] == "too_short"
+    assert result.metrics.sharpe is not None
+
+
+def test_annualization_past_one_day_that_will_not_fit_is_null() -> None:
+    """(1 + 99) ^ (365 / 3) does not fit in a 1e-10 quantize at 50 digits."""
+    metrics = compute_metrics(
+        initial=Decimal("10000"),
+        curve=(Decimal("10000"), Decimal("9000"), Decimal("1000000")),
+        closed_pnls=(),
+        open_trades=1,
+        bar_seconds=86_400,
+        take_profit_limit_below_low=0,
+        quality=QualityCounts(3, 0, 0, 0, 0, 120, 0, 0, 0, 0),
+    )
+    assert metrics.undefined["annualized_return"] == "annualization_overflow"
+    assert metrics.undefined["calmar"] == "annualization_overflow"
+    assert metrics.net_return == Decimal("99")
+
+
+def test_ratio_math_ignores_the_caller_precision() -> None:
+    quality = QualityCounts(2, 0, 0, 0, 0, 120, 0, 0, 0, 0)
+    kwargs = {
+        "initial": Decimal("10000"),
+        "curve": (Decimal("10000"), Decimal("11000")),
+        "closed_pnls": (Decimal("1000"),),
+        "open_trades": 0,
+        "bar_seconds": 86_400,
+        "take_profit_limit_below_low": 0,
+        "quality": quality,
+    }
+    full = compute_metrics(**kwargs)
+    with localcontext() as ctx:
+        ctx.prec = 6
+        narrow = compute_metrics(**kwargs)
+    assert narrow.sharpe == full.sharpe
+    assert narrow.annualized_return == full.annualized_return
+    assert full.sharpe is not None
+
+
+def test_a_flat_day_annualizes_to_zero_and_a_total_loss_to_minus_one() -> None:
+    flat = run_backtest(
+        _strategy(
+            engine={
+                "bar_size": "1d",
+                "event": "bar_close",
+                "fill_price_mode": "on_close",
+                "warmup_bars": 0,
+            },
+            signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+        ),
+        {"sol": [_bar(0, 1, timeframe="1d"), _bar(86_400, 1, timeframe="1d")]},
+    )
+    assert flat.metrics.net_return == Decimal("0")
+    assert flat.metrics.annualized_return == Decimal("0")
+    assert flat.metrics.undefined["calmar"] == "no_drawdown"
+
+    wiped = _strategy(
+        engine={
+            "bar_size": "1d",
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 0,
+        },
+        costs={"commission_bps": 10_000, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "stop", "expr": _eq("close", 90)},
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    wiped["actions"][0]["risk"] = _risk(100, 99)
+    lost = run_backtest(
+        wiped,
+        {
+            "sol": [
+                _bar(0, 100, timeframe="1d"),
+                _bar(86_400, 90, timeframe="1d"),
+            ]
+        },
+    )
+    assert lost.final_equity == Decimal("0.00")
+    assert lost.metrics.net_return == Decimal("-1")
+    assert lost.metrics.annualized_return == Decimal("-1")
+
+
+def test_drawdown_and_net_return_start_from_initial_capital() -> None:
+    """One buy with 10 bps. The only curve point is already below the capital.
+
+    A peak that starts on that point reports no drawdown, and a net return
+    measured from it is 0.
+    """
+    document = _strategy(
+        costs={"commission_bps": 10, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    result = run_backtest(document, {"sol": [_bar(0, 100)]})
+    assert result.equity_curve[0].equity == Decimal("9990.01")
+    assert result.metrics.net_return == Decimal("-0.000999")
+    assert result.metrics.max_drawdown == Decimal("0.000999")
+
+
+def test_a_scratch_between_wins_resets_the_streak() -> None:
+    def run(prices: list[int]):
+        document = _strategy(
+            costs={"commission_bps": 0, "slippage_bps": 0},
+            signals=[
+                {"id": "go", "expr": {"op": "lit", "value": True}},
+                {"id": "stop", "expr": {"op": "lit", "value": True}},
+            ],
+            rules=[
+                {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+                {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            ],
+        )
+        document["actions"][0]["risk"] = _risk(100, 99)
+        return run_backtest(
+            document, {"sol": [_bar(60 * index, price) for index, price in enumerate(prices)]}
+        )
+
+    scratch = run([100, 110, 110, 120])
+    assert [trade.realized_pnl for trade in scratch.trades if trade.status == "closed"] == [
+        Decimal("1000.00"),
+        Decimal("0.00"),
+        Decimal("1000.00"),
+    ]
+    assert scratch.metrics.win_streak == 1
+    loss = run([100, 110, 100, 110])
+    assert [trade.realized_pnl for trade in loss.trades if trade.status == "closed"] == [
+        Decimal("1000.00"),
+        Decimal("-1000.00"),
+        Decimal("1000.00"),
+    ]
+    assert loss.metrics.win_streak == 1
+    assert loss.metrics.loss_streak == 1
+
+
+def test_closed_trades_follow_exit_order_not_entry_order() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        assets=[
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+            {
+                "id": "jup",
+                "symbol": "JUP",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+        ],
+        signals=[
+            {"id": "go_sol", "expr": _eq("close", 100)},
+            {"id": "go_jup", "expr": _eq("close", 100)},
+            {"id": "out_jup", "expr": _eq("close", 120)},
+            {"id": "out_sol", "expr": _eq("close", 80)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "enter_jup",
+                "type": "enter",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_jup",
+                "type": "exit",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_sol_rule", "when": "go_sol", "do": "enter_sol"},
+            {"id": "enter_jup_rule", "when": "go_jup", "do": "enter_jup"},
+            {"id": "exit_jup_rule", "when": "out_jup", "do": "exit_jup"},
+            {"id": "exit_sol_rule", "when": "out_sol", "do": "exit_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 2,
+            "allow_pyramiding": False,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(
+        document,
+        {
+            "sol": [_bar(0, 100), _bar(60, 101), _bar(120, 102), _bar(180, 80)],
+            "jup": [_bar(0, 50), _bar(60, 100), _bar(120, 120), _bar(180, 90)],
+        },
+    )
+    closed = [trade for trade in result.trades if trade.status == "closed"]
+    assert [trade.asset_id for trade in closed] == ["jup", "sol"]
+    assert closed[0].realized_pnl == Decimal("1000.00")
+    assert closed[1].realized_pnl == Decimal("-1000.00")
+    assert [trade.exit_time for trade in closed] == [_START + 120, _START + 180]
+
+
+def test_a_take_profit_at_the_low_is_not_below_it() -> None:
+    """The raw limit is 110, equal to the low. The open is 112, above it."""
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": _eq("close", 100)}],
+    )
+    document["actions"][0]["risk"] = _risk(10, 5)
+    result = run_backtest(
+        document,
+        {
+            "sol": [
+                _bar(0, 100),
+                _bar(60, 112, open_=112, high=115, low=110),
+            ]
+        },
+    )
+    assert result.fills[1].leg == "take_profit"
+    assert result.fills[1].price == Decimal("110")
+    assert result.fills[1].limit_below_low is False
+    assert result.metrics.take_profit_limit_below_low == 0
+    assert result.trades[0].limit_below_low is False
+
+
+def test_a_half_equity_budget_rounds_half_even() -> None:
+    """3333.35 * 50% = 1666.675. The kept digit is odd, so the cent is 1666.68."""
+    document = _strategy(
+        capital={"initial": 3333.35, "currency": "USDC"},
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 10)]})
+    assert result.fills[0].notional == Decimal("1666.68")
+
+
+def test_open_equity_uses_the_exact_quantity() -> None:
+    """43175 / 78.834 * 1.655514 = 906.675, which half-even marks at 906.68."""
+    document = _strategy(
+        capital={"initial": 43175, "currency": "USDC"},
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": _gt("close", 10)}],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    result = run_backtest(document, {"sol": [_bar(0, 78.834), _bar(60, 1.655514)]})
+    assert result.final_positions
+    assert result.final_equity == Decimal("906.68")
+
+
+def test_buy_commission_is_in_the_open_unrealized_pnl() -> None:
+    document = _strategy(
+        costs={"commission_bps": 10, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    result = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 100)]})
+    assert result.trades[0].unrealized_pnl == Decimal("-9.99")
+    assert result.final_equity - result.metrics.initial_equity == Decimal("-9.99")
+
+
+def test_a_later_add_does_not_reprice_a_partial_sale() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "trim", "expr": _eq("close", 110)},
+            {"id": "add", "expr": _eq("close", 80)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "add_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 50},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "trim", "do": "exit_sol"},
+            {"id": "add_rule", "when": "add", "do": "add_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(
+        document,
+        {"sol": [_bar(0, 100), _bar(60, 110), _bar(120, 80)]},
+    )
+    assert result.trades[0].realized_pnl == Decimal("500.00")
+    assert result.trades[0].status == "open"
+    total = result.trades[0].realized_pnl + result.trades[0].unrealized_pnl
+    assert total == result.final_equity - result.metrics.initial_equity
+
+
+def test_realized_plus_unrealized_matches_the_equity_change() -> None:
+    """Seeded books with adds, partial sells, and commission."""
+    for seed in (617, *range(30)):
+        result = _random_book(seed)
+        total = sum(
+            (trade.realized_pnl + trade.unrealized_pnl for trade in result.trades),
+            Decimal("0.00"),
+        )
+        assert total == result.final_equity - result.metrics.initial_equity
+
+
+def _random_book(seed: int):
+    rng = random.Random(seed)
+    commission = rng.choice((0, 5, 10, 25))
+    document = _strategy(
+        costs={"commission_bps": commission, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _gt("close", 100)},
+            {
+                "id": "trim",
+                "expr": {
+                    "op": "and",
+                    "left": {
+                        "op": "lt",
+                        "left": {"op": "ref", "name": "close"},
+                        "right": {"op": "lit", "value": 90},
+                    },
+                    "right": {
+                        "op": "gte",
+                        "left": {"op": "ref", "name": "close"},
+                        "right": {"op": "lit", "value": 80},
+                    },
+                },
+            },
+            {
+                "id": "flat",
+                "expr": {
+                    "op": "lt",
+                    "left": {"op": "ref", "name": "close"},
+                    "right": {"op": "lit", "value": 80},
+                },
+            },
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 40},
+                "risk": _risk(100, 99),
+            },
+            {
+                "id": "exit_half",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 50},
+            },
+            {
+                "id": "exit_all",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "flat_rule", "when": "flat", "do": "exit_all"},
+            {"id": "trim_rule", "when": "trim", "do": "exit_half"},
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    bars = []
+    for index in range(rng.randint(6, 12)):
+        kind = rng.randrange(4)
+        if kind == 0:
+            price = rng.uniform(101, 130)
+        elif kind == 1:
+            price = rng.uniform(80, 89.9)
+        elif kind == 2:
+            price = rng.uniform(70, 79.9)
+        else:
+            price = rng.uniform(90, 100)
+        bars.append(_bar(60 * index, round(price, 4)))
+    return run_backtest(document, {"sol": bars})
+
+
+def test_a_long_one_minute_hole_is_not_quiet() -> None:
+    result = run_backtest(_flat(), {"sol": [_bar(0, 1), _bar(122 * 60, 1)]})
+    assert result.metrics.missing_bars == 121
+    assert result.metrics.suspect_outage is False
+
+
+def test_leading_holes_before_the_first_real_bar_are_not_quiet() -> None:
+    step = 300
+    count = 30
+    document = _strategy(
+        engine={
+            "bar_size": "5m",
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 0,
+        },
+        assets=[
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+            {
+                "id": "jup",
+                "symbol": "JUP",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    result = run_backtest(
+        document,
+        {
+            "sol": [_bar(index * step, 10, timeframe="5m") for index in range(count)],
+            "jup": [_bar((count - 1) * step, 10, timeframe="5m")],
+        },
+    )
+    assert result.metrics.missing_bars == count - 1
+    assert result.metrics.suspect_outage is False
+
+
+def test_an_sma_window_counts_only_the_outage_bars_it_reads() -> None:
+    bars = [
+        _bar(0, 10, synthetic=True),
+        _bar(60, 10, synthetic=True),
+        _bar(120, 11),
+        _bar(180, 11),
+        _bar(240, 11),
+        _bar(300, 11),
+    ]
+    result = run_backtest(_sma(period=4, level=10_000), {"sol": bars}, long_no_trade_minutes=1)
+    assert any(
+        note == "sma_4 on sol is computed across 2 suspect_outage bars" for note in result.lints
+    )
+
+
+def test_a_seeded_run_without_a_finite_output_is_not_linted() -> None:
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "ema_10",
+                "kind": "indicator",
+                "indicator": "ema",
+                "source": "close",
+                "params": {"period": 10},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    bars = [_bar(0, 10, synthetic=True), _bar(60, 10, synthetic=True)]
+    result = run_backtest(document, {"sol": bars}, long_no_trade_minutes=1)
+    assert result.metrics.suspect_outage is True
+    assert not any("suspect_outage" in note for note in result.lints)
+
+
+def test_stochastic_lookback_reaches_the_full_k_and_d_window() -> None:
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "stoch_d",
+                "kind": "indicator",
+                "indicator": "stochastic",
+                "source": "close",
+                "output": "d",
+                "params": {"k_period": 3, "d_period": 3},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    bars = [
+        _bar(0, 10, synthetic=True),
+        _bar(60, 10, synthetic=True),
+    ]
+    for index, close in enumerate((11, 12, 13, 14, 15), start=2):
+        bars.append(_bar(60 * index, close, high=close + 2, low=close - 2))
+    result = run_backtest(document, {"sol": bars}, long_no_trade_minutes=1)
+    assert any(
+        note == "stoch_d on sol is computed across 2 suspect_outage bars"
+        for note in result.lints
+    )
+
+
+def test_synthetic_bars_do_not_set_the_outage_flag_on_their_own() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    document["actions"][0]["risk"] = _risk(100, 99)
+    bars = [_bar(0, 100), _bar(60, 100, synthetic=True), _bar(120, 100, synthetic=True)]
+    result = run_backtest(document, {"sol": bars})
+    trade = result.trades[0]
+    assert trade.synthetic_bars == 2
+    assert trade.overlaps_suspect_outage is False

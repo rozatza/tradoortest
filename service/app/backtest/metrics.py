@@ -1,22 +1,25 @@
 """Backtest metrics. Formulas and edge cases are in ``docs/metrics.md``.
 
-Ratios are half-even to 1e-10. A ratio that the definition leaves undefined
-(zero variance, no losses, no drawdown, no closed trades) is 0. Nothing
-here is NaN or infinite.
+Ratios are half-even to 1e-10 inside a local 50-digit context. A ratio the
+definition leaves undefined is ``None``, and ``undefined`` names the reason.
+A defined zero stays 0. Nothing here is NaN or infinite, and a ratio that
+the 1e-10 quantize cannot hold does not raise.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
 from fractions import Fraction
+from types import MappingProxyType
 
 from app.backtest.quality import QualityCounts
 
 _RATIO = Decimal("1e-10")
 _ZERO = Decimal("0")
-_SECONDS_PER_YEAR = 365 * 24 * 60 * 60
+_DAY = 24 * 60 * 60
+_SECONDS_PER_YEAR = 365 * _DAY
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,20 +57,25 @@ class Trade:
 
 @dataclass(frozen=True, slots=True)
 class Metrics:
-    """The run's ratios, streaks, and data-quality counts. All decimals are finite."""
+    """The run's ratios, streaks, and data-quality counts.
+
+    A ratio is ``None`` when it is undefined. ``undefined`` maps that field
+    to a reason. Decimals that are present are finite.
+    """
 
     initial_equity: Decimal
     final_equity: Decimal
-    net_return: Decimal
-    annualized_return: Decimal
+    net_return: Decimal | None
+    annualized_return: Decimal | None
     bars_per_year: int
     bar_count: int
     max_drawdown: Decimal
-    sharpe: Decimal
-    sortino: Decimal
-    calmar: Decimal
-    win_rate: Decimal
-    payoff_ratio: Decimal
+    sharpe: Decimal | None
+    sortino: Decimal | None
+    calmar: Decimal | None
+    win_rate: Decimal | None
+    payoff_ratio: Decimal | None
+    undefined: Mapping[str, str]
     win_streak: int
     loss_streak: int
     closed_trades: int
@@ -105,30 +113,74 @@ def compute_metrics(
     take_profit_limit_below_low: int,
     quality: QualityCounts,
 ) -> Metrics:
-    """Ratios from the cent equity curve and the closed-trade pnl, in exit order."""
+    """Ratios from the cent equity curve and the closed-trade pnl, in exit order.
+
+    The arithmetic runs in a local 50-digit context, so the caller's precision
+    does not change a ratio. An overflow becomes a null ratio. It does not raise.
+    """
+    with localcontext() as ctx:
+        ctx.prec = 50
+        ctx.rounding = ROUND_HALF_EVEN
+        return _compute(
+            initial=initial,
+            curve=curve,
+            closed_pnls=closed_pnls,
+            open_trades=open_trades,
+            bar_seconds=bar_seconds,
+            take_profit_limit_below_low=take_profit_limit_below_low,
+            quality=quality,
+        )
+
+
+def _compute(
+    *,
+    initial: Decimal,
+    curve: Sequence[Decimal],
+    closed_pnls: Sequence[Decimal],
+    open_trades: int,
+    bar_seconds: int,
+    take_profit_limit_below_low: int,
+    quality: QualityCounts,
+) -> Metrics:
     per_year = bars_per_year(bar_seconds)
+    periods = len(curve)
+    final = curve[-1] if curve else initial
+    undefined: dict[str, str] = {}
+    blank = _blank_reason(periods, initial)
     returns = _returns(initial, curve)
-    net = _net(initial, curve[-1] if curve else initial)
-    annualized = _annualized(net, len(curve), per_year)
+    net_value, net_reason = _net(initial, final, blank)
+    _put(undefined, "net_return", net_reason)
+    annualized, annual_reason = _annualized(
+        _net_fraction(initial, final), periods, per_year, bar_seconds, blank, net_reason
+    )
+    _put(undefined, "annualized_return", annual_reason)
     drawdown = _drawdown(initial, curve)
-    sharpe, sortino = _risk_ratios(returns, per_year)
-    calmar = _ratio(Decimal(0)) if drawdown == 0 else _ratio(annualized / drawdown)
+    sharpe, sharpe_reason, sortino, sortino_reason = _risk_ratios(returns, per_year, blank)
+    _put(undefined, "sharpe", sharpe_reason)
+    _put(undefined, "sortino", sortino_reason)
+    calmar, calmar_reason = _calmar(annualized, annual_reason, drawdown)
+    _put(undefined, "calmar", calmar_reason)
     wins = [pnl for pnl in closed_pnls if pnl > 0]
     losses = [pnl for pnl in closed_pnls if pnl < 0]
+    win_rate, win_reason = _rate(len(wins), len(closed_pnls))
+    _put(undefined, "win_rate", win_reason)
+    payoff, payoff_reason = _payoff(wins, losses, len(closed_pnls))
+    _put(undefined, "payoff_ratio", payoff_reason)
     win_streak, loss_streak = _streaks(closed_pnls)
     return Metrics(
         initial_equity=initial,
-        final_equity=curve[-1] if curve else initial,
-        net_return=_ratio_fraction(net),
+        final_equity=final,
+        net_return=net_value,
         annualized_return=annualized,
         bars_per_year=per_year,
-        bar_count=len(curve),
+        bar_count=periods,
         max_drawdown=drawdown,
         sharpe=sharpe,
         sortino=sortino,
         calmar=calmar,
-        win_rate=_rate(len(wins), len(closed_pnls)),
-        payoff_ratio=_payoff(wins, losses),
+        win_rate=win_rate,
+        payoff_ratio=payoff,
+        undefined=MappingProxyType(undefined),
         win_streak=win_streak,
         loss_streak=loss_streak,
         closed_trades=len(closed_pnls),
@@ -152,6 +204,19 @@ def compute_metrics(
     )
 
 
+def _put(undefined: dict[str, str], name: str, reason: str | None) -> None:
+    if reason is not None:
+        undefined[name] = reason
+
+
+def _blank_reason(periods: int, initial: Decimal) -> str | None:
+    if periods == 0:
+        return "no_bars"
+    if initial == 0:
+        return "zero_initial"
+    return None
+
+
 def _returns(initial: Decimal, curve: Sequence[Decimal]) -> list[Fraction]:
     previous = Fraction(initial)
     returns: list[Fraction] = []
@@ -165,10 +230,21 @@ def _returns(initial: Decimal, curve: Sequence[Decimal]) -> list[Fraction]:
     return returns
 
 
-def _net(initial: Decimal, final: Decimal) -> Fraction:
+def _net_fraction(initial: Decimal, final: Decimal) -> Fraction:
     if initial == 0:
         return Fraction(0)
     return (Fraction(final) - Fraction(initial)) / Fraction(initial)
+
+
+def _net(
+    initial: Decimal, final: Decimal, blank: str | None
+) -> tuple[Decimal | None, str | None]:
+    if blank is not None:
+        return None, blank
+    value = _ratio_fraction(_net_fraction(initial, final))
+    if value is None:
+        return None, "annualization_overflow"
+    return value, None
 
 
 def _drawdown(initial: Decimal, curve: Sequence[Decimal]) -> Decimal:
@@ -182,51 +258,123 @@ def _drawdown(initial: Decimal, curve: Sequence[Decimal]) -> Decimal:
             drop = (peak - current) / peak
             if drop > worst:
                 worst = drop
-    return _ratio_fraction(worst)
+    value = _ratio_fraction(worst)
+    return Decimal(0) if value is None else value
 
 
-def _risk_ratios(returns: Sequence[Fraction], per_year: int) -> tuple[Decimal, Decimal]:
+def _risk_ratios(
+    returns: Sequence[Fraction], per_year: int, blank: str | None
+) -> tuple[Decimal | None, str | None, Decimal | None, str | None]:
+    if blank is not None:
+        return None, blank, None, blank
     count = len(returns)
     if count < 2:
-        return _ratio(_ZERO), _ratio(_ZERO)
+        return None, "too_few_returns", None, "too_few_returns"
     mean = sum(returns, Fraction(0)) / count
     variance = sum((item - mean) ** 2 for item in returns)
     downside = sum(min(item, Fraction(0)) ** 2 for item in returns)
-    scale = _sqrt(Fraction(per_year))
-    mean_dec = _decimal(mean)
-    sharpe = _ratio(_ZERO)
-    if variance != 0:
-        sharpe = _ratio(mean_dec / _sqrt(variance / (count - 1)) * scale)
-    sortino = _ratio(_ZERO)
-    if downside != 0:
-        sortino = _ratio(mean_dec / _sqrt(downside / (count - 1)) * scale)
-    return sharpe, sortino
+    try:
+        mean_dec = _decimal(mean)
+        scale = _sqrt(Fraction(per_year))
+    except DecimalException:
+        return None, "annualization_overflow", None, "annualization_overflow"
+    if variance == 0:
+        sharpe, sharpe_reason = None, "zero_variance"
+    else:
+        sharpe = _scale(mean_dec, variance / (count - 1), scale)
+        sharpe_reason = None if sharpe is not None else "annualization_overflow"
+    if downside == 0:
+        sortino, sortino_reason = None, "no_downside"
+    else:
+        # Every return is in the sum. A positive return contributes 0.
+        # The divisor is N - 1, the same sample divisor as Sharpe, not the
+        # count of negative returns and not N.
+        sortino = _scale(mean_dec, downside / (count - 1), scale)
+        sortino_reason = None if sortino is not None else "annualization_overflow"
+    return sharpe, sharpe_reason, sortino, sortino_reason
 
 
-def _annualized(net: Fraction, periods: int, per_year: int) -> Decimal:
-    if periods <= 0 or net == 0:
-        return _ratio(_ZERO)
+def _scale(mean: Decimal, second: Fraction, per_year_sqrt: Decimal) -> Decimal | None:
+    try:
+        with localcontext() as ctx:
+            ctx.prec = 50
+            ctx.rounding = ROUND_HALF_EVEN
+            deviation = _sqrt(second)
+            if deviation == 0:
+                return None
+            return _ratio(mean / deviation * per_year_sqrt)
+    except DecimalException:
+        return None
+
+
+def _annualized(
+    net: Fraction,
+    periods: int,
+    per_year: int,
+    bar_seconds: int,
+    blank: str | None,
+    net_reason: str | None,
+) -> tuple[Decimal | None, str | None]:
+    if blank is not None:
+        return None, blank
+    if periods * bar_seconds < _DAY:
+        return None, "too_short"
+    if net_reason == "annualization_overflow":
+        return None, "annualization_overflow"
+    if net == 0:
+        return _ratio(_ZERO), None
     base = 1 + net
     if base <= 0:
-        return _ratio(Decimal(-1))
+        return _ratio(Decimal(-1)), None
     try:
         with localcontext() as ctx:
             ctx.prec = 50
             ctx.rounding = ROUND_HALF_EVEN
             grown = _decimal(base) ** (Decimal(per_year) / Decimal(periods))
-            return _ratio(grown - 1)
+            value = _ratio(grown - 1)
     except DecimalException:
-        return _ratio(_ZERO)
+        value = None
+    if value is None:
+        return None, "annualization_overflow"
+    return value, None
 
 
-def _payoff(wins: Sequence[Decimal], losses: Sequence[Decimal]) -> Decimal:
-    if not wins or not losses:
-        return _ratio(_ZERO)
+def _calmar(
+    annualized: Decimal | None, annual_reason: str | None, drawdown: Decimal
+) -> tuple[Decimal | None, str | None]:
+    if annualized is None:
+        return None, annual_reason
+    if drawdown == 0:
+        return None, "no_drawdown"
+    try:
+        with localcontext() as ctx:
+            ctx.prec = 50
+            ctx.rounding = ROUND_HALF_EVEN
+            value = _ratio(annualized / drawdown)
+    except DecimalException:
+        value = None
+    if value is None:
+        return None, "annualization_overflow"
+    return value, None
+
+
+def _payoff(
+    wins: Sequence[Decimal], losses: Sequence[Decimal], closed: int
+) -> tuple[Decimal | None, str | None]:
+    if closed == 0:
+        return None, "no_closed_trades"
+    if not wins:
+        return None, "no_wins"
+    if not losses:
+        return None, "no_losses"
     average_win = sum((Fraction(pnl) for pnl in wins), Fraction(0)) / len(wins)
     average_loss = sum((Fraction(-pnl) for pnl in losses), Fraction(0)) / len(losses)
     if average_loss == 0:
-        return _ratio(_ZERO)
-    return _ratio_fraction(average_win / average_loss)
+        return None, "no_losses"
+    value = _ratio_fraction(average_win / average_loss)
+    if value is None:
+        return None, "annualization_overflow"
+    return value, None
 
 
 def _streaks(pnls: Sequence[Decimal]) -> tuple[int, int]:
@@ -246,10 +394,13 @@ def _streaks(pnls: Sequence[Decimal]) -> tuple[int, int]:
     return best_wins, best_losses
 
 
-def _rate(numerator: int, denominator: int) -> Decimal:
+def _rate(numerator: int, denominator: int) -> tuple[Decimal | None, str | None]:
     if denominator == 0:
-        return _ratio(_ZERO)
-    return _ratio_fraction(Fraction(numerator, denominator))
+        return None, "no_closed_trades"
+    value = _ratio_fraction(Fraction(numerator, denominator))
+    if value is None:
+        return None, "annualization_overflow"
+    return value, None
 
 
 def _sqrt(amount: Fraction) -> Decimal:
@@ -266,11 +417,14 @@ def _decimal(amount: Fraction) -> Decimal:
         return Decimal(amount.numerator) / Decimal(amount.denominator)
 
 
-def _ratio_fraction(amount: Fraction) -> Decimal:
-    return _ratio(_decimal(amount))
+def _ratio_fraction(amount: Fraction) -> Decimal | None:
+    try:
+        return _ratio(_decimal(amount))
+    except DecimalException:
+        return None
 
 
-def _ratio(amount: Decimal) -> Decimal:
+def _ratio(amount: Decimal) -> Decimal | None:
     with localcontext() as ctx:
         ctx.prec = 50
         ctx.rounding = ROUND_HALF_EVEN

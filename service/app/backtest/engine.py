@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
 from fractions import Fraction
 from typing import Any
@@ -157,6 +157,10 @@ class _Acc:
     sell_commission: Decimal = Decimal("0.00")
     limit_below_low: bool = False
     exit_time: int | None = None
+    # Open cost including the buy commission still attached to the open quantity.
+    basis: Fraction = field(default_factory=lambda: Fraction(0))
+    # Booked at each sell from the basis then open. Later buys do not rewrite it.
+    realized_exact: Fraction = field(default_factory=lambda: Fraction(0))
 
 
 @dataclass
@@ -627,7 +631,11 @@ def _walk(
         OpenPosition(asset_id, decimal_ratio(position.qty), position.entry_price)
         for asset_id, position in book.positions.items()
     )
-    trades = _trades(closed_acc, open_acc, marks, flags, grid, step)
+    trades = _tie_open_pnl(
+        _trades(closed_acc, open_acc, marks, flags, grid, step),
+        initial,
+        final_equity,
+    )
     quality = QualityCounts(
         grid_bars=len(grid),
         missing_bars=missing_bars,
@@ -1040,6 +1048,7 @@ def _note_buy(
     acc.entry_value += qty * Fraction(price)
     acc.entry_notional += notional
     acc.buy_commission += commission
+    acc.basis += Fraction(notional) + Fraction(commission)
 
 
 def _note_sell(
@@ -1055,6 +1064,9 @@ def _note_sell(
 ) -> None:
     acc = open_acc[asset_id]
     previous = acc.qty
+    sold_basis = acc.basis * qty / previous
+    acc.realized_exact += Fraction(notional) - Fraction(commission) - sold_basis
+    acc.basis -= sold_basis
     acc.exit_value += qty * Fraction(price)
     acc.exit_notional += notional
     acc.sell_commission += commission
@@ -1064,6 +1076,7 @@ def _note_sell(
     if acc.qty == 0:
         acc.exit_time = open_time
         acc.cost = Fraction(0)
+        acc.basis = Fraction(0)
         closed_acc.append(acc)
         del open_acc[asset_id]
 
@@ -1121,21 +1134,50 @@ def _trades(
 
 
 def _pnl(acc: _Acc, mark: Decimal | None) -> tuple[Decimal, Decimal]:
+    """Cents from the basis booked at each fill.
+
+    Realized uses the basis that was open at the sell, so a later add does
+    not reprice it. Unrealized marks what is left, and that basis still
+    includes the buy commission on the open quantity.
+    """
     sold = acc.qty_entry - acc.qty
-    if acc.qty_entry == 0 or sold == 0:
+    if sold == 0:
         realized = Decimal("0.00")
     else:
-        frac = sold / acc.qty_entry
-        realized = quantize_cents(
-            Fraction(acc.exit_notional - acc.sell_commission)
-            - Fraction(acc.entry_notional) * frac
-            - Fraction(acc.buy_commission) * frac
-        )
+        realized = quantize_cents(acc.realized_exact)
     if acc.qty == 0 or mark is None:
         unrealized = Decimal("0.00")
     else:
-        unrealized = quantize_cents(acc.qty * Fraction(mark) - acc.cost)
+        unrealized = quantize_cents(acc.qty * Fraction(mark) - acc.basis)
     return realized, unrealized
+
+
+def _tie_open_pnl(
+    trades: tuple[Trade, ...], initial: Decimal, final: Decimal
+) -> tuple[Trade, ...]:
+    """Absorb a one-cent remainder so the open book matches the equity change.
+
+    Realized plus unrealized equals ``final - initial`` when the parts are
+    exact. Rounding each trade to the cent can leave one cent over. That
+    cent is added to the last open trade. A larger gap is left in place.
+    """
+    if not trades:
+        return trades
+    total = sum((trade.realized_pnl + trade.unrealized_pnl for trade in trades), Decimal("0.00"))
+    delta = final - initial - total
+    if delta == 0:
+        return trades
+    last = None
+    open_count = 0
+    for index, trade in enumerate(trades):
+        if trade.status == "open":
+            last = index
+            open_count += 1
+    if last is None or abs(delta) > Decimal("0.01") * open_count:
+        return trades
+    chosen = trades[last]
+    patched = replace(chosen, unrealized_pnl=chosen.unrealized_pnl + delta)
+    return tuple(patched if index == last else trade for index, trade in enumerate(trades))
 
 
 def _span(
