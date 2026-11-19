@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import time
-from decimal import ROUND_DOWN, Decimal, Inexact, getcontext, localcontext
+import tracemalloc
+from decimal import MIN_EMIN, ROUND_DOWN, Decimal, Inexact, getcontext, localcontext
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
+import app.backtest.engine as engine
 from app.backtest import BacktestError, move_oco, run_backtest, trade_log_csv, trade_log_json
 from app.backtest.engine import _between, _flag_prefix
 from app.backtest.money import decimal_ratio, floor_qty
@@ -2118,6 +2120,34 @@ def test_a_same_bar_reenter_after_an_oco_fill_anchors_a_new_pair() -> None:
     assert result.final_positions == ()
 
 
+def test_exactly_200_000_slots_pass_the_cap_and_200_001_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``>`` accepts 200,000. ``>=`` would reject it. 200,001 never builds the grid."""
+
+    def stop(*_args, **_kwargs):
+        raise RuntimeError("past the cap")
+
+    monkeypatch.setattr(engine, "_walk", stop)
+    document = _strategy()
+    span = (engine.MAX_GRID_BARS - 1) * 60
+    with pytest.raises(RuntimeError, match="past the cap"):
+        run_backtest(document, {"sol": [_bar(0, 1), _bar(span, 1)]})
+    tracemalloc.start()
+    try:
+        with pytest.raises(BacktestError) as caught:
+            run_backtest(
+                document,
+                {"sol": [_bar(0, 1), _bar(engine.MAX_GRID_BARS * 60, 1)]},
+            )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert caught.value.code == "grid_too_large"
+    # The allocated grid of 200,001 stamps is about 30 MB. The check is first.
+    assert peak < 2_000_000
+
+
 def test_a_year_of_one_minute_slots_is_rejected_before_the_grid() -> None:
     document = _strategy()
     year = 365 * 86400
@@ -2151,6 +2181,42 @@ def test_the_engine_ignores_a_caller_inexact_trap() -> None:
         trapped = run_backtest(document, {"sol": bars})
         assert getcontext().traps[Inexact]
     assert trapped.fills[0].qty == plain.fills[0].qty == Decimal("1666.666666666666")
+
+
+def test_the_engine_context_keeps_the_full_emin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fill runs under the engine's own ``Emin``, which is the decimal minimum.
+
+    ``Decimal('1666.666666666666')`` has adjusted exponent 3, so forcing the
+    engine's ``Emin`` to -5 does not change this quantity. The guard reads the
+    context the fill actually uses.
+    """
+    seen: list[int] = []
+    real = engine.floor_qty
+
+    def watch(amount: Fraction) -> Decimal:
+        seen.append(getcontext().Emin)
+        return real(amount)
+
+    monkeypatch.setattr(engine, "floor_qty", watch)
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 3)]})
+    assert seen
+    assert set(seen) == {MIN_EMIN}
+    assert result.fills[0].qty == Decimal("1666.666666666666")
 
 
 def test_the_engine_ignores_a_caller_emin() -> None:

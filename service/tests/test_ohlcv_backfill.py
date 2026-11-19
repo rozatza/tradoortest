@@ -1877,6 +1877,64 @@ def test_rejection_text_uses_the_timestamp_not_the_page_index(tmp_path: Path) ->
     assert all(open_time != stamp for open_time, _close, _synthetic in later)
 
 
+def test_a_seed_past_the_window_budget_is_still_fetched(tmp_path: Path) -> None:
+    """The lookback pages are part of the budget. Without them this seed is not reached.
+
+    Window of one minute, page size 2. The base budget is 4 pages. The good
+    seed sits further back than that, and still inside 24 hours.
+    """
+    start = _START + 60 * 60
+    end = start + 60
+    seed_time = start - 40 * 60
+    candles: list[list[object]] = [[seed_time, 4.0, 4.0, 4.0, 4.0, 1.0]]
+    candles.extend(
+        [start - 60 * offset, 1.0, 1.0, 0.5, 9.0, 1.0] for offset in range(1, 30)
+    )
+    candles.append([start, 2.0, 2.0, 2.0, 2.0, 1.0])
+    bars, _rejected = _paged(
+        tmp_path / "lookback.sqlite",
+        candles,
+        [(start, end)],
+        page_limit=2,
+        load_start=seed_time,
+        load_end=end,
+    )
+    assert any(open_time == seed_time and not synthetic for open_time, _close, synthetic in bars)
+    assert any(open_time == start and close == 2.0 for open_time, close, _synthetic in bars)
+
+
+def test_a_seed_exactly_one_day_back_is_used_and_one_minute_older_is_not(
+    tmp_path: Path,
+) -> None:
+    """Exactly 86400 seconds is inside the cap. 86460 is not.
+
+    ``>=`` rejects the exact day. A cap 60 seconds short does too. A cap 60
+    seconds long would keep the older seed.
+    """
+    day = _START - 86400
+    older = _START - 86460
+    end = _START + 60
+    used, _flags = _paged(
+        tmp_path / "day.sqlite",
+        [_candle(day, 1.5)],
+        [(_START, end)],
+        page_limit=10,
+        load_start=day,
+        load_end=end,
+    )
+    assert used
+    assert used[0][0] == day
+    dropped, _flags = _paged(
+        tmp_path / "older.sqlite",
+        [_candle(older, 1.5)],
+        [(_START, end)],
+        page_limit=10,
+        load_start=older,
+        load_end=end,
+    )
+    assert dropped == []
+
+
 def test_a_seed_older_than_a_day_is_not_used(tmp_path: Path) -> None:
     old = _START - 10 * 86400
     end = _START + 30 * 60

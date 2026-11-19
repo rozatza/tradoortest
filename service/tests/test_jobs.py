@@ -6,6 +6,7 @@ job database.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import threading
@@ -23,7 +24,7 @@ from app.indicators.errors import IndicatorError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError
 from app.ir.validate import validate_ir
-from app.jobs.queue import JobQueue
+from app.jobs.queue import JobQueue, QueueBusy
 from app.jobs.run import run_backtest_job
 from app.main import create_app
 from test_backtest import _START, _risk, _strategy
@@ -105,12 +106,16 @@ def test_a_duplicate_request_key_returns_the_same_job(tmp_path: Path) -> None:
     queue = JobQueue(tmp_path / "jobs.sqlite")
     client = _client(queue)
     try:
-        first = client.post("/backtests", json=_payload("same", bars=[_row(0, 100)]))
+        body = _payload("same", bars=[_row(0, 100)])
+        first = client.post("/backtests", json=body)
         assert first.status_code == 202
         job_id = first.json()["job_id"]
-        second = client.post("/backtests", json=_payload("same", bars=[_row(0, 50)]))
+        second = client.post("/backtests", json=body)
         assert second.status_code == 200
         assert second.json()["job_id"] == job_id
+        reused = client.post("/backtests", json=_payload("same", bars=[_row(0, 50)]))
+        assert reused.status_code == 409
+        assert reused.json()["error"]["code"] == "request_key_reused"
         status = _wait(client, job_id)
         assert status["status"] == "succeeded"
         results = client.get(f"/backtests/{job_id}/results")
@@ -229,7 +234,7 @@ def test_concurrency_limit_is_429_and_a_duplicate_is_not(tmp_path: Path) -> None
         second = client.post("/backtests", json=_payload("two"))
         assert second.status_code == 429
         assert second.json()["error"]["code"] == "concurrency_limit"
-        replay = client.post("/backtests", json=_payload("one", bars=[_row(0, 50)]))
+        replay = client.post("/backtests", json=_payload("one"))
         assert replay.status_code == 200
         assert replay.json()["job_id"] == job_id
         release.set()
@@ -521,6 +526,324 @@ def test_validate_ir_rejects_a_lone_surrogate_before_the_hash() -> None:
         canonicalize(document)
     assert caught.value.code == "invalid_string"
     assert caught.value.path == "$.strategy.name"
+
+
+_MARKER = "424242.5"
+_JSON = {"content-type": "application/json"}
+
+
+def _raw(body: str) -> bytes:
+    return body.encode("utf-8")
+
+
+def _db_bytes(path: Path) -> bytes:
+    blob = bytearray()
+    for item in sorted(path.parent.glob(path.name + "*")):
+        if item.is_file():
+            blob.extend(item.read_bytes())
+    return bytes(blob)
+
+
+def _post_marked(client: TestClient, key: str) -> object:
+    row = _row(0, 100, high=31337.25, volume=424242.5)
+    return client.post("/backtests", json=_payload(key, bars=[row]))
+
+
+def test_non_finite_and_non_utf8_bodies_are_422(tmp_path: Path) -> None:
+    """NaN, Infinity, 1e400, a NaN inside ir, and a body that is not UTF-8."""
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    cases = [
+        '{"request_key":"nan","bars":{"sol":[{"open_time":1,"close":NaN}]}}',
+        '{"request_key":"inf","bars":{"sol":[{"open_time":1,"close":Infinity}]}}',
+        '{"request_key":"huge","bars":{"sol":[{"open_time":1,"close":1e400}]}}',
+        '{"request_key":"nan-ir","ir":{"capital":{"initial":NaN}},"bars":{}}',
+    ]
+    try:
+        for text in cases:
+            response = client.post("/backtests", content=_raw(text), headers=_JSON)
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "invalid_json"
+        raw = b'{"request_key": "bad\xff"}'
+        response = client.post("/backtests", content=raw, headers=_JSON)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_json"
+    finally:
+        queue.close()
+
+
+def test_bar_values_do_not_remain_after_success_failure_or_interrupt(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.sqlite"
+
+    def boom(_body: dict) -> dict:
+        raise RuntimeError("stop")
+
+    failed = JobQueue(path, runner=boom)
+    failed_client = _client(failed)
+    try:
+        created = _post_marked(failed_client, "fails")
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(failed_client, job_id)["status"] == "failed"
+        assert _MARKER.encode() not in _db_bytes(path)
+    finally:
+        failed.close()
+
+    stopped = JobQueue(tmp_path / "stopped.sqlite")
+    stopped.close()
+    stopped_path = tmp_path / "stopped.sqlite"
+    with sqlite3.connect(stopped_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, user_id, request_key, status, created_at, error_json, body_hash
+            )
+            VALUES ('stuck', ?, 'stuck', 'queued', 1, NULL, NULL)
+            """,
+            (_LOCAL,),
+        )
+        conn.execute(
+            "INSERT INTO job_bodies (job_id, body_json) VALUES ('stuck', ?)",
+            (json.dumps({"volume": _MARKER}),),
+        )
+    reopened = JobQueue(stopped_path)
+    try:
+        assert reopened.get(_LOCAL, "stuck").status == "failed"
+        assert _MARKER.encode() not in _db_bytes(stopped_path)
+    finally:
+        reopened.close()
+
+    done = JobQueue(tmp_path / "done.sqlite")
+    done_client = _client(done)
+    try:
+        created = _post_marked(done_client, "ok")
+        job_id = created.json()["job_id"]
+        assert _wait(done_client, job_id)["status"] == "succeeded"
+        results = done_client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 200
+        assert Decimal(results.json()["fills"][0]["price"]) == Decimal("100")
+        assert _MARKER.encode() not in _db_bytes(tmp_path / "done.sqlite")
+        assert b"31337.25" not in _db_bytes(tmp_path / "done.sqlite")
+    finally:
+        done.close()
+
+
+def test_the_rate_window_excludes_a_job_created_exactly_60_seconds_ago(tmp_path: Path) -> None:
+    now = {"t": 1_700_000_000.0}
+    queue = JobQueue(
+        tmp_path / "jobs.sqlite",
+        max_concurrent=4,
+        per_minute=1,
+        clock=lambda: now["t"],
+    )
+    client = _client(queue)
+    try:
+        assert client.post("/backtests", json=_payload("one")).status_code == 202
+        now["t"] += 59
+        blocked = client.post("/backtests", json=_payload("two"))
+        assert blocked.status_code == 429
+        assert blocked.json()["error"]["code"] == "rate_limit"
+        now["t"] += 1
+        allowed = client.post("/backtests", json=_payload("three"))
+        assert allowed.status_code == 202
+    finally:
+        queue.close()
+
+
+def test_a_queued_job_counts_toward_the_concurrency_limit(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite", max_concurrent=1, per_minute=10)
+    queue._executor.submit = lambda *_args, **_kwargs: None
+    client = _client(queue)
+    try:
+        first = client.post("/backtests", json=_payload("one"))
+        assert first.status_code == 202
+        job_id = first.json()["job_id"]
+        assert client.get(f"/backtests/{job_id}").json()["status"] == "queued"
+        second = client.post("/backtests", json=_payload("two"))
+        assert second.status_code == 429
+        assert second.json()["error"]["code"] == "concurrency_limit"
+    finally:
+        queue.close()
+
+
+def test_sixty_four_threads_with_one_key_create_one_job(tmp_path: Path) -> None:
+    queue = JobQueue(
+        tmp_path / "jobs.sqlite",
+        max_concurrent=64,
+        per_minute=100,
+        runner=lambda _body: {"ok": True},
+    )
+    errors: list[BaseException] = []
+    created: list[bool] = []
+    ids: list[str] = []
+    barrier = threading.Barrier(64)
+
+    def once() -> None:
+        try:
+            barrier.wait(5)
+            job = queue.start(user_id=_LOCAL, request_key="race", body={"n": 1})
+        except Exception as exc:
+            errors.append(exc)
+            return
+        ids.append(job.job_id)
+        created.append(job.created)
+
+    threads = [threading.Thread(target=once) for _ in range(64)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert errors == []
+        assert sum(created) == 1
+        assert len(set(ids)) == 1
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+        assert count == (1,)
+    finally:
+        queue.close()
+
+
+def test_a_request_key_of_200_characters_is_accepted_and_201_is_not(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: {"ok": True})
+    client = _client(queue)
+    try:
+        accepted = client.post("/backtests", json=_payload("k" * 200))
+        assert accepted.status_code == 202
+        rejected = client.post("/backtests", json=_payload("k" * 201))
+        assert rejected.status_code == 422
+        assert rejected.json()["error"]["code"] == "invalid_request_key"
+    finally:
+        queue.close()
+
+
+def test_a_surrogate_in_the_request_key_is_422(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    raw = '{"request_key":"bad\\ud800","ir":{"strategy":{"name":"x"}},"bars":{}}'
+    try:
+        response = client.post("/backtests", content=_raw(raw), headers=_JSON)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "invalid_string"
+        assert response.json()["error"]["path"] == "$.request_key"
+    finally:
+        queue.close()
+
+
+def test_a_low_surrogate_and_a_surrogate_key_are_422(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    low = '{"request_key":"low","ir":{"strategy":{"name":"bad\\udc00"}},"bars":{}}'
+    key = '{"request_key":"key","ir":{"\\ud800":1},"bars":{}}'
+    try:
+        for raw in (low, key):
+            response = client.post("/backtests", content=_raw(raw), headers=_JSON)
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "invalid_string"
+    finally:
+        queue.close()
+
+
+def test_exactly_200_000_slots_are_accepted(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: {"ok": True})
+    client = _client(queue)
+    span = (MAX_GRID_BARS - 1) * 60
+    over = MAX_GRID_BARS * 60
+    try:
+        accepted = client.post(
+            "/backtests",
+            json=_payload("cap", bars=[_row(0, 1), _row(span, 1)]),
+        )
+        assert accepted.status_code == 202
+        rejected = client.post(
+            "/backtests",
+            json=_payload("over", bars=[_row(0, 1), _row(over, 1)]),
+        )
+        assert rejected.status_code == 422
+        assert rejected.json()["error"]["code"] == "grid_too_large"
+    finally:
+        queue.close()
+
+
+def test_a_second_process_cannot_open_the_same_database(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(path, max_concurrent=2, per_minute=10)
+    queue._executor.submit = lambda *_args, **_kwargs: None
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("live"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        with pytest.raises(QueueBusy):
+            JobQueue(path)
+        status = client.get(f"/backtests/{job_id}")
+        assert status.json()["status"] == "queued"
+    finally:
+        queue.close()
+
+
+def test_a_held_write_lock_is_503(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(path, busy_timeout_ms=50)
+    client = _client(queue)
+    other = sqlite3.connect(path)
+    try:
+        other.execute("BEGIN EXCLUSIVE")
+        response = client.post("/backtests", json=_payload("locked"))
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "busy"
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+        queue.close()
+
+
+class _ExecuteProxy:
+    """Stand-in for the queue connection. Result inserts can be forced to fail."""
+
+    def __init__(self, conn: sqlite3.Connection, fail_until: int) -> None:
+        self._conn = conn
+        self._fail_until = fail_until
+        self.inserts = 0
+
+    def execute(self, sql: str, *args, **kwargs):
+        if isinstance(sql, str) and "INSERT INTO job_results" in sql:
+            self.inserts += 1
+            if self.inserts <= self._fail_until:
+                raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def test_a_result_write_that_keeps_failing_does_not_leave_the_job_running(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(path, max_concurrent=1, per_minute=10, runner=lambda _body: {"ok": True})
+    queue._conn = _ExecuteProxy(queue._conn, fail_until=10)
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("write"))
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "failed"
+        follow = client.post("/backtests", json=_payload("next"))
+        assert follow.status_code == 202
+    finally:
+        queue.close()
+
+
+def test_a_result_write_retries_a_held_lock(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: {"ok": True})
+    proxy = _ExecuteProxy(queue._conn, fail_until=2)
+    queue._conn = proxy
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("retry"))
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        assert proxy.inserts >= 3
+    finally:
+        queue.close()
 
 
 def test_parse_strategy_rejects_a_lone_surrogate_with_a_position() -> None:

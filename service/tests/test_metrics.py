@@ -1922,7 +1922,7 @@ def test_a_caller_context_cannot_put_nan_in_a_ratio() -> None:
     _no_nan(trapped_payoff)
 
 
-def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
+def test_metrics_on_a_random_walk_stay_within_three_seconds() -> None:
     """A seeded cent walk. Seven repeated values hid the old exact-sum cost."""
     rng = random.Random(17)
     price = Decimal("10000.00")
@@ -1944,20 +1944,16 @@ def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
         quality=_quality(20_000),
     )
     elapsed = time.perf_counter() - started
-    # Headroom for a slow CI runner. The bound is the wall clock, not a comparison.
-    assert elapsed < 15
+    # Headroom for a slow CI runner. Head is under a second. Three seconds still
+    # fails a Fraction running sum, which spends the walk in gcd.
+    assert elapsed < 3
     assert metrics.bar_count == 20_000
     assert metrics.sharpe is not None
     assert metrics.sharpe.is_finite()
 
 
-def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
-    """20k bars: one asset adds every bar and trims on four of every ten.
-
-    The other asset round-trips. The budget is absolute. It is not a
-    comparison of two clocks. A 50% trim halves the basis, so this guard
-    does not see a partial sale whose fraction does not terminate.
-    """
+def _pyramid(count: int) -> tuple[dict, dict[str, list]]:
+    """One asset adds every bar and trims on four of every ten. The other round-trips."""
     document = _strategy(
         costs={"commission_bps": 0, "slippage_bps": 0},
         assets=[
@@ -2035,20 +2031,49 @@ def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
     )
     sol = []
     jup = []
-    for index in range(20_000):
+    for index in range(count):
         # Adds every bar. The close is above 105 on four of every ten bars,
         # and the position stays open for the whole run.
         sol_close = 100 + (index % 10)
         sol.append(_bar(60 * index, sol_close))
         jup_close = 110 if index % 2 == 0 else 90
         jup.append(_bar(60 * index, jup_close, mint="SyntheticMint222222222222222222222222222"))
+    return document, {"sol": sol, "jup": jup}
+
+
+def test_a_long_pyramid_and_many_trades_stay_within_eight_seconds() -> None:
+    """20k bars. Eight seconds still fails a full-grid rescan of each trade.
+
+    The slot counter is the clock-free twin: a bisect probes a few stamps per
+    trade, and a walk of the whole grid touches one slot per bar per call.
+    """
+    import app.backtest.engine as backtest_engine
+
+    document, bars = _pyramid(20_000)
+    backtest_engine.between_slots = 0
     started = time.perf_counter()
-    result = run_backtest(document, {"sol": sol, "jup": jup})
+    result = run_backtest(document, bars)
     elapsed = time.perf_counter() - started
-    # Headroom for a slow CI runner. The bound is the wall clock, not a comparison.
-    assert elapsed < 45
+    assert elapsed < 8
+    # 20k bars, about 10k trades, two searches, ~15 probes each: under 2e6.
+    # A full-grid rescan touches hundreds of millions of slots.
+    assert 0 < backtest_engine.between_slots < 20_000 * 100
     assert len(result.trades) > 500
     assert sum(fill.side == "buy" and fill.asset_id == "sol" for fill in result.fills) > 300
+
+
+def test_a_pyramid_from_5k_to_20k_bars_takes_under_eight_times_as_long() -> None:
+    """Linear work grows about four times. A quadratic rescan grows about sixteen."""
+    document, bars = _pyramid(5_000)
+    started = time.perf_counter()
+    run_backtest(document, bars)
+    short = time.perf_counter() - started
+    document, bars = _pyramid(20_000)
+    started = time.perf_counter()
+    run_backtest(document, bars)
+    long = time.perf_counter() - started
+    assert short > 0
+    assert long / short < 8
 
 
 def _dca_trim(count: int, *, close_out: bool = False) -> tuple[dict, list[Bar]]:
@@ -2144,19 +2169,18 @@ def test_a_partial_sale_keeps_basis_on_a_fixed_grid() -> None:
     assert reported == result.final_equity - result.metrics.initial_equity
 
 
-def test_repeated_one_third_trims_stay_within_four_seconds() -> None:
+def test_repeated_one_third_trims_stay_within_eight_seconds() -> None:
     """Buy 1% every bar and trim 33.3% every seventh bar, for 20k bars.
 
     A 50% trim only halves the basis. This fraction does not terminate, and
-    an exact split is already many seconds at this length. The budget is
-    absolute.
+    an exact split is already many seconds at this length. Eight seconds
+    still fails that exact split. The 1e-30 pin below is the clock-free twin.
     """
     document, bars = _dca_trim(20_000)
     started = time.perf_counter()
     result = run_backtest(document, {"sol": bars})
     elapsed = time.perf_counter() - started
-    # Headroom for a slow CI runner. The bound is the wall clock, not a comparison.
-    assert elapsed < 60
+    assert elapsed < 8
     sells = [fill for fill in result.fills if fill.side == "sell"]
     assert len(sells) > 2_000
     assert result.final_positions

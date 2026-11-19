@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
+from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.ir.validate import REPO_ROOT, format_issues, load_schema, validate_ir
 
 EXAMPLES = REPO_ROOT / "schemas" / "examples"
@@ -154,6 +155,45 @@ def test_a_document_deeper_than_the_json_limit_is_positioned() -> None:
     assert issues[0].keyword == "expr_too_deep"
     assert issues[0].path.startswith("$")
     assert ".arg" in issues[0].path
+
+
+def _nested(depth: int) -> object:
+    node: object = "leaf"
+    for _ in range(depth):
+        node = {"n": node}
+    return node
+
+
+def test_json_depth_of_exactly_96_is_accepted() -> None:
+    """Depth 96 is the limit. ``>=`` would reject it. 97 is too deep."""
+    check_json_value(_nested(96))
+    with pytest.raises(JsonShapeError) as caught:
+        check_json_value(_nested(97))
+    assert caught.value.code == "expr_too_deep"
+
+
+def test_a_non_finite_float_is_rejected() -> None:
+    with pytest.raises(JsonShapeError) as nan:
+        check_json_value({"ir": float("nan")})
+    assert nan.value.code == "non_finite_number"
+    assert nan.value.path == "$.ir"
+    with pytest.raises(JsonShapeError) as infinite:
+        check_json_value([float("inf")])
+    assert infinite.value.code == "non_finite_number"
+    with pytest.raises(JsonShapeError):
+        check_json_value({"edge": float("-inf")})
+
+
+def test_a_low_surrogate_and_a_surrogate_key_are_rejected() -> None:
+    low = json.loads('"\\udc00"')
+    assert lone_surrogate_at(low) == 0
+    with pytest.raises(JsonShapeError) as caught:
+        check_json_value({"name": low})
+    assert caught.value.code == "invalid_string"
+    payload = json.loads('{"\\ud800": 1}')
+    with pytest.raises(JsonShapeError) as keyed:
+        check_json_value(payload)
+    assert keyed.value.code == "invalid_string"
 
 
 def test_a_lone_surrogate_is_positioned() -> None:

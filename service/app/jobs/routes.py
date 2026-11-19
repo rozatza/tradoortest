@@ -10,6 +10,8 @@ return 4xx. None of these routes is a 500 for those failures.
 from __future__ import annotations
 
 import json
+import math
+import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -26,7 +28,7 @@ from app.expr.errors import ExprError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.ir.validate import validate_ir
-from app.jobs.queue import JobQueue, JobRecord, LimitReached
+from app.jobs.queue import JobQueue, JobRecord, KeyReused, LimitReached, QueueBusy
 
 router = APIRouter()
 
@@ -54,18 +56,26 @@ def _queue(request: Request) -> JobQueue:
     return jobs
 
 
+def _busy() -> JSONResponse:
+    return error_response(503, "busy", "the job database is busy", None)
+
+
 @router.post("/backtests")
 async def start_backtest(request: Request, user: CurrentUserDep) -> JSONResponse:
     try:
         return await _start(request, user.user_id)
     except RecursionError:
         return error_response(422, "expr_too_deep", "expression nested too deeply", None)
+    except QueueBusy:
+        return _busy()
 
 
 @router.get("/backtests/{job_id}")
 def backtest_status(job_id: str, request: Request, user: CurrentUserDep) -> JSONResponse:
     try:
         job = _queue(request).get(user.user_id, job_id)
+    except QueueBusy:
+        return _busy()
     except KeyError:
         return error_response(404, "not_found", "backtest job was not found", None)
     return JSONResponse(status_code=200, content=_job_body(job))
@@ -73,7 +83,10 @@ def backtest_status(job_id: str, request: Request, user: CurrentUserDep) -> JSON
 
 @router.get("/backtests/{job_id}/results")
 def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSONResponse:
-    queue = _queue(request)
+    try:
+        queue = _queue(request)
+    except QueueBusy:
+        return _busy()
     try:
         job = queue.get(user.user_id, job_id)
     except KeyError:
@@ -95,10 +108,11 @@ def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSO
 
 async def _start(request: Request, user_id: str) -> JSONResponse:
     try:
-        payload = json.loads(await request.body() or b"null")
+        raw = await request.body() or b"null"
+        payload = json.loads(raw, parse_float=_parse_float, parse_constant=_reject_non_finite)
     except RecursionError:
         return error_response(422, "expr_too_deep", "expression nested too deeply", None)
-    except json.JSONDecodeError:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return error_response(422, "invalid_json", "request body is not JSON", None)
     if not isinstance(payload, dict):
         return error_response(422, "invalid_json", "request body must be a JSON object", None)
@@ -131,11 +145,27 @@ async def _start(request: Request, user_id: str) -> JSONResponse:
         return error_response(422, exc.code or "invalid_strategy", exc.message, exc.path)
     except TypeError:
         return error_response(422, "invalid_request", "request could not be read", None)
-    queue = _queue(request)
+    except ValueError:
+        return error_response(422, "invalid_json", "request body is not JSON", None)
+    try:
+        queue = _queue(request)
+    except QueueBusy:
+        return _busy()
     try:
         job = queue.start(user_id=user_id, request_key=key, body=body)
     except LimitReached as exc:
         return error_response(429, exc.code, exc.message, None)
+    except KeyReused:
+        return error_response(
+            409,
+            "request_key_reused",
+            "request_key was already used with a different body",
+            "$.request_key",
+        )
+    except sqlite3.OperationalError:
+        return _busy()
+    except ValueError:
+        return error_response(422, "invalid_json", "request body is not JSON", None)
     status = 202 if job.created else 200
     return JSONResponse(status_code=status, content=_job_body(job))
 
@@ -209,6 +239,19 @@ def _prepare(payload: Mapping[str, Any]) -> dict[str, Any]:
         "bars": bars,
         "long_no_trade_minutes": minutes,
     }
+
+
+def _parse_float(text: str) -> float:
+    """Reject a magnitude JSON would turn into infinity, such as ``1e400``."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("non-finite number")
+    return number
+
+
+def _reject_non_finite(_text: str) -> float:
+    """``NaN`` and ``Infinity`` are not JSON numbers for this API."""
+    raise ValueError("non-finite number")
 
 
 def _job_body(job: JobRecord) -> dict[str, Any]:

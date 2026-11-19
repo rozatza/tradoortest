@@ -10,6 +10,7 @@ otherwise pass the schema and then crash ``ir_hash`` with
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -22,8 +23,8 @@ MAX_JSON_DEPTH = 96
 class JsonShapeError(ValueError):
     """The document is too deep, or a string is not Unicode text.
 
-    ``code`` is ``expr_too_deep`` or ``invalid_string``. ``path`` is a
-    JSONPath to the value that failed.
+    ``code`` is ``expr_too_deep``, ``invalid_string``, or ``non_finite_number``.
+    ``path`` is a JSONPath to the value that failed.
     """
 
     def __init__(self, message: str, *, code: str, path: str) -> None:
@@ -34,7 +35,11 @@ class JsonShapeError(ValueError):
 
 
 def check_json_value(value: Any, *, limit: int = MAX_JSON_DEPTH) -> None:
-    """Reject a too-deep tree or a lone surrogate. The walk does not recurse."""
+    """Reject a too-deep tree, a non-finite float, or a lone surrogate.
+
+    The walk does not recurse. A bool is an int, not a float, so it is not
+    treated as a number here.
+    """
     stack: list[tuple[Any, str, int]] = [(value, "$", 0)]
     while stack:
         node, path, depth = stack.pop()
@@ -44,6 +49,14 @@ def check_json_value(value: Any, *, limit: int = MAX_JSON_DEPTH) -> None:
                 code="expr_too_deep",
                 path=path,
             )
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise JsonShapeError(
+                    "number is not finite",
+                    code="non_finite_number",
+                    path=path,
+                )
+            continue
         if isinstance(node, str):
             _reject_lone_surrogate(node, path)
             continue

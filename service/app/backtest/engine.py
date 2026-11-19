@@ -26,7 +26,6 @@ the fill price.
 from __future__ import annotations
 
 import math
-from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import (
@@ -1408,8 +1407,47 @@ def _flag_prefix(flags: Sequence[bool]) -> list[int]:
     return prefix
 
 
+# Slots ``_between`` examines. A bisect probes a few stamps per call. A walk
+# of the whole grid would add one per slot per call. Tests bound this.
+between_slots = 0
+
+
+def _probe() -> None:
+    global between_slots
+    between_slots += 1
+
+
+def _lower_bound(grid: Sequence[int], target: int) -> int:
+    lo = 0
+    hi = len(grid)
+    while lo < hi:
+        _probe()
+        mid = (lo + hi) // 2
+        if grid[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _upper_bound(grid: Sequence[int], target: int) -> int:
+    lo = 0
+    hi = len(grid)
+    while lo < hi:
+        _probe()
+        mid = (lo + hi) // 2
+        if grid[mid] <= target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 def _between(prefix: Sequence[int], grid: Sequence[int], start: int, end: int) -> int:
-    """How many flagged slots have an open time in ``start..end``, inclusive."""
-    lo = bisect_left(grid, start)
-    hi = bisect_right(grid, end)
+    """How many flagged slots have an open time in ``start..end``, inclusive.
+
+    The span is two binary searches. The prefix then answers in one subtraction.
+    """
+    lo = _lower_bound(grid, start)
+    hi = _upper_bound(grid, end)
     return prefix[hi] - prefix[lo]
