@@ -6,7 +6,7 @@ The hand-calc fixture is synthetic. Nothing here calls the network.
 from __future__ import annotations
 
 import json
-from decimal import Decimal, localcontext
+from decimal import ROUND_DOWN, Decimal, getcontext, localcontext
 from pathlib import Path
 
 import pytest
@@ -915,3 +915,172 @@ def test_sizing_edges_and_a_zero_percent_message() -> None:
     assert paid.fills[0].notional == Decimal("5000.25")
     assert paid.fills[0].commission == Decimal("4999.75")
     assert paid.final_cash == Decimal("0.00")
+
+
+def test_cents_round_half_even_on_a_tie() -> None:
+    # 50 * 1.0001 = 50.005. Half-even keeps 50.00. Half-up would be 50.01.
+    document = _strategy(
+        capital={"initial": 100, "currency": "USDC"},
+        signals=[
+            {"id": "go", "expr": _gt("close", 1.5)},
+            {
+                "id": "stop",
+                "expr": {
+                    "op": "lt",
+                    "left": {"op": "ref", "name": "close"},
+                    "right": {"op": "lit", "value": 1.5},
+                },
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 2.0), _bar(60, 1.0001)]})
+    assert result.fills[0].notional == Decimal("100.00")
+    assert result.fills[1].notional == Decimal("50.00")
+    assert result.final_cash == Decimal("50.00")
+
+
+def test_a_hole_is_marked_at_the_prior_close() -> None:
+    document = _strategy(costs={"commission_bps": 0, "slippage_bps": 0})
+    result = run_backtest(document, {"sol": [_bar(0, 100), _bar(120, 200)]})
+    hole = next(point for point in result.equity_curve if point.open_time == _START + 60)
+    later = next(point for point in result.equity_curve if point.open_time == _START + 120)
+    assert hole.equity == Decimal("10000.00")
+    assert later.equity == Decimal("20000.00")
+
+
+def test_a_pyramid_sizes_from_equity_not_cash() -> None:
+    enter = {
+        "id": "enter_sol",
+        "type": "enter",
+        "side": "long",
+        "asset": "sol",
+        "order": {"type": "market"},
+        "sizing": {"mode": "percent_equity", "percent": 50},
+        "risk": _risk(),
+    }
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        actions=[
+            enter,
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 100), _bar(60, 50)]})
+    assert [fill.notional for fill in result.fills] == [Decimal("5000.00"), Decimal("3750.00")]
+
+
+def test_decimal_context_stays_local() -> None:
+    payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    bars = [
+        Bar(
+            _MINT,
+            "1m",
+            _START + item["offset"],
+            item["open"],
+            item["high"],
+            item["low"],
+            item["close"],
+            item["volume"],
+            False,
+        )
+        for item in payload["bars"]
+    ]
+    document = _strategy(
+        engine={
+            "bar_size": "1m",
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 1,
+        },
+        costs={"commission_bps": 10, "slippage_bps": 5},
+        signals=[
+            {"id": "go", "expr": _gt("close", 50)},
+            {"id": "stop", "expr": _gt("close", 120)},
+        ],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(),
+            },
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    ctx = getcontext()
+    saved = (ctx.prec, ctx.rounding)
+    ctx.prec = 6
+    ctx.rounding = ROUND_DOWN
+    try:
+        result = run_backtest(document, {"sol": bars})
+        assert result.final_equity == _FINAL_EQUITY
+        assert getcontext().prec == 6
+        assert getcontext().rounding == ROUND_DOWN
+    finally:
+        ctx.prec, ctx.rounding = saved
+
+
+def test_a_series_defined_on_exactly_half_the_bars_is_not_linted() -> None:
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "sma_3",
+                "kind": "indicator",
+                "indicator": "sma",
+                "source": "close",
+                "params": {"period": 3},
+            }
+        ]
+    )
+    result = run_backtest(document, {"sol": [_bar(offset, 1.0) for offset in range(0, 240, 60)]})
+    assert result.lints == ()
+
+
+def test_an_indicator_warning_is_a_result_lint() -> None:
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "stoch_k",
+                "kind": "indicator",
+                "indicator": "stochastic",
+                "source": "close",
+                "output": "k",
+                "params": {"k_period": 1, "d_period": 1},
+            }
+        ]
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 1.0), _bar(60, 1.0)]})
+    assert any("highest high equals the lowest low" in note for note in result.lints)

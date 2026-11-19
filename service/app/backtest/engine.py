@@ -18,6 +18,7 @@ as NaN. A later bar cannot change an earlier fill.
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
@@ -26,6 +27,7 @@ from typing import Any
 from app.backtest.errors import BacktestError
 from app.backtest.eval import EvalContext, EvalMemory, evaluate
 from app.indicators import atr, bollinger, ema, macd, rsi, sma, stochastic
+from app.indicators.errors import IndicatorLint
 from app.ir.validate import format_issues, validate_ir
 from app.ohlcv.bars import MAX_ABS_VALUE, Bar
 
@@ -169,8 +171,11 @@ def _run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]]
         return BacktestResult((), (), (), initial, initial, ())
     grid = list(range(min(times), max(times) + step, step))
     _align(frames, grid)
-    _derive(document["derived_series"], frames)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", IndicatorLint)
+        _derive(document["derived_series"], frames)
     lints = _series_lints(document["derived_series"], frames, len(grid))
+    lints = lints + _indicator_lints(caught)
     return _walk(document, frames, grid, warmup, initial, lints)
 
 
@@ -303,6 +308,20 @@ def _series_lints(
                     f"derived series {series_id} on {asset_id} is defined on "
                     f"{defined} of {total} bars"
                 )
+    return tuple(notes)
+
+
+def _indicator_lints(caught: list[warnings.WarningMessage]) -> tuple[str, ...]:
+    """Indicator library warnings, once each, on the result a caller reads."""
+    notes: list[str] = []
+    seen: set[str] = set()
+    for item in caught:
+        if not issubclass(item.category, IndicatorLint):
+            continue
+        text = str(item.message).strip()
+        if text and text not in seen:
+            seen.add(text)
+            notes.append(text)
     return tuple(notes)
 
 

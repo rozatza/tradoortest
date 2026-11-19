@@ -163,6 +163,8 @@ class BarStore(Protocol):
         end: int,
         window_start: int,
         window_end: int,
+        provider_empty: bool = False,
+        seed: Bar | None = None,
     ) -> None: ...
 
 
@@ -331,11 +333,11 @@ class SqliteBarStore:
         start: int,
         end: int,
     ) -> list[tuple[int, int]]:
-        """Fetched spans that came back with no candles and no rejections.
+        """Fetched spans whose provider returned no candles at all.
 
-        The provider answered and the range is not fetched again inside the
-        TTL. It is a gap, not a no-trade run, and a prior close does not
-        cross it.
+        A quiet page that returned older candles is not in this list. The
+        range is not fetched again inside the TTL. It is a gap, not a
+        no-trade run, and a prior close does not cross it.
         """
         self._purge()
         _owner(user_id)
@@ -392,6 +394,8 @@ class SqliteBarStore:
         end: int,
         window_start: int,
         window_end: int,
+        provider_empty: bool = False,
+        seed: Bar | None = None,
     ) -> None:
         """Upsert one page and record its fetched span in a single transaction.
 
@@ -399,6 +403,12 @@ class SqliteBarStore:
         fetched spans in place. This page is absent from both. The span is
         stored on its own row with this write's clock, so merging it with an
         older span cannot extend that older span's TTL.
+
+        ``provider_empty`` is set only when the provider returned no candles
+        at all. Zero bars inside the requested range is not enough: ``seed``
+        is the latest older candle, the span starts at that candle, and the
+        quiet minutes are synthetic. An empty page stays a gap, and a prior
+        close does not cross it.
 
         For 1m, the same transaction rewrites flagged synthetic bars inside
         ``[window_start, window_end)``.
@@ -453,7 +463,24 @@ class SqliteBarStore:
                     """,
                     rejection_rows,
                 )
-            empty_page = 1 if not bars and not rejections else 0
+            span_start = start
+            if seed is not None:
+                if provider_empty:
+                    raise StoreError("an empty provider page cannot carry a prior close")
+                if seed.mint != mint or seed.timeframe != timeframe or seed.synthetic:
+                    raise StoreError("prior close does not match the fetched series")
+                if seed.open_time >= start:
+                    raise StoreError("prior close must sit before the fetched page")
+                span_start = seed.open_time
+                self._conn.execute(_UPSERT, _row(user_id, seed, stored_at))
+                self._conn.execute(
+                    """
+                    DELETE FROM rejections
+                    WHERE user_id = ? AND mint = ? AND timeframe = ? AND open_time = ?
+                    """,
+                    (user_id, mint, timeframe, seed.open_time),
+                )
+            empty_page = 1 if provider_empty else 0
             self._conn.execute(
                 """
                 INSERT INTO fetched (user_id, mint, timeframe, start, end, stored_at, empty)
@@ -462,7 +489,7 @@ class SqliteBarStore:
                     stored_at = excluded.stored_at,
                     empty = excluded.empty
                 """,
-                (user_id, mint, timeframe, start, end, stored_at, empty_page),
+                (user_id, mint, timeframe, span_start, end, stored_at, empty_page),
             )
             if timeframe == "1m":
                 self._rewrite_synthetics(user_id, mint, window_start, window_end)

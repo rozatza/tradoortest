@@ -65,9 +65,9 @@ A second run with the same IR and the same bars returns the same fills, skips, a
 
 `slippage_bps` of 10000 or more is refused. A sell would fill at 0. The schema still allows 10000; the engine does not.
 
-An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up.
+An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is copied onto `lints` as well.
 
-USDC amounts use a 50-digit decimal context and half-even cents. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error.
+USDC amounts use a local 50-digit decimal context and half-even cents. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
 
 ## No look-ahead
 

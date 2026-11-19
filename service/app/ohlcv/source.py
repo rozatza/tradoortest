@@ -33,12 +33,19 @@ class FetchPage:
     ``start`` and ``end`` are the half-open span this page actually covered.
     A minute inside that span with no candle was fetched and had no trade.
     It is not a hole to request again. The next page starts at ``end``.
+
+    ``provider_empty`` is true only when the provider returned no candles at
+    all. A page that returned older candles is not empty: ``seed`` is the
+    latest of those candles, and it is the prior close for the quiet range.
+    ``seed`` sits before ``start``. It is not one of ``bars``.
     """
 
     bars: list[Bar]
     rejected: list[BarRejection]
     start: int
     end: int
+    provider_empty: bool = False
+    seed: Bar | None = None
 
 
 class OhlcvSource(Protocol):

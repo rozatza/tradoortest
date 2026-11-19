@@ -9,15 +9,17 @@ again.
 1m minutes inside a fetched span with no candle become flagged synthetic
 flat bars once a real close exists in that span, at any length. A long quiet
 run stays synthetic and is flagged when it is longer than the threshold
-(default 120 minutes). It is not a gap. Minutes before the first close in
-the span are a leading gap, including when the provider's history starts
-inside the window or a short page does not reach the window start. An empty
-provider page is a gap, and a prior close does not cross it. The prior close
-is seeded from the fetched span even when that close sits before the current
-window, and it does not cross an unfetched hole. Higher timeframes are
-native GeckoTerminal aggregates. They are not built from 1m bars. A missing
-native bucket after history has started is a no-trade count, not a gap
-range. Rejected candles stay rejected and are not repaired.
+(default 120 minutes). It is not a gap. A page is empty only when the
+provider returned no candles at all. Older candles on a quiet page are the
+prior close, and the quiet range stays synthetic. Minutes before the first
+close in the span are a leading gap when history starts inside the window
+or a short page does not reach back past the window start. An empty page is
+a gap, and a prior close does not cross it. The prior close is seeded from
+the fetched span even when that close sits before the current window, and
+it does not cross an unfetched hole. Higher timeframes are native
+GeckoTerminal aggregates. They are not built from 1m bars. A missing native
+bucket after history has started in the merged span is a no-trade count,
+not a gap range. Rejected candles stay rejected and are not repaired.
 """
 
 from __future__ import annotations
@@ -187,6 +189,8 @@ def _fill_timeframe(
                 end=page.end,
                 window_start=start,
                 window_end=end,
+                provider_empty=page.provider_empty,
+                seed=_seed_bar(page, asset, timeframe),
             )
             page_number += 1
             _say(
@@ -205,6 +209,24 @@ def _fill_timeframe(
 def _say(progress: Callable[[str], None] | None, message: str) -> None:
     if progress is not None:
         progress(message)
+
+
+def _seed_bar(page: FetchPage, asset: Asset, timeframe: str) -> Bar | None:
+    """The latest older candle, when it is a real bar this series can store."""
+    if page.provider_empty:
+        return None
+    seed = page.seed
+    if seed is None:
+        return None
+    if seed.mint != asset.mint or seed.timeframe != timeframe or seed.synthetic:
+        return None
+    if isinstance(seed.open_time, bool) or not isinstance(seed.open_time, int):
+        return None
+    if seed.open_time >= page.start:
+        return None
+    if validate_bar(seed):
+        return None
+    return seed
 
 
 def _split_page(
@@ -406,7 +428,11 @@ def main(
         clock = int(time.time()) if now is None else now
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
-        store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+        try:
+            store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+        except OSError as exc:
+            print(_data_dir_line(data_dir, exc), file=sys.stderr)
+            return 1
         active = open_source(args.provider) if source is None else source
         report = run_backfill(
             source=active,
@@ -510,6 +536,16 @@ def _prepare_report_path(path: Path) -> None:
 
 def _progress(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def _data_dir_line(path: Path, exc: OSError) -> str:
+    """One clean line for a data directory that cannot hold the cache."""
+    if isinstance(exc, PermissionError):
+        return f"data directory {path} is not writable"
+    if isinstance(exc, (FileExistsError, NotADirectoryError)):
+        return f"data directory {path} is not a directory"
+    text = str(exc).strip().splitlines()
+    return text[0] if text else f"data directory {path} is not usable"
 
 
 def _one_line(exc: BaseException) -> str:

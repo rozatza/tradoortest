@@ -161,12 +161,14 @@ def series_report(
 ) -> SeriesReport:
     """Count the grid.
 
-    ``gaps`` are provider-missing points only: never fetched, an empty
-    provider page, or the leading range before the first real candle in a
-    span the provider did answer. A rejected minute is not a gap. A flagged
-    1m synthetic bar is not a gap, however long the quiet run is. A missing
-    native bucket at 5m or above, after history has started in that span, is
-    a no-trade bucket: it counts in ``no_trade`` and is not a gap range.
+    ``gaps`` are provider-missing points only: never fetched, a page on which
+    the provider returned no candles at all, or the leading range before the
+    first real candle in a merged populated span. Abutting pages are one
+    span, so a quiet bucket at the start of a later page is not a seam gap.
+    A rejected minute is not a gap. A flagged 1m synthetic bar is not a gap,
+    however long the quiet run is. A missing native bucket at 5m or above,
+    after history has started in that merged span, is a no-trade bucket: it
+    counts in ``no_trade`` and is not a gap range.
     ``unfetched`` counts only points no fetched span covers.
     ``coverage_pct`` is real bars divided by the expected grid, as a percent.
     Synthetic bars are present, so a quiet minute is not missing.
@@ -181,7 +183,9 @@ def series_report(
     step = TIMEFRAME_SECONDS[timeframe]
     _check_window(start, end, step)
     expected = (end - start) // step
-    populated = [(lo, hi) for lo, hi in fetched if not _covers_span((lo, hi), empty)]
+    populated = merged_spans(
+        [(lo, hi) for lo, hi in fetched if not _covers_span((lo, hi), empty)]
+    )
     first_real = _first_real_by_span(populated, real)
     unfetched_times: list[int] = []
     gap_times: list[int] = []
@@ -211,6 +215,7 @@ def series_report(
             rejected_times=rejected_times,
             fetched=fetched,
             empty=empty,
+            populated=populated,
             first_real=first_real,
         )
         if kind == "gap":
@@ -256,6 +261,7 @@ def _point_kind(
     rejected_times: set[int],
     fetched: Sequence[tuple[int, int]],
     empty: Sequence[tuple[int, int]],
+    populated: Sequence[tuple[int, int]],
     first_real: dict[tuple[int, int], int | None],
 ) -> str:
     """``real``, ``synthetic``, ``rejected``, ``gap``, or ``no_trade``."""
@@ -267,7 +273,7 @@ def _point_kind(
         return "rejected"
     if not _covers(cursor, fetched) or _covers(cursor, empty):
         return "gap"
-    span = _span_containing(cursor, fetched, empty)
+    span = _span_containing(cursor, populated)
     started = None if span is None else first_real.get(span)
     if started is None or cursor < started:
         return "gap"
@@ -289,12 +295,15 @@ def _covers_span(span: tuple[int, int], empty: Sequence[tuple[int, int]]) -> boo
 
 
 def _span_containing(
-    timestamp: int,
-    fetched: Sequence[tuple[int, int]],
-    empty: Sequence[tuple[int, int]],
+    timestamp: int, populated: Sequence[tuple[int, int]]
 ) -> tuple[int, int] | None:
-    for lo, hi in fetched:
-        if lo <= timestamp < hi and not _covers_span((lo, hi), empty):
+    """The merged populated span that contains ``timestamp``.
+
+    Pages that abut are already one span, so the first real candle is the
+    earliest in the whole run, not the first candle of the latest page.
+    """
+    for lo, hi in populated:
+        if lo <= timestamp < hi:
             return (lo, hi)
     return None
 

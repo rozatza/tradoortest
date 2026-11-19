@@ -8,7 +8,8 @@ counts as present. It is not a gap. The report flags runs over a threshold
 separately.
 
 The previous close may sit earlier in the same fetched span, including
-before the caller's current window. It does not cross an unfetched hole or
+before the caller's current window and including a close the provider
+returned from before that window. It does not cross an unfetched hole or
 an empty provider page. Slots before the first real bar in the span stay
 missing. A rejected minute stays rejected.
 """
