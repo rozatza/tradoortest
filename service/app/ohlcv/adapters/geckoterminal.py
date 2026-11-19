@@ -9,7 +9,9 @@ HTTP 429, HTTP 5xx, and timeouts retry with a bounded backoff. A connect
 or DNS failure is a ``SourceError`` and is not retried. The public API
 only serves about 180 days; a 401 is reported as that limit.
 
-1m is fetched natively. Higher timeframes are resampled from those 1m bars.
+Every timeframe is a native aggregate: minute 1/5/15, hour 1/4, and day.
+Higher timeframes are not built from 1m bars.
+
 A mint that is not in ``POOLS`` raises ``UnknownMint``. A later source can
 accept any mint through the same ``fetch_bars`` method.
 
@@ -27,16 +29,20 @@ from typing import Any
 
 import httpx
 
-from app.ohlcv.bars import (
-    TIMEFRAME_SECONDS,
-    Bar,
-    BarRejection,
-    validate_bar,
-)
+from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection
 from app.ohlcv.errors import SourceError, UnknownMint
 from app.ohlcv.registry import BONK_MINT, JTO_MINT, JUP_MINT, SOL_MINT, WIF_MINT
-from app.ohlcv.resample import resample
 from app.ohlcv.source import FetchPage, FetchResult
+
+# path segment, aggregate. GeckoTerminal native candles, not a 1m resample.
+_NATIVE: dict[str, tuple[str, int]] = {
+    "1m": ("minute", 1),
+    "5m": ("minute", 5),
+    "15m": ("minute", 15),
+    "1h": ("hour", 1),
+    "4h": ("hour", 4),
+    "1d": ("day", 1),
+}
 
 BASE_URL = "https://api.geckoterminal.com/api/v2"
 # Chosen 2026-11-19. Each pool was created more than 90 days earlier and
@@ -119,54 +125,28 @@ class GeckoTerminalSource:
         self.close()
 
     def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
-        if timeframe not in TIMEFRAME_SECONDS:
-            raise SourceError(f"timeframe {timeframe!r} is not supported")
-        if start < 0 or end < start:
-            raise SourceError("bar window is invalid")
-        minutes = self._collect_minutes(mint, start, end)
-        if timeframe == "1m":
-            return minutes
-        rejected = list(minutes.rejected)
-        good: list[Bar] = []
-        for bar in minutes.bars:
-            reasons = validate_bar(bar)
-            if reasons:
-                rejected.append(
-                    BarRejection(bar.mint, bar.timeframe, bar.open_time, tuple(reasons))
-                )
-            else:
-                good.append(bar)
-        step = TIMEFRAME_SECONDS[timeframe]
-        resampled = [
-            bar
-            for bar in resample(good, timeframe)
-            if start <= bar.open_time and bar.open_time + step <= end
-        ]
-        return FetchResult(resampled, rejected)
-
-    def fetch_pages(self, mint: str, timeframe: str, start: int, end: int) -> Iterator[FetchPage]:
-        """Yield one HTTP page at a time. The caller commits each page.
-
-        A later page that fails does not un-yield the pages already returned.
-        Coverage is the span this response answered, not only the minutes
-        that contained a trade.
-        """
-        if timeframe != "1m":
-            raise SourceError("fetch_pages is only defined for 1m")
-        if start < 0 or end < start:
-            raise SourceError("bar window is invalid")
-        yield from self._minute_pages(mint, start, end)
-
-    def _collect_minutes(self, mint: str, start: int, end: int) -> FetchResult:
         bars: list[Bar] = []
         rejected: list[BarRejection] = []
-        for page in self._minute_pages(mint, start, end):
+        for page in self.fetch_pages(mint, timeframe, start, end):
             bars.extend(page.bars)
             rejected.extend(page.rejected)
         bars.sort(key=lambda bar: bar.open_time)
         return FetchResult(bars, rejected)
 
-    def _minute_pages(self, mint: str, start: int, end: int) -> Iterator[FetchPage]:
+    def fetch_pages(self, mint: str, timeframe: str, start: int, end: int) -> Iterator[FetchPage]:
+        """Yield one HTTP page at a time. The caller commits each page.
+
+        A later page that fails does not un-yield the pages already returned.
+        Coverage is the span this response answered, not only the candles
+        that contained a trade.
+        """
+        if timeframe not in _NATIVE:
+            raise SourceError(f"timeframe {timeframe!r} is not supported")
+        if start < 0 or end < start:
+            raise SourceError("bar window is invalid")
+        yield from self._pages(mint, timeframe, start, end)
+
+    def _pages(self, mint: str, timeframe: str, start: int, end: int) -> Iterator[FetchPage]:
         pool = self._pools.get(mint)
         if pool is None:
             raise UnknownMint(
@@ -175,19 +155,21 @@ class GeckoTerminalSource:
             )
         if start == end:
             return
+        path, aggregate = _NATIVE[timeframe]
+        step = TIMEFRAME_SECONDS[timeframe]
         before = end - 1
         page_hi = end
         span = end - start
-        page_budget = max(2, math.ceil(span / 60 / self._page_limit) + 3)
+        page_budget = max(2, math.ceil(span / step / self._page_limit) + 3)
         pages = 0
         while pages < page_budget:
-            payload = self._get_json(pool, mint, before)
+            payload = self._get_json(pool, mint, before, path, aggregate)
             candles = _ohlcv_list(payload)
             pages += 1
             if not candles:
                 yield FetchPage([], [], start, page_hi)
                 return
-            parsed = _parse_page(candles, mint)
+            parsed = _parse_page(candles, mint, timeframe)
             if parsed.oldest is None:
                 raise SourceError("GeckoTerminal page has no candle timestamps")
             finished = parsed.oldest <= start or len(candles) < self._page_limit
@@ -202,15 +184,17 @@ class GeckoTerminalSource:
             page_hi = parsed.oldest
         raise SourceError("GeckoTerminal pagination stopped before the window was covered")
 
-    def _get_json(self, pool: str, mint: str, before: int) -> dict[str, Any]:
+    def _get_json(
+        self, pool: str, mint: str, before: int, path: str, aggregate: int
+    ) -> dict[str, Any]:
         params = {
-            "aggregate": "1",
+            "aggregate": str(aggregate),
             "limit": str(self._page_limit),
             "currency": "usd",
             "token": mint,
             "before_timestamp": str(before),
         }
-        url = f"{BASE_URL}/networks/solana/pools/{pool}/ohlcv/minute"
+        url = f"{BASE_URL}/networks/solana/pools/{pool}/ohlcv/{path}"
         backoff = max(self._pace.interval, 1.0)
         last_status = 0
         for attempt in range(_ATTEMPTS):
@@ -265,13 +249,13 @@ class _ParsedPage:
     oldest: int | None
 
 
-def _parse_page(candles: list[Any], mint: str) -> _ParsedPage:
+def _parse_page(candles: list[Any], mint: str, timeframe: str) -> _ParsedPage:
     bars: dict[int, Bar] = {}
     rejected: list[BarRejection] = []
     conflicts: set[int] = set()
     oldest: int | None = None
     for index, candle in enumerate(candles):
-        bar, rejection, stamp = _parse_candle(candle, mint, index)
+        bar, rejection, stamp = _parse_candle(candle, mint, index, timeframe)
         if stamp is not None:
             oldest = stamp if oldest is None else min(oldest, stamp)
         if rejection is not None:
@@ -301,7 +285,7 @@ def _page_in_range(parsed: _ParsedPage, start: int, end: int) -> FetchPage:
             rejected.append(
                 BarRejection(
                     bar.mint,
-                    "1m",
+                    bar.timeframe,
                     open_time,
                     ("conflicting candles for the same open_time",),
                 )
@@ -325,10 +309,13 @@ def _parse_candle(
     candle: object,
     mint: str,
     index: int,
+    timeframe: str = "1m",
 ) -> tuple[Bar | None, BarRejection | None, int | None]:
     """Parse one candle. Extra elements and any sibling metadata are ignored."""
     if not isinstance(candle, list) or len(candle) < 6:
-        rejection = BarRejection(mint, "1m", None, (f"candle {index} does not have 6 values",))
+        rejection = BarRejection(
+            mint, timeframe, None, (f"candle {index} does not have 6 values",)
+        )
         return None, rejection, None
     stamp, stamp_ok = _integer_second(candle[0])
     numbers, bad = _numbers(candle[1:6])
@@ -337,13 +324,13 @@ def _parse_candle(
         if not stamp_ok:
             reasons.append(f"candle {index} open_time is not an integer second")
         reasons.extend(f"candle {index} {name} is not a number" for name in bad)
-        return None, BarRejection(mint, "1m", stamp if stamp_ok else None, tuple(reasons)), (
+        return None, BarRejection(mint, timeframe, stamp if stamp_ok else None, tuple(reasons)), (
             stamp if stamp_ok else None
         )
     assert stamp is not None
     bar = Bar(
         mint=mint,
-        timeframe="1m",
+        timeframe=timeframe,
         open_time=stamp,
         open=numbers["open"],
         high=numbers["high"],

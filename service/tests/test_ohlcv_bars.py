@@ -98,5 +98,13 @@ def test_alignment_timeframe_and_mint() -> None:
     assert validate_bar(_bar(mint="")) == ["mint is empty"]
 
 
+def test_a_synthetic_bar_must_be_flat_with_zero_volume() -> None:
+    flat = _bar(open=4.0, high=4.0, low=4.0, close=4.0, volume=0.0, synthetic=True)
+    assert validate_bar(flat) == []
+    traded = _bar(synthetic=True)
+    assert "synthetic bar must be flat" in validate_bar(traded)
+    assert "synthetic bar must have volume 0" in validate_bar(traded)
+
+
 def test_a_flat_bar_is_valid_market_data() -> None:
     assert validate_bar(_bar(open=4.0, high=4.0, low=4.0, close=4.0, volume=0.0)) == []

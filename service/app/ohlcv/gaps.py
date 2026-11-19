@@ -27,13 +27,13 @@ class SeriesReport:
     start: int
     end: int
     expected: int
+    real: int
+    synthetic: int
     present: int
     missing: int
+    coverage_pct: float
     unfetched: int
-    no_trade: int
     gaps: tuple[GapRange, ...]
-    unfetched_gaps: tuple[GapRange, ...]
-    no_trade_gaps: tuple[GapRange, ...]
     rejected: tuple[BarRejection, ...]
 
 
@@ -63,15 +63,10 @@ def gap_ranges(present: set[int], start: int, end: int, step: int) -> tuple[GapR
     )
 
 
-def unfetched_spans(
+def covered_spans(
     covered: Sequence[tuple[int, int]], start: int, end: int
 ) -> list[tuple[int, int]]:
-    """Half-open holes inside ``[start, end)`` that no fetched range covers.
-
-    ``covered`` ranges may overlap or abut. They are clipped to the window
-    and merged. A minute inside a covered range is not a hole, even when no
-    candle was stored for it.
-    """
+    """Clip ``covered`` to ``[start, end)`` and merge overlaps and abutments."""
     if end < start:
         raise ValueError("gap window is not aligned to the timeframe")
     merged: list[list[int]] = []
@@ -84,9 +79,20 @@ def unfetched_spans(
             merged[-1][1] = max(merged[-1][1], hi)
         else:
             merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+def unfetched_spans(
+    covered: Sequence[tuple[int, int]], start: int, end: int
+) -> list[tuple[int, int]]:
+    """Half-open holes inside ``[start, end)`` that no fetched range covers.
+
+    A minute inside a covered range is not a hole, even when no real candle
+    was stored for it.
+    """
     holes: list[tuple[int, int]] = []
     cursor = start
-    for lo, hi in merged:
+    for lo, hi in covered_spans(covered, start, end):
         if cursor < lo:
             holes.append((cursor, lo))
         cursor = hi
@@ -102,45 +108,36 @@ def series_report(
     timeframe: str,
     start: int,
     end: int,
-    present: set[int],
+    real: set[int],
+    synthetic: set[int],
     rejected: tuple[BarRejection, ...] = (),
-    fetched: Sequence[tuple[int, int]] | None = None,
+    fetched: Sequence[tuple[int, int]] = (),
 ) -> SeriesReport:
-    """Count the grid. ``present`` is the set of stored open times.
+    """Count the grid.
 
-    ``fetched`` is the set of half-open spans the provider has already
-    answered for this series. Pass it for 1m. A minute inside one of those
-    spans with no candle and no rejection is ``no_trade``. A minute outside
-    them is ``unfetched``. Omit ``fetched`` for a resampled timeframe: its
-    ``gaps`` are incomplete buckets, and the unfetched / no-trade split is
-    left at zero.
+    ``gaps`` are only the grid points the provider has not answered. A minute
+    inside a fetched span is not a gap, whether it holds a real bar, a
+    flagged synthetic bar, a rejection, or nothing (no prior close yet).
+    ``coverage_pct`` is real bars divided by the expected grid, as a percent.
     """
     step = TIMEFRAME_SECONDS[timeframe]
     _check_window(start, end, step)
-    gaps = gap_ranges(present, start, end, step)
     expected = (end - start) // step
-    missing = sum(gap.missing for gap in gaps)
-    if fetched is None:
-        unfetched_gaps: tuple[GapRange, ...] = ()
-        no_trade_gaps: tuple[GapRange, ...] = ()
-        unfetched = 0
-        no_trade = 0
-    else:
-        rejected_times = _rejected_times(rejected, start, end, step)
-        unfetched_times: list[int] = []
-        no_trade_times: list[int] = []
-        cursor = start
-        while cursor < end:
-            if cursor not in present and cursor not in rejected_times:
-                if _covers(cursor, fetched):
-                    no_trade_times.append(cursor)
-                else:
-                    unfetched_times.append(cursor)
-            cursor += step
-        unfetched_gaps = _ranges_from_times(unfetched_times, step)
-        no_trade_gaps = _ranges_from_times(no_trade_times, step)
-        unfetched = sum(gap.missing for gap in unfetched_gaps)
-        no_trade = sum(gap.missing for gap in no_trade_gaps)
+    unfetched_times: list[int] = []
+    real_count = 0
+    synthetic_count = 0
+    cursor = start
+    while cursor < end:
+        if cursor in real:
+            real_count += 1
+        elif cursor in synthetic:
+            synthetic_count += 1
+        if not _covers(cursor, fetched):
+            unfetched_times.append(cursor)
+        cursor += step
+    gaps = _ranges_from_times(unfetched_times, step)
+    present = real_count + synthetic_count
+    coverage = 0.0 if expected == 0 else round(100.0 * real_count / expected, 2)
     return SeriesReport(
         symbol=symbol,
         mint=mint,
@@ -148,28 +145,15 @@ def series_report(
         start=start,
         end=end,
         expected=expected,
-        present=expected - missing,
-        missing=missing,
-        unfetched=unfetched,
-        no_trade=no_trade,
+        real=real_count,
+        synthetic=synthetic_count,
+        present=present,
+        missing=expected - present,
+        coverage_pct=coverage,
+        unfetched=sum(gap.missing for gap in gaps),
         gaps=gaps,
-        unfetched_gaps=unfetched_gaps,
-        no_trade_gaps=no_trade_gaps,
         rejected=rejected,
     )
-
-
-def _rejected_times(
-    rejected: Sequence[BarRejection], start: int, end: int, step: int
-) -> set[int]:
-    times: set[int] = set()
-    for item in rejected:
-        stamp = item.open_time
-        if isinstance(stamp, bool) or not isinstance(stamp, int):
-            continue
-        if start <= stamp < end and stamp % step == 0:
-            times.add(stamp)
-    return times
 
 
 def _covers(timestamp: int, covered: Sequence[tuple[int, int]]) -> bool:

@@ -35,7 +35,8 @@ def test_committed_fixture_is_synthetic_and_has_no_secrets() -> None:
         assert forbidden not in text
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert "meta" not in payload
-    assert set(payload) == {"data"}
+    assert payload["synthetic"] is True
+    assert set(payload) == {"synthetic", "data"}
 
 
 def test_fixture_page_parses_without_keeping_extra_fields() -> None:
@@ -128,36 +129,41 @@ def test_unknown_mint_is_refused_without_a_request() -> None:
         source.fetch_bars("not-a-configured-mint", "1m", 0, 60)
 
 
-def test_higher_timeframe_is_resampled_and_a_bad_minute_is_not_repaired() -> None:
+def test_higher_timeframe_is_a_native_aggregate_and_is_not_repaired() -> None:
     start = 1_700_000_100
-    good = [[start + offset, 1.0, 2.0, 0.5, 1.5, 1.0] for offset in (0, 60, 120, 180, 240)]
+    seen: list[tuple[str, str]] = []
 
-    def handler(_request: httpx.Request) -> httpx.Response:
-        body = {"data": {"attributes": {"ohlcv_list": list(reversed(good))}}}
-        return httpx.Response(200, json=body)
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.url.params["aggregate"]))
+        assert "include_empty_intervals" not in request.url.params
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"ohlcv_list": [[start, 1.0, 2.0, 0.5, 1.5, 5.0]]}}},
+        )
 
     source = GeckoTerminalSource(_client(handler), min_interval=0, sleep=lambda _seconds: None)
     result = source.fetch_bars(SOL_MINT, "5m", start, start + 300)
-    assert len(result.bars) == 1
+    assert seen[0][1] == "5"
+    assert seen[0][0].endswith("/ohlcv/minute")
     assert result.bars[0].timeframe == "5m"
     assert result.bars[0].open_time == start
     assert result.bars[0].volume == 5.0
+    assert result.bars[0].synthetic is False
 
-    broken = [row[:] for row in good]
-    broken[2] = [start + 120, 1.0, 1.0, 0.5, 4.0, 1.0]
-
-    def broken_handler(_request: httpx.Request) -> httpx.Response:
+    def broken_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["aggregate"] == "5"
+        assert request.url.path.endswith("/ohlcv/minute")
         return httpx.Response(
-            200, json={"data": {"attributes": {"ohlcv_list": list(reversed(broken))}}}
+            200,
+            json={"data": {"attributes": {"ohlcv_list": [[start, 1.0, 1.0, 0.5, 4.0, 1.0]]}}},
         )
 
-    broken_source = GeckoTerminalSource(
+    broken = GeckoTerminalSource(
         _client(broken_handler), min_interval=0, sleep=lambda _seconds: None
     )
-    failed = broken_source.fetch_bars(SOL_MINT, "5m", start, start + 300)
-    assert failed.bars == []
-    assert failed.rejected
-    assert "high is below max(open, close)" in failed.rejected[0].reasons
+    parsed = broken.fetch_bars(SOL_MINT, "5m", start, start + 300)
+    assert parsed.bars[0].high == 1.0
+    assert parsed.bars[0].close == 4.0
 
 
 def test_unparseable_candle_is_flagged() -> None:

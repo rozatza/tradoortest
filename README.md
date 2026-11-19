@@ -9,7 +9,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | `web/` | Next.js placeholder page. No product features. |
 | `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), and historical OHLCV ingest (`app/ohlcv`). |
 | `docs/ohlcv.md` | Provider, cost, timeframes, bar checks, and the backfill command. |
-| `data/` | Local bar store. Gitignored. Not created until a backfill runs. |
+| `data/` | Local OHLCV cache. Gitignored. Expires within 24 hours. Not created until a backfill runs. |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
 | `docs/dsl-spec.md` | Strategy DSL, IR contract, semantic error codes, and the canonical hash. |
 | `docs/save-format.md` | Versioned save envelope (`ir_version`, `format_version`, `ir_hash`). |
@@ -39,7 +39,7 @@ Run the API locally, after `make install`:
 
 `GET /health` returns `{"status": "ok"}`. The web placeholder is `npm run dev --prefix web`.
 
-Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. No API key is required. Details, rate limits, and the gap report are in `docs/ohlcv.md`.
+Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Details, rate limits, and the gap report are in `docs/ohlcv.md`.
 
 ```bash
 .venv/bin/python -m app.ohlcv.backfill --days 90

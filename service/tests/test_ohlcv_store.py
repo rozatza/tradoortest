@@ -73,3 +73,130 @@ def test_bar_directory_is_gitignored() -> None:
     root = Path(__file__).resolve().parents[2]
     ignore = (root / ".gitignore").read_text(encoding="utf-8")
     assert "\ndata/\n" in f"\n{ignore}\n"
+
+
+def test_ttl_above_24_hours_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="24 hours"):
+        SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=24 * 3600 + 1)
+    with pytest.raises(ValueError, match="whole number"):
+        SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=True)  # type: ignore[arg-type]
+
+
+def test_rows_and_fetched_ranges_expire_and_reopen_purges(tmp_path: Path) -> None:
+    clock = {"now": 1_800_000_000}
+    path = tmp_path / "ohlcv.sqlite"
+    store = SqliteBarStore(path, ttl_seconds=3600, now=lambda: clock["now"])
+    try:
+        store.commit_page(
+            [_bar()],
+            [],
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=_T,
+            end=_T + 60,
+            window_start=_T,
+            window_end=_T + 60,
+        )
+        clock["now"] += 3599
+        assert len(
+            store.load(user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 60)
+        ) == 1
+        assert store.fetched_ranges(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 60
+        ) == [(_T, _T + 60)]
+        clock["now"] += 1
+        assert (
+            store.load(user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 60)
+            == []
+        )
+        assert (
+            store.fetched_ranges(
+                user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 60
+            )
+            == []
+        )
+    finally:
+        store.close()
+    reopened = SqliteBarStore(path, ttl_seconds=3600, now=lambda: clock["now"])
+    try:
+        assert (
+            reopened.load(user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 60)
+            == []
+        )
+    finally:
+        reopened.close()
+
+
+def test_a_write_purges_rows_that_have_reached_the_ttl(tmp_path: Path) -> None:
+    clock = {"now": 1_800_000_000}
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=60, now=lambda: clock["now"])
+    try:
+        store.upsert([_bar()], user_id=LOCAL_USER_ID)
+        clock["now"] += 60
+        store.upsert([_bar(open_time=_T + 60)], user_id=LOCAL_USER_ID)
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 120
+        )
+        assert [bar.open_time for bar in stored] == [_T + 60]
+    finally:
+        store.close()
+
+
+def test_an_older_page_expires_without_extending_its_ttl(tmp_path: Path) -> None:
+    clock = {"now": 1_800_000_000}
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=100, now=lambda: clock["now"])
+    try:
+        store.commit_page(
+            [_bar()],
+            [],
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=_T,
+            end=_T + 60,
+            window_start=_T,
+            window_end=_T + 120,
+        )
+        clock["now"] += 50
+        store.commit_page(
+            [_bar(open_time=_T + 60)],
+            [],
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=_T + 60,
+            end=_T + 120,
+            window_start=_T,
+            window_end=_T + 120,
+        )
+        clock["now"] += 50
+        assert store.fetched_ranges(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 120
+        ) == [(_T + 60, _T + 120)]
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_T, end=_T + 120
+        )
+        assert [bar.open_time for bar in stored] == [_T + 60]
+    finally:
+        store.close()
+
+
+def test_a_fetched_page_cannot_contain_a_synthetic_bar(tmp_path: Path) -> None:
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    synthetic = Bar(_MINT, "1m", _T, 11.0, 11.0, 11.0, 11.0, 0.0, True)
+    try:
+        with pytest.raises(StoreError, match="synthetic"):
+            store.commit_page(
+                [synthetic],
+                [],
+                user_id=LOCAL_USER_ID,
+                mint=_MINT,
+                timeframe="1m",
+                start=_T,
+                end=_T + 60,
+                window_start=_T,
+                window_end=_T + 60,
+            )
+    finally:
+        store.close()

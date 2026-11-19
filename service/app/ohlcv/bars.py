@@ -1,7 +1,9 @@
 """One OHLCV bar and the checks every ingested bar has to pass.
 
 A failing bar is reported and dropped. No field is rewritten to make the
-bar pass, and no missing minute is invented.
+bar pass. A 1m minute the provider answered with no candle can be stored
+later as a flagged synthetic flat bar. That path is explicit. A bad candle
+is never turned into one.
 """
 
 from __future__ import annotations
@@ -9,7 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-# 1m is native. Higher timeframes are resampled from 1m on UTC epoch buckets.
+# Every timeframe is a native GeckoTerminal aggregate. See docs/ohlcv.md.
 TIMEFRAME_SECONDS: dict[str, int] = {
     "1m": 60,
     "5m": 300,
@@ -39,6 +41,7 @@ class Bar:
     low: float
     close: float
     volume: float
+    synthetic: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,8 @@ def validate_bar(bar: Bar) -> list[str]:
     - open, high, low, close, and volume are finite and ``<= 1e15``.
     - each price is ``> 0``. Volume may be ``0``.
     - ``high >= max(open, close) >= min(open, close) >= low``.
+    - a synthetic bar is flat, volume 0, and ``synthetic`` is true. A real
+      bar keeps ``synthetic`` false, including a real bar whose volume is 0.
     """
     reasons: list[str] = []
     if not isinstance(bar.mint, str) or bar.mint == "":
@@ -100,4 +105,11 @@ def validate_bar(bar: Bar) -> list[str]:
             reasons.append("high is below max(open, close)")
         if finite["low"] > body_low:
             reasons.append("low is above min(open, close)")
+    if not isinstance(bar.synthetic, bool):
+        reasons.append("synthetic flag is not a boolean")
+    elif bar.synthetic and all(name in finite for name in _FIELDS):
+        if any(finite[name] != finite["open"] for name in _PRICES):
+            reasons.append("synthetic bar must be flat")
+        if finite["volume"] != 0.0:
+            reasons.append("synthetic bar must have volume 0")
     return reasons

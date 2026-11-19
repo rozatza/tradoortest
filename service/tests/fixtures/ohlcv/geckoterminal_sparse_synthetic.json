@@ -1,0 +1,27 @@
+{
+  "synthetic": true,
+  "note": "Synthetic fixture shaped like a thin JUP or WIF pool. Not a live GeckoTerminal response.",
+  "minute_aggregate_1": {
+    "data": {
+      "id": "synthetic-sparse",
+      "type": "ohlcv_request_response",
+      "attributes": {
+        "ohlcv_list": [
+          [1700000280, 2.0, 2.2, 1.8, 2.0, 3.0],
+          [1700000160, 1.2, 1.4, 1.0, 1.2, 2.0]
+        ]
+      }
+    }
+  },
+  "minute_aggregate_5": {
+    "data": {
+      "id": "synthetic-sparse-5m",
+      "type": "ohlcv_request_response",
+      "attributes": {
+        "ohlcv_list": [
+          [1700000100, 1.2, 2.2, 1.0, 2.0, 5.0]
+        ]
+      }
+    }
+  }
+}

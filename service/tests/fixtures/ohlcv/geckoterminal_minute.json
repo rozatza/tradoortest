@@ -1,4 +1,5 @@
 {
+  "synthetic": true,
   "data": {
     "id": "synthetic-minute",
     "type": "ohlcv_request_response",

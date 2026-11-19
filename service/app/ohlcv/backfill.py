@@ -1,15 +1,16 @@
-"""Resumable backfill of 1m bars, then higher timeframes resampled locally.
+"""Resumable fetch of native OHLCV candles into a TTL cache.
 
 Each successful page is committed before the next one is requested. The
-store records the half-open span that page covered. A later run requests
-only spans that were never fetched, as a few contiguous calls. A minute
-inside a fetched span with no candle had no trades. It is not requested
-again. Rejected bars stay rejected and are not repaired.
+store records the half-open span that page covered, with the same TTL as
+the rows. A later run, while the cache is fresh, requests only spans that
+were never fetched. After the TTL, those spans are gone and are fetched
+again.
 
-Higher timeframes are rebuilt from the stored 1m bars for the window, so
-they do not add HTTP calls. A bucket that is short a minute is omitted.
-``replace_window`` drops a previously stored higher-timeframe candle that
-the current 1m set no longer supports. That resample rule is unchanged.
+1m minutes inside a fetched span with no candle become flagged synthetic
+flat bars once a real close exists in that span. Minutes before that close
+stay missing. Higher timeframes are native GeckoTerminal aggregates. They
+are not built from 1m bars. Rejected candles stay rejected and are not
+repaired.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,11 +32,11 @@ from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, StoreError
 from app.ohlcv.gaps import GapRange, SeriesReport, series_report, unfetched_spans
 from app.ohlcv.registry import MAJORS, Asset, require_assets
-from app.ohlcv.resample import resample
 from app.ohlcv.source import FetchPage, OhlcvSource, iter_pages
-from app.ohlcv.store import BarStore, SqliteBarStore
+from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, BarStore, SqliteBarStore
 
 _DEFAULT_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+_TIMEFRAME_ORDER = _DEFAULT_TIMEFRAMES
 
 
 def plan_window(now: int, days: int, timeframes: Sequence[str]) -> tuple[int, int]:
@@ -74,82 +75,50 @@ def run_backfill(
     timeframes: Sequence[str],
     user_id: str,
     generated_at: int,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    """Fetch missing 1m bars, resample, and return the gap report document."""
+    """Fetch uncached native candles and return the gap report document."""
     ordered = _timeframes(timeframes)
     sections: list[SeriesReport] = []
     for asset in assets:
-        rejected = _fill_minutes(
-            source=source,
-            store=store,
-            asset=asset,
-            start=start,
-            end=end,
-            user_id=user_id,
-        )
-        present = store.open_times(
-            user_id=user_id,
-            mint=asset.mint,
-            timeframe="1m",
-            start=start,
-            end=end,
-        )
-        fetched = store.fetched_ranges(
-            user_id=user_id,
-            mint=asset.mint,
-            timeframe="1m",
-            start=start,
-            end=end,
-        )
-        sections.append(
-            series_report(
-                symbol=asset.symbol,
-                mint=asset.mint,
-                timeframe="1m",
+        for timeframe in ordered:
+            rejected = _fill_timeframe(
+                source=source,
+                store=store,
+                asset=asset,
+                timeframe=timeframe,
                 start=start,
                 end=end,
-                present=present,
-                rejected=tuple(rejected),
-                fetched=fetched,
+                user_id=user_id,
+                progress=progress,
             )
-        )
-        if any(timeframe != "1m" for timeframe in ordered):
-            minutes = store.load(
+            stored = store.load(
                 user_id=user_id,
                 mint=asset.mint,
-                timeframe="1m",
+                timeframe=timeframe,
                 start=start,
                 end=end,
             )
-            for timeframe in ordered:
-                if timeframe == "1m":
-                    continue
-                derived = resample(minutes, timeframe)
-                store.replace_window(
-                    derived,
-                    user_id=user_id,
+            fetched = store.fetched_ranges(
+                user_id=user_id,
+                mint=asset.mint,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+            )
+            sections.append(
+                series_report(
+                    symbol=asset.symbol,
                     mint=asset.mint,
                     timeframe=timeframe,
                     start=start,
                     end=end,
+                    real={bar.open_time for bar in stored if not bar.synthetic},
+                    synthetic={bar.open_time for bar in stored if bar.synthetic},
+                    rejected=tuple(rejected),
+                    fetched=fetched,
                 )
-                stored = store.open_times(
-                    user_id=user_id,
-                    mint=asset.mint,
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                )
-                sections.append(
-                    series_report(
-                        symbol=asset.symbol,
-                        mint=asset.mint,
-                        timeframe=timeframe,
-                        start=start,
-                        end=end,
-                        present=stored,
-                    )
-                )
+            )
     return _document(
         user_id=user_id,
         provider=source.name,
@@ -158,19 +127,21 @@ def run_backfill(
     )
 
 
-def _fill_minutes(
+def _fill_timeframe(
     *,
     source: OhlcvSource,
     store: BarStore,
     asset: Asset,
+    timeframe: str,
     start: int,
     end: int,
     user_id: str,
+    progress: Callable[[str], None] | None,
 ) -> list[BarRejection]:
     rejected = store.rejections(
         user_id=user_id,
         mint=asset.mint,
-        timeframe="1m",
+        timeframe=timeframe,
         start=start,
         end=end,
     )
@@ -178,21 +149,31 @@ def _fill_minutes(
     covered = store.fetched_ranges(
         user_id=user_id,
         mint=asset.mint,
-        timeframe="1m",
+        timeframe=timeframe,
         start=start,
         end=end,
     )
     for lo, hi in unfetched_spans(covered, start, end):
-        for page in iter_pages(source, asset.mint, "1m", lo, hi):
-            good, page_rejected = _split_page(page, asset, lo, hi)
+        _say(progress, f"ohlcv: {asset.symbol} {timeframe} fetching {_iso(lo)} .. {_iso(hi)}")
+        page_number = 0
+        for page in iter_pages(source, asset.mint, timeframe, lo, hi):
+            good, page_rejected = _split_page(page, asset, timeframe, lo, hi)
             store.commit_page(
                 good,
                 page_rejected,
                 user_id=user_id,
                 mint=asset.mint,
-                timeframe="1m",
+                timeframe=timeframe,
                 start=page.start,
                 end=page.end,
+                window_start=start,
+                window_end=end,
+            )
+            page_number += 1
+            _say(
+                progress,
+                f"ohlcv: {asset.symbol} {timeframe} committed page {page_number} "
+                f"through {_iso(page.end)}",
             )
             for item in page_rejected:
                 key = (item.open_time, item.reasons)
@@ -202,9 +183,15 @@ def _fill_minutes(
     return rejected
 
 
+def _say(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
 def _split_page(
     page: FetchPage,
     asset: Asset,
+    timeframe: str,
     request_start: int,
     request_end: int,
 ) -> tuple[list[Bar], list[BarRejection]]:
@@ -215,11 +202,11 @@ def _split_page(
     rejected = list(page.rejected)
     good: list[Bar] = []
     for bar in page.bars:
-        if bar.mint != asset.mint or bar.timeframe != "1m":
+        if bar.mint != asset.mint or bar.timeframe != timeframe:
             rejected.append(
                 BarRejection(
                     asset.mint,
-                    "1m",
+                    timeframe,
                     bar.open_time,
                     ("candle does not match the requested mint and timeframe",),
                 )
@@ -236,13 +223,14 @@ def _split_page(
 
 
 def _timeframes(timeframes: Sequence[str]) -> tuple[str, ...]:
-    """1m is always stored. Higher timeframes are reported after it."""
+    """Requested timeframes in coarse-grid order. Each one is fetched natively."""
     if not timeframes:
         raise ValueError("at least one timeframe is required")
     unknown = [item for item in timeframes if item not in TIMEFRAME_SECONDS]
     if unknown:
         raise ValueError(f"unsupported timeframe {unknown[0]!r}")
-    return tuple(["1m", *[item for item in timeframes if item != "1m"]])
+    requested = set(timeframes)
+    return tuple(item for item in _TIMEFRAME_ORDER if item in requested)
 
 
 def _document(
@@ -256,7 +244,9 @@ def _document(
         "user_id": user_id,
         "provider": provider,
         "generated_at": _iso(generated_at),
+        "attribution": "Data by GeckoTerminal / CoinGecko",
         "forward_filled": False,
+        "synthetic_no_trade": True,
         "series": [_section(section) for section in sections],
     }
 
@@ -269,13 +259,13 @@ def _section(section: SeriesReport) -> dict[str, object]:
         "start": _iso(section.start),
         "end": _iso(section.end),
         "expected": section.expected,
+        "real": section.real,
+        "synthetic": section.synthetic,
         "present": section.present,
         "missing": section.missing,
+        "coverage_pct": section.coverage_pct,
         "unfetched": section.unfetched,
-        "no_trade": section.no_trade,
         "gaps": [_gap(gap) for gap in section.gaps],
-        "unfetched_gaps": [_gap(gap) for gap in section.unfetched_gaps],
-        "no_trade_gaps": [_gap(gap) for gap in section.no_trade_gaps],
         "rejected": [
             {
                 "open_time": None if item.open_time is None else _iso(item.open_time),
@@ -297,7 +287,7 @@ def _iso(timestamp: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.ohlcv.backfill",
-        description="Backfill 1m OHLCV for SOL and majors, then resample locally.",
+        description="Fetch native OHLCV for SOL and majors into a 24-hour cache.",
     )
     parser.add_argument("--days", type=int, default=90, help="how many days to cover (default 90)")
     parser.add_argument(
@@ -308,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeframes",
         default=",".join(_DEFAULT_TIMEFRAMES),
-        help="comma-separated timeframes (1m is always stored; higher bars are resampled)",
+        help="comma-separated native timeframes (1m, 5m, 15m, 1h, 4h, 1d)",
     )
     parser.add_argument(
         "--data-dir",
@@ -319,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--report",
         default=None,
         help="also write the gap report JSON to this path (keep it under data/)",
+    )
+    parser.add_argument(
+        "--cache-ttl-hours",
+        type=float,
+        default=None,
+        help="how long cached bars are kept, in hours (maximum 24)",
     )
     parser.add_argument("--provider", default="geckoterminal", help="OHLCV source name")
     return parser
@@ -341,6 +337,11 @@ def main(
     if args.days > PUBLIC_HISTORY_DAYS:
         print(PUBLIC_HISTORY_MESSAGE, file=sys.stderr)
         return 1
+    try:
+        ttl_seconds = _ttl_seconds(args.cache_ttl_hours)
+    except ValueError as exc:
+        print(_one_line(exc), file=sys.stderr)
+        return 1
     store: SqliteBarStore | None = None
     active: OhlcvSource | None = None
     owns_source = source is None
@@ -350,7 +351,7 @@ def main(
         clock = int(time.time()) if now is None else now
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
-        store = SqliteBarStore(data_dir / "ohlcv.sqlite")
+        store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
         active = open_source(args.provider) if source is None else source
         report = run_backfill(
             source=active,
@@ -359,9 +360,10 @@ def main(
             start=start,
             end=end,
             timeframes=timeframes,
-            user_id=LOCAL_USER_ID,
-            generated_at=clock,
-        )
+                user_id=LOCAL_USER_ID,
+                generated_at=clock,
+                progress=_progress,
+            )
         text = json.dumps(report, indent=2) + "\n"
         if args.report is not None:
             destination = Path(args.report)
@@ -379,6 +381,38 @@ def main(
             if close is not None:
                 close()
     return 0
+
+
+def _ttl_seconds(hours: float | None) -> int:
+    """Resolve the cache TTL. Above 24 hours is an error, not a silent clamp."""
+    if hours is None:
+        raw = os.environ.get("OHLCV_CACHE_TTL_HOURS")
+        if raw is None or raw.strip() == "":
+            return MAX_CACHE_TTL_SECONDS
+        try:
+            hours = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "OHLCV_CACHE_TTL_HOURS must be a number of hours, at most 24"
+            ) from exc
+    if hours <= 0 or hours > 24:
+        raise ValueError(
+            "cache TTL must be greater than 0 and at most 24 hours; "
+            "the CoinGecko API terms do not allow a longer store"
+        )
+    seconds = int(hours * 3600)
+    if seconds < 1:
+        seconds = 1
+    if seconds > MAX_CACHE_TTL_SECONDS:
+        raise ValueError(
+            "cache TTL must be greater than 0 and at most 24 hours; "
+            "the CoinGecko API terms do not allow a longer store"
+        )
+    return seconds
+
+
+def _progress(message: str) -> None:
+    print(message, file=sys.stderr)
 
 
 def _one_line(exc: BaseException) -> str:
