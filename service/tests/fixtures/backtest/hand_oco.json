@@ -10,7 +10,7 @@
   "stop_loss_bar": {"offset": 60, "open": 100, "high": 100, "low": 90, "close": 96, "volume": 1},
   "both_bar": {"offset": 60, "open": 100, "high": 130, "low": 80, "close": 105, "volume": 1},
   "gap_bar": {"offset": 60, "open": 80, "high": 80, "low": 70, "close": 80, "volume": 1},
-  "deferred_bar": {"offset": 120, "open": 92, "high": 92, "low": 92, "close": 92, "volume": 1},
+  "after_synthetic_bar": {"offset": 120, "open": 92, "high": 92, "low": 92, "close": 92, "volume": 1},
   "expected": {
     "buy_price": "100.05",
     "buy_notional": "9990.01",
@@ -27,9 +27,9 @@
     "gap_notional": "7984.02",
     "gap_commission": "7.98",
     "gap_cash": "7976.04",
-    "deferred_fill": "91.954",
-    "deferred_notional": "9181.62",
-    "deferred_commission": "9.18",
-    "deferred_cash": "9172.44"
+    "after_synthetic_fill": "91.954",
+    "after_synthetic_notional": "9181.62",
+    "after_synthetic_commission": "9.18",
+    "after_synthetic_cash": "9172.44"
   }
 }

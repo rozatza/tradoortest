@@ -65,9 +65,9 @@ A second run with the same IR and the same bars returns the same fills, skips, a
 
 `slippage_bps` of 10000 or more is refused. A sell would fill at 0. The schema still allows 10000; the engine does not.
 
-An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is moved onto `lints`. The warning is not also emitted to the caller. The text names the series and the asset, for example `stoch_k on sol: ...`. A tighten-only rejection is moved onto `lints` the same way.
+An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. Exactly half the slots is not a lint. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up. An indicator warning, such as a flat stochastic range, is moved onto `lints`. The warning is not also emitted to the caller. The text names the series and the asset, for example `stoch_k on sol: ...`. A tighten-only rejection is moved onto `lints` the same way. The lint is the `move_oco` message plus the asset and the bar open time, in unix seconds: `tighten_only rejected a looser stop_loss on sol at bar 1767225600`.
 
-USDC amounts use a local 50-digit decimal context and half-even cents. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
+USDC amounts use a local 50-digit decimal context and half-even cents. Quantity and open cost are kept as exact rationals. A cent is half-even of that rational, not of a quantity that was already rounded to 50 significant digits. Rounding the quantity first lands just off an exact half-cent, and the next multiply keeps the wrong cent: `43175 / 78.834 * 1.655514` is `906.675`, which half-even takes to `906.68`, while the 50-digit quantity produces `906.67`. `5049.495` rounds to `5049.50` and `5049.485` rounds to `5049.48`. The caller's decimal context is unchanged after the run. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error. A hole in the equity curve is marked at the prior close, not at the next bar. A pyramid sizes from marked equity, then caps the spend at cash.
 
 ## No look-ahead
 
@@ -99,6 +99,8 @@ Every enter carries one OCO pair (`evaluation: on_entry_fill`, `movement: tighte
 - take-profit = `F * (1 + take_profit.percent / 100)`
 - stop-loss = `F * (1 - stop_loss.percent / 100)`
 
+A percent smaller than the 50-digit unit of `F` does not move the level. `1e-300` on a fill of 100 leaves both the stop and the target on the entry. The engine rejects that pair with `BacktestError` (`take_profit and stop_loss percents are too small to move the price off the entry`) and does not attach it.
+
 The pair is attached after that fill. It is not checked against the entry bar. A wick through either level on the fill bar does not exit. The next bar is the first one that can. `Fill.leg` is `market` for a rule, and `take_profit` or `stop_loss` for a leg. One fill cancels the other leg.
 
 On a later real bar, only that bar's low and high are read:
@@ -111,7 +113,7 @@ The path inside the bar is unknown, so the stop wins. That is the intrabar rule 
 
 Prices before sell slippage:
 
-- a take-profit fills at the limit, including when the bar opens above the limit
+- a take-profit fills at the limit, including when the bar opens above the limit. If that raw limit is strictly below the bar's low, `Fill.limit_below_low` is true and the metrics count it. The fill price is still the limit. `docs/metrics.md` has the flag.
 - a stop-loss fills at the stop when the bar opens above the stop
 - a stop-loss fills at the open when the bar opens at or below the stop
 
@@ -121,7 +123,7 @@ OCO runs before the bar's rules. A stop-out closes the long, and a signal exit o
 
 A synthetic bar is not a fill, and it is not a touch. It does not arm a leg. A missing bar has no high or low, so it is not a touch either. The next real bar uses the live rules: the stop fills when that bar's low is at or below the stop, at the stop or at the open when the bar gaps through, and the take-profit fills at the limit. If that bar touches both, the stop wins. Inserting a no-trade minute does not change the fill. If the run ends on the synthetic bar, the long stays open.
 
-A pyramid does not move the anchor. The anchor stays the first entry fill. If the added enter names percents that leave both levels where they are, or move the stop up, or move the target down, the levels update. `move_oco` is that check. A lower stop or a higher target rejects the whole change. Neither price moves. The added quantity still fills. The rejection is a lint, and the same text is what `move_oco` raises. OCO is settled before the bar's rules, so a tighten or a rejected loosen on this bar is first read on the next bar. The entry bar is the exception: the pair is attached during that bar's rules, and the next bar is still the first check.
+A pyramid does not move the anchor. The anchor stays the first entry fill, including when the added fill is below that anchor and the two enters name different percents. If the added enter names percents that leave both levels where they are, or move the stop up, or move the target down, the levels update. `move_oco` is that check. A lower stop or a higher target rejects the whole change, even when the other leg would have tightened. Neither price moves. The added quantity still fills. The rejection is a lint. The text is what `move_oco` raises, then ` on {asset_id} at bar {open_time}` with the bar open time in unix seconds. A NaN or an infinity raises `BacktestError` (`OCO level is not a finite price`), not `decimal.InvalidOperation`. OCO is settled before the bar's rules, so a tighten or a rejected loosen on this bar is first read on the next bar. The entry bar is the exception: the pair is attached during that bar's rules, and the next bar is still the first check.
 
 The hand-computed pair is synthetic and lives in `service/tests/fixtures/backtest/hand_oco.json`. It is not a market print. Capital 10000. Commission 10 bps. Slippage 5 bps. Enter 100% on the first bar, close 100. Take-profit 10%, stop-loss 5%. The first bar's high is 200 and its low is 1. Those wicks are not read.
 
@@ -150,4 +152,4 @@ Sell fill = 92 × 9995 / 10000 = 91.954. Notional = 9181.62. Commission = 9.18. 
 
 ## What this does not do
 
-It does not compute a drawdown report or write a result file. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
+The ratios, the drawdown, and the trade log are `docs/metrics.md`. The engine does not write a result file and it does not draw a chart. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
