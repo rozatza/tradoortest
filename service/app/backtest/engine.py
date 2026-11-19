@@ -25,6 +25,7 @@ the fill price.
 
 from __future__ import annotations
 
+import contextvars
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -306,6 +307,8 @@ def run_backtest(
         raise BacktestError("long_no_trade_minutes must be a whole number of minutes")
     if long_no_trade_minutes < 1:
         raise BacktestError("long_no_trade_minutes must be at least 1")
+    _between_slots.set(0)
+    _basis_denominator.set(1)
     try:
         # A fresh context, not a copy of the caller's. Copying kept the
         # caller's traps and Emin: Inexact then aborted the run, and Emin -5
@@ -1175,9 +1178,12 @@ def _sold_basis(basis: Fraction, qty: Decimal, previous: Decimal) -> Fraction:
     pnl identity stays exact and the denominator stays bounded.
     """
     if qty == previous:
+        _note_basis_denominator(basis.denominator)
         return basis
     share = basis * Fraction(qty) / Fraction(previous)
-    return Fraction(round(share * _BASIS_QUANTUM), _BASIS_QUANTUM)
+    sold = Fraction(round(share * _BASIS_QUANTUM), _BASIS_QUANTUM)
+    _note_basis_denominator(sold.denominator)
+    return sold
 
 
 def _note_sell(
@@ -1409,12 +1415,34 @@ def _flag_prefix(flags: Sequence[bool]) -> list[int]:
 
 # Slots ``_between`` examines. A bisect probes a few stamps per call. A walk
 # of the whole grid would add one per slot per call. Tests bound this.
-between_slots = 0
+# One context per run, so two threads do not add their probes together.
+_between_slots: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "tradoortest_between_slots", default=0
+)
+# Largest basis denominator this run wrote. Exact ``basis * qty / previous``
+# grows without a bound. The 1e-30 grid stays at ``10**30``.
+_basis_denominator: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "tradoortest_basis_denominator", default=1
+)
+
+
+def between_slots() -> int:
+    """Probes ``_between`` made by the run on this thread."""
+    return _between_slots.get()
+
+
+def basis_denominator() -> int:
+    """Largest basis denominator written by the run on this thread."""
+    return _basis_denominator.get()
 
 
 def _probe() -> None:
-    global between_slots
-    between_slots += 1
+    _between_slots.set(_between_slots.get() + 1)
+
+
+def _note_basis_denominator(denominator: int) -> None:
+    if denominator > _basis_denominator.get():
+        _basis_denominator.set(denominator)
 
 
 def _lower_bound(grid: Sequence[int], target: int) -> int:

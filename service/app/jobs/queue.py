@@ -158,11 +158,10 @@ class JobQueue:
         payload = json.dumps(body, allow_nan=False, separators=(",", ":"))
         digest = _body_hash(payload)
         created = False
-        removed: set[tuple[str, str]] = set()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                removed = self._purge_unlocked()
+                _removed, changed = self._purge_unlocked()
                 existing = self._find(user_id, request_key)
                 if existing is None:
                     active = self._conn.execute(
@@ -213,7 +212,7 @@ class JobQueue:
             except Exception:
                 self._rollback()
                 raise
-            if removed:
+            if changed:
                 self._checkpoint()
         if created:
             self._executor.submit(self._execute, job_id)
@@ -228,7 +227,7 @@ class JobQueue:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                removed = self._purge_unlocked()
+                removed, changed = self._purge_unlocked()
                 row = self._conn.execute(
                     """
                     SELECT job_id, user_id, request_key, status, error_json
@@ -240,7 +239,7 @@ class JobQueue:
             except Exception:
                 self._rollback()
                 raise
-            if removed:
+            if changed:
                 self._checkpoint()
         if (job_id, user_id) in removed:
             raise JobExpired(job_id)
@@ -257,7 +256,7 @@ class JobQueue:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                removed = self._purge_unlocked()
+                removed, changed = self._purge_unlocked()
                 row = self._conn.execute(
                     """
                     SELECT result_json FROM job_results
@@ -269,7 +268,7 @@ class JobQueue:
             except Exception:
                 self._rollback()
                 raise
-            if removed:
+            if changed:
                 self._checkpoint()
         if (job_id, user_id) in removed:
             raise JobExpired(job_id)
@@ -278,28 +277,48 @@ class JobQueue:
         return str(row[0])
 
     def _execute(self, job_id: str) -> None:
+        body: str | None = None
+        user_id: str | None = None
         with self._lock:
-            self._conn.execute(
-                "UPDATE jobs SET status = 'running' WHERE job_id = ? AND status = 'queued'",
-                (job_id,),
-            )
-            row = self._conn.execute(
-                "SELECT body_json FROM job_bodies WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-            owner = self._conn.execute(
-                "SELECT user_id FROM jobs WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-        if row is None or owner is None:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                _removed, changed = self._purge_unlocked()
+                if self._job_status(job_id) != "queued":
+                    self._conn.execute("COMMIT")
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE jobs SET status = 'running'
+                        WHERE job_id = ? AND status = 'queued'
+                        """,
+                        (job_id,),
+                    )
+                    row = self._conn.execute(
+                        "SELECT body_json FROM job_bodies WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    owner = self._conn.execute(
+                        "SELECT user_id FROM jobs WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    self._conn.execute("COMMIT")
+                    if row is not None and owner is not None:
+                        body = str(row[0])
+                        user_id = str(owner[0])
+            except Exception:
+                self._rollback()
+                raise
+            if changed:
+                self._checkpoint()
+        if body is None or user_id is None:
             return
         try:
-            result = self._runner(json.loads(row[0]))
+            result = self._runner(json.loads(body))
             text = json.dumps(result, allow_nan=False, separators=(",", ":"))
         except Exception as exc:
             self._mark_failed(job_id, json.dumps(self._error_from(exc), allow_nan=False))
             return
-        self._store_result(job_id, str(owner[0]), text)
+        self._store_result(job_id, user_id, text)
 
     def _store_result(self, job_id: str, user_id: str, text: str) -> None:
         """Write the result and drop the request body. Retry a held write lock.
@@ -313,31 +332,35 @@ class JobQueue:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
-                        removed = self._purge_unlocked()
-                        if any(job == job_id for job, _owner in removed):
+                        _removed, changed = self._purge_unlocked()
+                        # The job may already have been purged by another
+                        # start or read. ``removed`` only lists rows this
+                        # transaction just deleted, so re-read the row.
+                        if self._job_status(job_id) != "running":
                             self._conn.execute("COMMIT")
-                            self._checkpoint()
-                            return
-                        self._conn.execute(
-                            """
-                            INSERT INTO job_results (job_id, user_id, result_json)
-                            VALUES (?, ?, ?)
-                            """,
-                            (job_id, user_id, text),
-                        )
-                        self._conn.execute(
-                            """
-                            UPDATE jobs SET status = 'succeeded', error_json = NULL
-                            WHERE job_id = ? AND status = 'running'
-                            """,
-                            (job_id,),
-                        )
-                        self._delete_body(job_id)
-                        self._conn.execute("COMMIT")
+                        else:
+                            self._conn.execute(
+                                """
+                                INSERT INTO job_results (job_id, user_id, result_json)
+                                VALUES (?, ?, ?)
+                                """,
+                                (job_id, user_id, text),
+                            )
+                            self._conn.execute(
+                                """
+                                UPDATE jobs SET status = 'succeeded', error_json = NULL
+                                WHERE job_id = ? AND status = 'running'
+                                """,
+                                (job_id,),
+                            )
+                            self._delete_body(job_id)
+                            self._conn.execute("COMMIT")
+                            changed = True
                     except Exception:
                         self._rollback()
                         raise
-                    self._checkpoint()
+                    if changed:
+                        self._checkpoint()
                 return
             except sqlite3.OperationalError as exc:
                 last = exc
@@ -355,19 +378,25 @@ class JobQueue:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
-                        self._conn.execute(
-                            """
-                            UPDATE jobs SET status = 'failed', error_json = ?
-                            WHERE job_id = ? AND status = 'running'
-                            """,
-                            (error, job_id),
-                        )
-                        self._delete_body(job_id)
-                        self._conn.execute("COMMIT")
+                        _removed, changed = self._purge_unlocked()
+                        if self._job_status(job_id) != "running":
+                            self._conn.execute("COMMIT")
+                        else:
+                            self._conn.execute(
+                                """
+                                UPDATE jobs SET status = 'failed', error_json = ?
+                                WHERE job_id = ? AND status = 'running'
+                                """,
+                                (error, job_id),
+                            )
+                            self._delete_body(job_id)
+                            self._conn.execute("COMMIT")
+                            changed = True
                     except Exception:
                         self._rollback()
                         raise
-                    self._checkpoint()
+                    if changed:
+                        self._checkpoint()
                 return
             except sqlite3.OperationalError:
                 continue
@@ -387,33 +416,44 @@ class JobQueue:
     def _delete_body(self, job_id: str) -> None:
         self._conn.execute("DELETE FROM job_bodies WHERE job_id = ?", (job_id,))
 
-    def _purge(self) -> set[tuple[str, str]]:
+    def _job_status(self, job_id: str) -> str | None:
+        """Status of ``job_id``, or ``None`` when the row is already gone."""
+        row = self._conn.execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
+    def _purge(self) -> None:
         """Delete jobs whose retention window has ended. Startup calls this."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            removed = self._purge_unlocked()
+            _removed, changed = self._purge_unlocked()
             self._conn.execute("COMMIT")
         except Exception:
             self._rollback()
             raise
-        if removed:
+        if changed:
             self._checkpoint()
-        return removed
 
-    def _purge_unlocked(self) -> set[tuple[str, str]]:
-        """Delete expired jobs. Caller holds the transaction.
+    def _purge_unlocked(self) -> tuple[set[tuple[str, str]], bool]:
+        """Delete expired jobs and orphan rows. Caller holds the transaction.
 
         ``created_at + ttl <= now`` matches the bar cache. The job row, its
         result, and any leftover body go together. Each item is
         ``(job_id, user_id)`` so another user's read stays ``not_found``.
+        A result or body whose job row is already gone is deleted too: a
+        late worker must not leave fill prices behind. The bool is true when
+        any row was deleted, so the caller can checkpoint.
         """
+        before = self._changes()
         cutoff = self._clock() - self._ttl
         rows = self._conn.execute(
             "SELECT job_id, user_id FROM jobs WHERE created_at <= ?",
             (cutoff,),
         ).fetchall()
-        if not rows:
-            return set()
         self._conn.execute(
             """
             DELETE FROM job_results WHERE job_id IN (
@@ -431,7 +471,18 @@ class JobQueue:
             (cutoff,),
         )
         self._conn.execute("DELETE FROM jobs WHERE created_at <= ?", (cutoff,))
-        return {(str(row[0]), str(row[1])) for row in rows}
+        self._conn.execute(
+            "DELETE FROM job_results WHERE job_id NOT IN (SELECT job_id FROM jobs)"
+        )
+        self._conn.execute(
+            "DELETE FROM job_bodies WHERE job_id NOT IN (SELECT job_id FROM jobs)"
+        )
+        removed = {(str(row[0]), str(row[1])) for row in rows}
+        return removed, self._changes() != before
+
+    def _changes(self) -> int:
+        row = self._conn.execute("SELECT total_changes()").fetchone()
+        return 0 if row is None else int(row[0])
 
     def _fail_interrupted(self) -> None:
         """A previous process died. Those rows must not hold a concurrency slot.

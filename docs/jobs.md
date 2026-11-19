@@ -18,7 +18,7 @@ The request body, OHLCV bars included, is kept only while the job is `queued` or
 
 CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. The same note is in `docs/ohlcv.md`. A job result carries fill prices, the trade log, and metrics computed from those bars, so it follows the GeckoTerminal cache.
 
-The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result and any leftover body. A read that finds the job still stored and past the window is HTTP 410 `expired`. A later read of that id is HTTP 404 `not_found`, because the row is gone. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
+The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result and any leftover body. The same pass deletes a result or a body whose job row is already gone. A worker that finishes after that purge writes nothing: the result is stored only when the job is still `running` in that write. A read that still finds the expired job is HTTP 410 `expired`, and that read deletes it. 410 is best-effort. Another start or read purges the row first, and so does startup, so the client can see HTTP 404 `not_found` without a 410. A later read of an id that was deleted is 404 as well. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
 
 Keeping results longer than 24 hours waits on ROZ-92, a provider whose terms allow storage.
 
@@ -37,7 +37,7 @@ Tests pass their own database path. Importing the app, and `GET /health`, do not
 | `bars` | Object of bar lists, keyed by asset id. Each bar has `open_time` (integer unix second) and `close`. `open`, `high`, `low`, and `volume` default from `close`. `synthetic: true` is a flat no-trade minute. |
 | `long_no_trade_minutes` | Optional. Default 120. The quiet-run cut from `docs/ohlcv.md`. |
 
-A new job is HTTP 202. The same `request_key` and the same body is HTTP 200 and the same `job_id`. A different body for that key is HTTP 409 `request_key_reused` and does not create a second job. `NaN`, `Infinity`, a magnitude such as `1e400`, and a body that is not UTF-8 are HTTP 422 `invalid_json`. A lone surrogate in `request_key` is HTTP 422 `invalid_string`. A key of 200 characters is accepted. 201 is rejected.
+A new job is HTTP 202. The same `request_key` and the same body is HTTP 200 and the same `job_id`. A different body for that key is HTTP 409 `request_key_reused` and does not create a second job. `NaN`, `Infinity`, a magnitude such as `1e400`, and a body that is not UTF-8 are HTTP 422 `invalid_json`. JSON is UTF-8. UTF-16, with or without a BOM, is the same 422. A lone surrogate in `request_key` is HTTP 422 `invalid_string`. A key of 200 characters is accepted. 201 is rejected.
 
 A write that cannot get the database lock is HTTP 503 `busy`, not 500.
 
@@ -63,7 +63,7 @@ Validation runs before the job is stored. A bad document, a lone surrogate (incl
 - `metrics` also carries the grid, missing, synthetic, and suspect-outage counts, the in-position twins, and `take_profit_limit_below_low`
 - `trades` and `fills` use the same decimal strings as the trade log
 
-No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404. A job past the retention window is HTTP 410 `expired`, and that read deletes it.
+No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404. A job past the retention window is HTTP 410 `expired` when that read is the one that deletes it. 410 is best-effort: if a start, another read, or startup already purged the row, the response is 404.
 
 A failed run uses a code, not a 500. That includes `grid_too_large`, `expr_too_deep`, `indicator_error`, `indicator_overflow`, `indicator_non_finite`, and `invalid_string`. `RecursionError` at the route is HTTP 422 `expr_too_deep`.
 

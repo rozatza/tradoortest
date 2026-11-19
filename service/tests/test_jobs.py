@@ -568,6 +568,13 @@ def test_non_finite_and_non_utf8_bodies_are_422(tmp_path: Path) -> None:
         response = client.post("/backtests", content=raw, headers=_JSON)
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "invalid_json"
+        utf8 = '{"request_key":"wide","bars":{}}'
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            response = client.post(
+                "/backtests", content=utf8.encode(encoding), headers=_JSON
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "invalid_json"
     finally:
         queue.close()
 
@@ -916,6 +923,87 @@ def test_startup_purges_an_expired_result(tmp_path: Path) -> None:
         gone = again.get(f"/backtests/{job_id}")
         assert gone.status_code == 404
         assert gone.json()["error"]["code"] == "not_found"
+    finally:
+        reopened.close()
+
+
+def test_a_late_worker_does_not_leave_an_orphan_result(tmp_path: Path) -> None:
+    """A purge from another start runs before the worker finishes.
+
+    The result insert must see that the job is gone. A row planted after
+    that, with no job, is deleted on the next open past the TTL.
+    """
+    now = {"t": 1_700_000_000.0}
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(_body: dict) -> dict:
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("runner was not released")
+        return {
+            "marker": "ORPHAN-RESULT-999",
+            "fills": [{"price": "123.456", "qty": "1"}],
+        }
+
+    path = tmp_path / "jobs.sqlite"
+    queue = JobQueue(path, clock=lambda: now["t"], runner=slow, per_minute=100)
+    client = _client(queue)
+    finished = False
+    try:
+        created = client.post("/backtests", json=_payload("late"))
+        assert created.status_code == 202
+        late_id = created.json()["job_id"]
+        assert started.wait(5)
+        now["t"] += _DAY + 10
+        other = client.post("/backtests", json=_payload("other"))
+        assert other.status_code == 202
+        gone = client.get(f"/backtests/{late_id}")
+        assert gone.status_code == 404
+        assert gone.json()["error"]["code"] == "not_found"
+        release.set()
+        finished = True
+    finally:
+        release.set()
+        queue.close()
+    assert finished
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM job_results WHERE job_id = ?", (late_id,)
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM job_bodies WHERE job_id = ?", (late_id,)
+        ).fetchone() == (0,)
+        conn.execute(
+            """
+            INSERT INTO job_results (job_id, user_id, result_json)
+            VALUES (?, ?, ?)
+            """,
+            (
+                late_id,
+                _LOCAL,
+                '{"marker":"ORPHAN-RESULT-999","fills":[{"price":"123.456"}]}',
+            ),
+        )
+        conn.execute(
+            "INSERT INTO job_bodies (job_id, body_json) VALUES (?, ?)",
+            (late_id, '{"price":"123.456"}'),
+        )
+    now["t"] += _DAY
+    reopened = JobQueue(path, clock=lambda: now["t"])
+    try:
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM job_results").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM job_bodies").fetchone() == (0,)
+            assert conn.execute(
+                """
+                SELECT COUNT(*) FROM job_results
+                WHERE job_id NOT IN (SELECT job_id FROM jobs)
+                """
+            ).fetchone() == (0,)
+        blob = _db_bytes(path)
+        assert b"ORPHAN-RESULT-999" not in blob
+        assert b"123.456" not in blob
     finally:
         reopened.close()
 

@@ -122,7 +122,9 @@ def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSO
 async def _start(request: Request, user_id: str) -> JSONResponse:
     try:
         raw = await request.body() or b"null"
-        payload = json.loads(raw, parse_float=_parse_float, parse_constant=_reject_non_finite)
+        # RFC 8259 is UTF-8. json.loads on bytes also accepts UTF-16.
+        text = raw.decode("utf-8-sig")
+        payload = json.loads(text, parse_float=_parse_float, parse_constant=_reject_non_finite)
     except RecursionError:
         return error_response(422, "expr_too_deep", "expression nested too deeply", None)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):

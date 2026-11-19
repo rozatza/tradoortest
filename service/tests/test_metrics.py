@@ -13,6 +13,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, localcontext
 from fractions import Fraction
@@ -2050,16 +2051,38 @@ def test_a_long_pyramid_and_many_trades_stay_within_eight_seconds() -> None:
     import app.backtest.engine as backtest_engine
 
     document, bars = _pyramid(20_000)
-    backtest_engine.between_slots = 0
     started = time.perf_counter()
     result = run_backtest(document, bars)
     elapsed = time.perf_counter() - started
     assert elapsed < 8
     # 20k bars, about 10k trades, two searches, ~15 probes each: under 2e6.
     # A full-grid rescan touches hundreds of millions of slots.
-    assert 0 < backtest_engine.between_slots < 20_000 * 100
+    assert 0 < backtest_engine.between_slots() < 20_000 * 100
     assert len(result.trades) > 500
     assert sum(fill.side == "buy" and fill.asset_id == "sol" for fill in result.fills) > 300
+
+
+def test_between_slot_counts_stay_on_their_own_thread() -> None:
+    """Two runs must not add their probes into one process-wide integer."""
+    import app.backtest.engine as backtest_engine
+
+    barrier = threading.Barrier(2)
+    seen: list[int] = []
+
+    def work(steps: int) -> None:
+        backtest_engine._between_slots.set(0)
+        barrier.wait(timeout=5)
+        for _step in range(steps):
+            backtest_engine._probe()
+        barrier.wait(timeout=5)
+        seen.append(backtest_engine.between_slots())
+
+    threads = [threading.Thread(target=work, args=(steps,)) for steps in (10, 25)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(seen) == [10, 25]
 
 
 def test_a_pyramid_from_5k_to_20k_bars_takes_under_eight_times_as_long() -> None:
@@ -2184,6 +2207,11 @@ def test_repeated_one_third_trims_stay_within_eight_seconds() -> None:
     sells = [fill for fill in result.fills if fill.side == "sell"]
     assert len(sells) > 2_000
     assert result.final_positions
+    # Clock-free twin of the 8 second bound. An exact split is past 30 digits
+    # by the second trim. The 22-bar pin above is the same rule on one trade.
+    import app.backtest.engine as backtest_engine
+
+    assert 1 < backtest_engine.basis_denominator() <= 10**30
 
 
 def test_a_closed_trade_qty_is_the_entry_quantity() -> None:
