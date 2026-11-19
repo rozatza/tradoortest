@@ -98,7 +98,7 @@ capital:
 
 ## costs
 
-Per-fill costs in basis points of notional. Both are required and must be `>= 0` and `<= 10000`.
+Per-fill costs in basis points of notional. Both are required and must be `>= 0` and `<= 10000`. The backtest engine refuses `slippage_bps` of 10000 or more, because a sell would fill at 0. Sizing percent must be greater than 0 and at most 100.
 
 ```text
 costs:

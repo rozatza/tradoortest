@@ -18,7 +18,7 @@ from app.ohlcv.errors import SourceError, StoreError
 from app.ohlcv.registry import MAJORS, SOL_MINT
 from app.ohlcv.source import FetchPage, FetchResult
 from app.ohlcv.store import SqliteBarStore
-from app.ohlcv.synthetic import MAX_SYNTHETIC_RUN, synthetic_minutes
+from app.ohlcv.synthetic import synthetic_minutes
 
 _START = 1_767_225_600  # 2026-01-01T00:00:00Z
 _MINT = SOL_MINT
@@ -131,6 +131,10 @@ def test_gaps_stay_gaps_and_bad_bars_are_excluded(tmp_path: Path) -> None:
             "missing": 1,
             "coverage_pct": 40.0,
             "unfetched": 0,
+            "no_trade": 2,
+            "long_no_trade_minutes": 120,
+            "long_no_trade": [],
+            "suspect_outage": False,
             "gaps": [],
             "rejected": [
                 {
@@ -334,13 +338,16 @@ def test_sparse_window_is_one_call_and_a_rerun_does_not_refetch(tmp_path: Path) 
         section = report["series"][0]
         assert section["unfetched"] == 0
         assert section["real"] == 2
-        assert section["synthetic"] == 0
-        assert section["missing"] == 1438
-        assert section["gaps"] == [
+        assert section["synthetic"] == 1438
+        assert section["missing"] == 0
+        assert section["no_trade"] == 1438
+        assert section["gaps"] == []
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
             {
                 "start": "2026-01-01T00:02:00Z",
                 "end": "2026-01-02T00:00:00Z",
-                "missing": 1438,
+                "minutes": 1438,
             }
         ]
         assert section["coverage_pct"] == round(100.0 * 2 / 1440, 2)
@@ -746,8 +753,7 @@ def test_prior_close_does_not_cross_an_unfetched_hole(tmp_path: Path) -> None:
         store.close()
 
 
-def test_synthetic_run_cap_and_prior_close_seed() -> None:
-    assert MAX_SYNTHETIC_RUN == 15
+def test_synthetic_run_keeps_a_prior_close_at_any_length() -> None:
     real_time = _START
     seeded = synthetic_minutes(
         mint=_MINT,
@@ -759,15 +765,6 @@ def test_synthetic_run_cap_and_prior_close_seed() -> None:
     )
     assert [bar.open_time for bar, _stored in seeded] == [real_time + 60, real_time + 120]
     assert all(bar.synthetic and bar.close == 2.5 and bar.volume == 0.0 for bar, _stored in seeded)
-    short = synthetic_minutes(
-        mint=_MINT,
-        real={real_time: (1.0, 1)},
-        rejected=set(),
-        covered=[(real_time, real_time + 16 * 60)],
-        start=real_time,
-        end=real_time + 16 * 60,
-    )
-    assert len(short) == 15
     long = synthetic_minutes(
         mint=_MINT,
         real={real_time: (1.0, 1)},
@@ -776,10 +773,11 @@ def test_synthetic_run_cap_and_prior_close_seed() -> None:
         start=real_time,
         end=real_time + 17 * 60,
     )
-    assert long == []
+    assert len(long) == 16
+    assert all(bar.synthetic and bar.close == 1.0 for bar, _stored in long)
 
 
-def test_a_long_no_trade_run_is_a_gap(tmp_path: Path) -> None:
+def test_a_long_quiet_run_stays_synthetic_and_is_not_a_gap(tmp_path: Path) -> None:
     end = _START + 21 * 60
     later = _minute(20 * 60, high=4.0, close=3.0)
     source = MemorySource([_minute(0), later])
@@ -798,18 +796,16 @@ def test_a_long_no_trade_run_is_a_gap(tmp_path: Path) -> None:
         stored = store.load(
             user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
         )
-        assert [bar.open_time for bar in stored] == [_START, _START + 20 * 60]
-        assert all(not bar.synthetic for bar in stored)
+        synthetic = [bar for bar in stored if bar.synthetic]
+        assert len(synthetic) == 19
+        assert all(bar.close == 1.5 and bar.volume == 0.0 for bar in synthetic)
         section = report["series"][0]
-        assert section["synthetic"] == 0
+        assert section["synthetic"] == 19
+        assert section["no_trade"] == 19
         assert section["unfetched"] == 0
-        assert section["gaps"] == [
-            {
-                "start": "2026-01-01T00:01:00Z",
-                "end": "2026-01-01T00:20:00Z",
-                "missing": 19,
-            }
-        ]
+        assert section["gaps"] == []
+        assert section["long_no_trade"] == []
+        assert section["suspect_outage"] is False
     finally:
         store.close()
 
@@ -991,3 +987,148 @@ def test_nan_and_inf_ttl_are_one_line(
     assert source.calls == []
     assert "finite" in capsys.readouterr().err
     assert "Traceback" not in capsys.readouterr().err
+
+
+def test_quiet_series_has_no_gaps_and_flags_the_long_run(tmp_path: Path) -> None:
+    # Sparse on purpose: short quiet runs stay synthetic, one run over 120
+    # minutes is flagged, and none of it is a gap. Not a live series.
+    end = _START + 200 * 60
+    source = MemorySource([_minute(0), _minute(40 * 60), _minute(191 * 60, high=4.0, close=3.0)])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["gaps"] == []
+        assert section["unfetched"] == 0
+        assert section["real"] == 3
+        assert section["synthetic"] == 197
+        assert section["no_trade"] == 197
+        assert section["present"] == 200
+        assert section["missing"] == 0
+        assert section["suspect_outage"] is True
+        assert section["long_no_trade"] == [
+            {
+                "start": "2026-01-01T00:41:00Z",
+                "end": "2026-01-01T03:11:00Z",
+                "minutes": 150,
+            }
+        ]
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert sum(1 for bar in stored if bar.synthetic) == 197
+    finally:
+        store.close()
+
+
+def test_a_three_hour_provider_outage_is_a_gap(tmp_path: Path) -> None:
+    quiet_end = _START + 30 * 60
+    outage_end = quiet_end + 3 * 3600
+    end = outage_end + 60
+    later = _minute(outage_end - _START, high=4.0, close=3.0)
+    pages = [
+        FetchPage([_minute(0)], [], _START, quiet_end),
+        FetchPage([], [], quiet_end, outage_end),
+        FetchPage([later], [], outage_end, end),
+    ]
+    source = _PagingSource(pages, fail_on=None)
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("1m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=_MINT, timeframe="1m", start=_START, end=end
+        )
+        assert not any(quiet_end <= bar.open_time < outage_end for bar in stored)
+        assert any(bar.synthetic and bar.open_time < quiet_end for bar in stored)
+        section = report["series"][0]
+        assert section["unfetched"] == 0
+        assert section["gaps"] == [
+            {
+                "start": "2026-01-01T00:30:00Z",
+                "end": "2026-01-01T03:30:00Z",
+                "missing": 180,
+            }
+        ]
+    finally:
+        store.close()
+
+
+def test_missing_native_buckets_are_a_count_not_gap_ranges(tmp_path: Path) -> None:
+    end = _START + 31 * 300
+    native = Bar(_MINT, "5m", _START, 1.0, 2.0, 0.5, 1.5, 9.0)
+    source = MemorySource([native])
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite")
+    try:
+        report = run_backfill(
+            source=source,
+            store=store,
+            assets=(MAJORS[0],),
+            start=_START,
+            end=end,
+            timeframes=("5m",),
+            user_id=LOCAL_USER_ID,
+            generated_at=end,
+        )
+        section = report["series"][0]
+        assert section["real"] == 1
+        assert section["expected"] == 31
+        assert section["no_trade"] == 30
+        assert section["missing"] == 30
+        assert section["gaps"] == []
+        assert section["coverage_pct"] == round(100.0 / 31, 2)
+        assert section["long_no_trade"] == [
+            {"start": "2026-01-01T00:05:00Z", "end": "2026-01-01T02:35:00Z", "minutes": 150}
+        ]
+    finally:
+        store.close()
+
+
+def test_read_only_report_dir_is_rejected_before_fetch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    report_dir.chmod(0o555)
+    source = MemorySource([_minute(0)])
+    try:
+        code = main(
+            [
+                "--days",
+                "1",
+                "--symbols",
+                "SOL",
+                "--timeframes",
+                "1m",
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--report",
+                str(report_dir / "gap-report.json"),
+            ],
+            source=source,
+            now=_START + 86400,
+        )
+        assert code == 1
+        assert source.calls == []
+        err = capsys.readouterr().err
+        assert "not writable" in err
+        assert "Traceback" not in err
+    finally:
+        report_dir.chmod(0o755)

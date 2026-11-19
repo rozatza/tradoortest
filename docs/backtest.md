@@ -63,6 +63,12 @@ The mark used for sizing is cash plus quantity × that bar's close, rounded half
 
 A second run with the same IR and the same bars returns the same fills, skips, and equity. The engine does not use the clock or a random source.
 
+`slippage_bps` of 10000 or more is refused. A sell would fill at 0. The schema still allows 10000; the engine does not.
+
+An asset with no bars is an error. A derived series that is defined on fewer than half of the grid slots is named in `lints`, with the defined count. The run still completes. Sparse 5m data often leaves SMA and the other seeded indicators empty, and the lint is how that shows up.
+
+USDC amounts use a 50-digit decimal context and half-even cents. A value that still cannot be priced to the cent raises `BacktestError`. It is not an uncaught decimal error.
+
 ## No look-ahead
 
 The fill on bar `i` uses that bar's close and the signal state built from slots `0..i`. Indicator functions are causal: a NaN hole ends or empties a window, and a later sample does not change an earlier output. Changing or deleting a later bar does not change fills or equity on earlier slots. A test poisons a future close and fails if an earlier fill moves.

@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS fetched (
     start INTEGER NOT NULL,
     end INTEGER NOT NULL,
     stored_at INTEGER NOT NULL,
+    empty INTEGER NOT NULL,
     PRIMARY KEY (user_id, mint, timeframe, start, end)
 );
 CREATE TABLE IF NOT EXISTS rejections (
@@ -121,6 +122,16 @@ class BarStore(Protocol):
     ) -> set[int]: ...
 
     def fetched_ranges(
+        self,
+        *,
+        user_id: str,
+        mint: str,
+        timeframe: str,
+        start: int,
+        end: int,
+    ) -> list[tuple[int, int]]: ...
+
+    def empty_ranges(
         self,
         *,
         user_id: str,
@@ -311,6 +322,34 @@ class SqliteBarStore:
         )
         return [(row[0], row[1]) for row in cursor]
 
+    def empty_ranges(
+        self,
+        *,
+        user_id: str,
+        mint: str,
+        timeframe: str,
+        start: int,
+        end: int,
+    ) -> list[tuple[int, int]]:
+        """Fetched spans that came back with no candles and no rejections.
+
+        The provider answered and the range is not fetched again inside the
+        TTL. It is a gap, not a no-trade run, and a prior close does not
+        cross it.
+        """
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT start, end FROM fetched
+            WHERE user_id = ? AND mint = ? AND timeframe = ? AND empty = 1
+              AND start < ? AND end > ?
+            ORDER BY start
+            """,
+            (user_id, mint, timeframe, end, start),
+        )
+        return [(row[0], row[1]) for row in cursor]
+
     def rejections(
         self,
         *,
@@ -414,14 +453,16 @@ class SqliteBarStore:
                     """,
                     rejection_rows,
                 )
+            empty_page = 1 if not bars and not rejections else 0
             self._conn.execute(
                 """
-                INSERT INTO fetched (user_id, mint, timeframe, start, end, stored_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO fetched (user_id, mint, timeframe, start, end, stored_at, empty)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, mint, timeframe, start, end) DO UPDATE SET
-                    stored_at = excluded.stored_at
+                    stored_at = excluded.stored_at,
+                    empty = excluded.empty
                 """,
-                (user_id, mint, timeframe, start, end, stored_at),
+                (user_id, mint, timeframe, start, end, stored_at, empty_page),
             )
             if timeframe == "1m":
                 self._rewrite_synthetics(user_id, mint, window_start, window_end)
@@ -431,7 +472,7 @@ class SqliteBarStore:
         bars = {row[1] for row in self._conn.execute("PRAGMA table_info(bars)")}
         fetched = {row[1] for row in self._conn.execute("PRAGMA table_info(fetched)")}
         rejections = {row[1] for row in self._conn.execute("PRAGMA table_info(rejections)")}
-        fresh = {"synthetic", "stored_at"} <= bars and "stored_at" in fetched
+        fresh = {"synthetic", "stored_at"} <= bars and {"stored_at", "empty"} <= fetched
         fresh = fresh and "stored_at" in rejections
         if fresh:
             self._conn.commit()
@@ -465,12 +506,23 @@ class SqliteBarStore:
         """
         ranges = self._conn.execute(
             """
-            SELECT start, end FROM fetched
+            SELECT start, end, empty FROM fetched
             WHERE user_id = ? AND mint = ? AND timeframe = '1m'
             """,
             (user_id, mint),
         ).fetchall()
-        touching = spans_touching([(int(row[0]), int(row[1])) for row in ranges], start, end)
+        populated = [(int(row[0]), int(row[1])) for row in ranges if not row[2]]
+        holes = [(int(row[0]), int(row[1])) for row in ranges if row[2]]
+        for lo, hi in holes:
+            self._conn.execute(
+                """
+                DELETE FROM bars
+                WHERE user_id = ? AND mint = ? AND timeframe = '1m' AND synthetic = 1
+                  AND open_time >= ? AND open_time < ?
+                """,
+                (user_id, mint, lo, hi),
+            )
+        touching = spans_touching(populated, start, end)
         for lo, hi in touching:
             real_rows = self._conn.execute(
                 """
@@ -504,6 +556,11 @@ class SqliteBarStore:
                 start=lo,
                 end=hi,
             )
+            built = [
+                item
+                for item in built
+                if not any(hole_lo <= item[0].open_time < hole_hi for hole_lo, hole_hi in holes)
+            ]
             if built:
                 self._conn.executemany(
                     _UPSERT,

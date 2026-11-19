@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
 from typing import Any
 
 from app.backtest.errors import BacktestError
@@ -103,6 +103,7 @@ class BacktestResult:
     final_equity: Decimal
     final_cash: Decimal
     final_positions: tuple[OpenPosition, ...]
+    lints: tuple[str, ...] = ()
 
 
 @dataclass
@@ -137,6 +138,19 @@ def run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]])
     for ``engine.bar_size``. The run does not fetch data and does not place
     a live order.
     """
+    try:
+        with localcontext() as ctx:
+            # 1e12 capital marked at 1e15 after a 1e-9 fill needs more than
+            # the default 28 digits. Anything still outside this precision
+            # becomes BacktestError instead of an uncaught Decimal error.
+            ctx.prec = 50
+            ctx.rounding = ROUND_HALF_EVEN
+            return _run_backtest(document, bars)
+    except DecimalException as exc:
+        raise BacktestError("order amount is outside the range this book can price") from exc
+
+
+def _run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]]) -> BacktestResult:
     issues = validate_ir(document)
     if issues:
         raise BacktestError(format_issues(issues))
@@ -156,7 +170,8 @@ def run_backtest(document: Mapping[str, Any], bars: Mapping[str, Sequence[Bar]])
     grid = list(range(min(times), max(times) + step, step))
     _align(frames, grid)
     _derive(document["derived_series"], frames)
-    return _walk(document, frames, grid, warmup, initial)
+    lints = _series_lints(document["derived_series"], frames, len(grid))
+    return _walk(document, frames, grid, warmup, initial, lints)
 
 
 def _reject_unknown_bars(asset_ids: list[str], bars: Mapping[str, Sequence[Bar]]) -> None:
@@ -178,6 +193,8 @@ def _frame(asset_id: str, bars: Sequence[Bar], bar_size: str, step: int) -> _Fra
         if bar.open_time in by_time:
             raise BacktestError(f"duplicate bar for asset {asset_id}")
         by_time[bar.open_time] = bar
+    if not by_time:
+        raise BacktestError(f"no bars for asset {asset_id}")
     return _Frame(by_time=by_time, series={}, present=[])
 
 
@@ -262,12 +279,40 @@ def _indicator(spec: Mapping[str, Any], source: Sequence[float], frame: _Frame) 
     raise BacktestError(f"unknown indicator {name}")
 
 
+def _series_lints(
+    specs: Sequence[Mapping[str, Any]], frames: dict[str, _Frame], total: int
+) -> tuple[str, ...]:
+    """Warn when a derived series is empty on most of the grid.
+
+    Sparse native buckets leave SMA and the other seeded indicators NaN.
+    The run still completes. The lint says how many bars were defined so a
+    strategy that never trades is not silent.
+    """
+    if total == 0:
+        return ()
+    notes: list[str] = []
+    for spec in specs:
+        series_id = str(spec["id"])
+        for asset_id, frame in frames.items():
+            values = frame.series.get(series_id, [])
+            defined = sum(
+                1 for value in values if isinstance(value, float) and math.isfinite(value)
+            )
+            if defined * 2 < total:
+                notes.append(
+                    f"derived series {series_id} on {asset_id} is defined on "
+                    f"{defined} of {total} bars"
+                )
+    return tuple(notes)
+
+
 def _walk(
     document: Mapping[str, Any],
     frames: dict[str, _Frame],
     grid: list[int],
     warmup: int,
     initial: Decimal,
+    lints: tuple[str, ...],
 ) -> BacktestResult:
     book = _Book(cash=initial, positions={})
     signals = {signal["id"]: signal["expr"] for signal in document["signals"]}
@@ -278,6 +323,8 @@ def _walk(
     max_positions = int(portfolio["max_positions"])
     commission_bps = _dec(document["costs"]["commission_bps"])
     slippage_bps = _dec(document["costs"]["slippage_bps"])
+    if slippage_bps >= _BPS:
+        raise BacktestError("slippage_bps must be less than 10000; a sell would fill at 0")
     memory = {asset_id: EvalMemory() for asset_id in frames}
     fills: list[Fill] = []
     skipped: list[SkippedOrder] = []
@@ -342,6 +389,7 @@ def _walk(
         final_equity,
         book.cash,
         positions,
+        lints,
     )
 
 
@@ -391,6 +439,7 @@ def _snapshot(
         value = evaluate(
             signals[signal_id],
             EvalContext(index, frames[asset_id].series, entry, memory[asset_id]),
+            (signal_id,),
         )
         truth[(signal_id, asset_id)] = value is True
     return truth
@@ -531,4 +580,7 @@ def _price(value: float) -> Decimal:
 
 
 def _q(amount: Decimal) -> Decimal:
-    return amount.quantize(_CENT, rounding=ROUND_HALF_EVEN)
+    try:
+        return amount.quantize(_CENT, rounding=ROUND_HALF_EVEN)
+    except DecimalException as exc:
+        raise BacktestError("order amount is outside the range this book can price") from exc

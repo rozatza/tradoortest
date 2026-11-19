@@ -1,14 +1,16 @@
-"""Flagged no-trade minutes. These are not silent forward-fill.
+"""Flagged no-trade minutes. These are not silent forward-fill and not gaps.
 
-Inside a span the provider has already answered, a short run of 1m slots
-with no candle becomes flat bars: open, high, low, and close are the
-previous real close, volume is 0, and ``synthetic`` is true. The previous
-close may sit earlier in the same fetched span, including before the
-caller's current window. It does not cross an unfetched hole.
+Inside a span the provider has already answered with at least one candle, a
+run of 1m slots with no candle becomes flat bars: open, high, low, and
+close are the previous real close, volume is 0, and ``synthetic`` is true.
+The run can be any length. A long quiet stretch stays a synthetic bar so it
+counts as present. It is not a gap. The report flags runs over a threshold
+separately.
 
-A run longer than ``MAX_SYNTHETIC_RUN`` minutes is not stored. That run is
-a gap (an outage), not hours of flat bars. Slots before the first real bar
-in the span stay missing. A rejected minute stays rejected.
+The previous close may sit earlier in the same fetched span, including
+before the caller's current window. It does not cross an unfetched hole or
+an empty provider page. Slots before the first real bar in the span stay
+missing. A rejected minute stays rejected.
 """
 
 from __future__ import annotations
@@ -20,10 +22,6 @@ from app.ohlcv.gaps import spans_touching
 
 _MINUTE = 60
 
-# A 1m no-trade run of this many minutes is still a flagged flat bar.
-# One minute more is a gap: a 3-hour outage must not become 180 synthetics.
-MAX_SYNTHETIC_RUN = 15
-
 
 def synthetic_minutes(
     *,
@@ -34,17 +32,16 @@ def synthetic_minutes(
     start: int,
     end: int,
 ) -> list[tuple[Bar, int]]:
-    """Return ``(bar, stored_at)`` for short no-trade runs that have a prior close.
+    """Return ``(bar, stored_at)`` for no-trade runs that have a prior close.
 
     ``real`` maps a minute open time to ``(close, stored_at)`` of a real bar.
     Bars before ``start`` count: they seed the prior close for a window that
     begins in the middle of a span already fetched. ``stored_at`` on the
     synthetic bar is the real bar's, so the flat bar expires with the trade
     it copies. ``rejected`` minutes are left empty and they break a run.
-    Only minutes inside ``[start, end)`` are returned. A run is measured
-    across the whole fetched span, including minutes outside that window, so
-    a long outage is not stored as a short run just because the window
-    clipped it.
+    Only minutes inside ``[start, end)`` are returned. ``covered`` must be
+    populated spans only. An empty provider page is not coverage, so a prior
+    close does not walk across it.
     """
     built: list[tuple[Bar, int]] = []
     for lo, hi in spans_touching(covered, start, end):
@@ -78,7 +75,7 @@ def _flush(
     start: int,
     end: int,
 ) -> None:
-    if not run or len(run) > MAX_SYNTHETIC_RUN:
+    if not run:
         return
     for open_time, close, stored_at in run:
         if open_time < start or open_time >= end:

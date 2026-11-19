@@ -6,7 +6,7 @@ The hand-calc fixture is synthetic. Nothing here calls the network.
 from __future__ import annotations
 
 import json
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -230,7 +230,9 @@ def test_hand_computed_round_trip_matches_to_the_cent() -> None:
     assert buy.price == _BUY_PRICE
     assert buy.notional == _BUY_NOTIONAL
     assert buy.commission == _BUY_COMMISSION
-    assert buy.qty == _BUY_NOTIONAL / _BUY_PRICE
+    with localcontext() as ctx:
+        ctx.prec = 50
+        assert buy.qty == _BUY_NOTIONAL / _BUY_PRICE
     assert buy.equity_after == _EQUITY_AFTER_BUY
     assert sell.side == "sell"
     assert sell.price == _SELL_PRICE
@@ -607,3 +609,309 @@ def test_invalid_ir_and_bad_bars_are_refused() -> None:
         run_backtest(_strategy(), {"sol": [_bar(0, 1)], "nope": [_bar(0, 1)]})
     with pytest.raises(BacktestError, match="no bars"):
         run_backtest(_strategy(), {})
+    with pytest.raises(BacktestError, match="no bars for asset sol"):
+        run_backtest(_strategy(), {"sol": []})
+
+
+def test_a_shifted_indicator_would_fill_early() -> None:
+    # SMA(2) of 1, 1, 1, 100 is nan, 1, 1, 50.5. Only the last bar is above 10.
+    # Reading the series one bar ahead would buy the third bar at close 1.
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "sma_2",
+                "kind": "indicator",
+                "indicator": "sma",
+                "source": "close",
+                "params": {"period": 2},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("sma_2", 10)}],
+    )
+    result = run_backtest(
+        document,
+        {"sol": [_bar(0, 1), _bar(60, 1), _bar(120, 1), _bar(180, 100)]},
+    )
+    assert [fill.open_time for fill in result.fills] == [_START + 180]
+    assert result.fills[0].price == Decimal("100")
+
+
+def test_a_signal_on_a_missing_bar_is_skipped() -> None:
+    # Enter on the first bar. The exit is true only on the hole (bars_since
+    # counts it). Filling that signal at the prior close would sell there.
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _gt("close", 150)},
+            {
+                "id": "stop",
+                "expr": {
+                    "op": "gt",
+                    "left": {
+                        "op": "bars_since",
+                        "args": [_gt("close", 0)],
+                    },
+                    "right": {"op": "lit", "value": 0},
+                },
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 200), _bar(120, 100)]})
+    assert [fill.open_time for fill in result.fills] == [_START]
+    assert result.fills[0].side == "buy"
+    assert result.fills[0].price == Decimal("200")
+    assert [(item.open_time, item.reason) for item in result.skipped] == [
+        (_START + 60, "missing_bar")
+    ]
+    assert len(result.final_positions) == 1
+
+
+def test_a_buy_cannot_spend_more_cash_than_the_book_has() -> None:
+    document = _strategy(
+        assets=[
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+            {
+                "id": "jup",
+                "symbol": "JUP",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            },
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 2,
+            "allow_pyramiding": False,
+            "quote_currency": "USDC",
+        },
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(),
+            },
+            {
+                "id": "enter_jup",
+                "type": "enter",
+                "side": "long",
+                "asset": "jup",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": _risk(),
+            },
+        ],
+        rules=[
+            {"id": "enter_sol_rule", "when": "go", "do": "enter_sol"},
+            {"id": "enter_jup_rule", "when": "go", "do": "enter_jup"},
+        ],
+    )
+    result = run_backtest(
+        document,
+        {"sol": [_bar(0, 100)], "jup": [_bar(0, 2, mint="OtherMint")]},
+    )
+    assert [fill.asset_id for fill in result.fills] == ["sol"]
+    assert result.skipped[0].reason == "no_cash"
+    assert result.final_cash == Decimal("0.00")
+    assert all(point.cash >= 0 for point in result.equity_curve)
+
+
+def test_sparse_sma_is_linted_and_an_empty_asset_is_an_error() -> None:
+    document = _strategy(
+        engine={
+            "bar_size": "5m",
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 0,
+        },
+        derived_series=[
+            {
+                "id": "sma_20",
+                "kind": "indicator",
+                "indicator": "sma",
+                "source": "close",
+                "params": {"period": 20},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("sma_20", 0)}],
+    )
+    result = run_backtest(
+        document,
+        {"sol": [_bar(0, 10, timeframe="5m"), _bar(39 * 300, 10, timeframe="5m")]},
+    )
+    assert result.fills == ()
+    assert result.lints == ("derived series sma_20 on sol is defined on 0 of 40 bars",)
+
+
+def test_shared_subexpression_matches_a_copied_one() -> None:
+    cross = {
+        "op": "cross_above",
+        "args": [{"op": "ref", "name": "close"}, {"op": "lit", "value": 5}],
+    }
+    shared = {"op": "and", "left": cross, "right": cross}
+    copied = json.loads(json.dumps(shared))
+    bars = [_bar(0, 1), _bar(60, 1), _bar(120, 10)]
+
+    def run(expr: dict) -> list[int]:
+        document = _strategy(signals=[{"id": "go", "expr": expr}])
+        return [fill.open_time for fill in run_backtest(document, {"sol": bars}).fills]
+
+    assert run(shared) == run(copied) == [_START + 120]
+
+
+def test_extreme_prices_price_to_the_cent() -> None:
+    """Rows from the robustness log. None of them may raise InvalidOperation."""
+
+    def marked(capital: float, buy: float, mark: float) -> Decimal:
+        document = _strategy(
+            capital={"initial": capital, "currency": "USDC"},
+            costs={"commission_bps": 0, "slippage_bps": 0},
+            signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        )
+        result = run_backtest(
+            document,
+            {"sol": [_bar(0, buy), _bar(60, mark)]},
+        )
+        assert result.final_cash == Decimal("0.00")
+        assert all(point.cash >= 0 for point in result.equity_curve)
+        return result.final_equity
+
+    assert marked(1e12, 1e-5, 1e9) == Decimal("1E+26")
+    assert marked(1e12, 0.01, 1e15) == Decimal("1E+29")
+    assert marked(10000, 1e-9, 1e15) == Decimal("1E+28")
+    assert marked(10000, 2e-5, 1e9) == Decimal("5E+17")
+
+
+def test_sizing_edges_and_a_zero_percent_message() -> None:
+    zero = _strategy()
+    zero["actions"][0]["sizing"]["percent"] = 0
+    with pytest.raises(BacktestError, match=r"greater than 0 and at most 100"):
+        run_backtest(zero, {"sol": [_bar(0, 1)]})
+
+    tiny = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 0.01},
+                "risk": _risk(),
+            }
+        ],
+    )
+    bought = run_backtest(tiny, {"sol": [_bar(0, 1)]})
+    assert bought.fills[0].notional == Decimal("1.00")
+    assert bought.fills[0].commission == Decimal("0.00")
+    assert bought.final_cash == Decimal("9999.00")
+
+    full = _strategy(
+        costs={"commission_bps": 10000, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": {"op": "lit", "value": True}},
+            {"id": "stop", "expr": {"op": "lit", "value": True}},
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+        engine={
+            "bar_size": "1m",
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 1,
+        },
+    )
+    # Warmup blocks bar 0. Bar 1 enters 100% and then exits, because both
+    # signals were already true. Commission of 10000 bps takes the whole
+    # notional on the way in and again on the way out, so the account ends at 0.
+    closed = run_backtest(full, {"sol": [_bar(0, 100), _bar(60, 90)]})
+    assert [(fill.notional, fill.commission) for fill in closed.fills] == [
+        (Decimal("5000.00"), Decimal("5000.00")),
+        (Decimal("5000.00"), Decimal("5000.00")),
+    ]
+    assert closed.final_equity == Decimal("0.00")
+    assert closed.final_cash == Decimal("0.00")
+
+    with pytest.raises(BacktestError, match="less than 10000"):
+        run_backtest(
+            _strategy(costs={"commission_bps": 0, "slippage_bps": 10000}),
+            {"sol": [_bar(0, 100)]},
+        )
+
+    # 100% equity, no costs: buy 10000, sell at 90 for 9000, buy 9000 again.
+    # Extra enters while cash is 0 are no_cash, not a negative balance.
+    round_trip = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+        signals=[
+            {"id": "go", "expr": _gt("close", 95)},
+            {
+                "id": "stop",
+                "expr": {
+                    "op": "lt",
+                    "left": {"op": "ref", "name": "close"},
+                    "right": {"op": "lit", "value": 95},
+                },
+            },
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    cycled = run_backtest(
+        round_trip,
+        {
+            "sol": [
+                _bar(0, 100),
+                _bar(60, 100),
+                _bar(120, 90),
+                _bar(180, 100),
+                _bar(240, 100),
+            ]
+        },
+    )
+    assert [(fill.side, fill.notional, fill.commission) for fill in cycled.fills] == [
+        ("buy", Decimal("10000.00"), Decimal("0.00")),
+        ("sell", Decimal("9000.00"), Decimal("0.00")),
+        ("buy", Decimal("9000.00"), Decimal("0.00")),
+    ]
+    assert [item.reason for item in cycled.skipped] == ["no_cash", "no_cash"]
+    assert cycled.final_equity == Decimal("9000.00")
+    assert min(point.cash for point in cycled.equity_curve) == Decimal("0.00")
+
+    heavy = _strategy(
+        costs={"commission_bps": 9999, "slippage_bps": 9999},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    paid = run_backtest(heavy, {"sol": [_bar(0, 1)]})
+    assert paid.fills[0].notional == Decimal("5000.25")
+    assert paid.fills[0].commission == Decimal("4999.75")
+    assert paid.final_cash == Decimal("0.00")

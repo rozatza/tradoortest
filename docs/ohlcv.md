@@ -83,11 +83,11 @@ fetch_bars(mint, timeframe, start, end) -> bars
 
 Each requested timeframe is fetched on its own. Higher timeframes are not built from 1-minute bars. There is no 1m resample path.
 
-On 1m, a short run of minutes inside a fetched span with no candle becomes flat synthetic bars: open, high, low, and close are the previous real close, volume is 0, and `synthetic` is true. That flag is stored and it is on the bar the store returns. It is a no-trade minute, and it is not a trade. A run is at most 15 consecutive minutes. A longer run is a gap, not a row of flat bars, so a multi-hour outage is not stored as hours of silent synthetics. The 15 minutes are counted across the whole fetched span, not only inside the current window.
+On 1m, minutes inside a fetched span with no candle become flat synthetic bars: open, high, low, and close are the previous real close, volume is 0, and `synthetic` is true. That flag is stored and it is on the bar the store returns. It is a no-trade minute, and it is not a trade. The run can be any length. A long quiet stretch stays synthetic, so it counts as present and it is not a gap. A run strictly longer than the threshold (default 120 minutes, `--long-no-trade-minutes`) is listed under `long_no_trade` and sets `suspect_outage`. The bars stay in the series. The length is counted inside the reported window.
 
-The previous close is the latest real close in that same fetched span. A later window that starts in the middle of a span already fetched still uses that close, so the synthetic bars at the new window's start stay. The close does not come from before the span, and it does not cross an unfetched hole. Two runs that cover the same spans store the same series, whichever window was requested first.
+The previous close is the latest real close in that same fetched span. A later window that starts in the middle of a span already fetched still uses that close, so the synthetic bars at the new window's start stay. The close does not come from before the span, and it does not cross an unfetched hole or an empty provider page. Two runs that cover the same spans store the same series, whichever window was requested first.
 
-Minutes before the first real bar in a span have no prior close, so they stay missing and the gap report lists them. A rejected minute stays rejected. It is not turned into a synthetic bar and it is not a gap. 5m and above are stored only as the provider returned them. A missing native bucket inside a fetched span is a gap. Nothing is resampled from 1m and nothing is copied forward.
+Minutes before the first real bar in a span have no prior close, so they stay missing and the gap report lists them. That is the leading range when history starts inside the window, or when a short page does not reach back to the window start. An empty provider page, and a fetch that never covered the range, are gaps too. A rejected minute stays rejected. It is not turned into a synthetic bar and it is not a gap. 5m and above are stored only as the provider returned them. A missing native bucket after the first real candle in that span is a no-trade bucket: `no_trade` counts it and `coverage_pct` is still real bars over the grid. It is not one gap range per bucket. Nothing is resampled from 1m and nothing is copied forward.
 
 The window is at least `--days` long (default 90). It is floored to the coarsest requested timeframe, which can add less than one of those bars.
 
@@ -123,7 +123,9 @@ The primary key of a bar is `(user_id, mint, timeframe, open_time)`. Inserting t
 
 The CLI prints JSON and writes the same document when `--report` is set. `forward_filled` is always false: the provider is not asked to copy a close forward. `synthetic_no_trade` is true because 1m no-trade minutes are stored as flagged flat bars. `attribution` is `Data by GeckoTerminal / CoinGecko`.
 
-Counts are per symbol and timeframe. `coverage_pct` is real bars divided by the expected grid, as a percent. `real` counts provider candles. `synthetic` counts flagged no-trade bars. `present` is those two. `missing` is `expected - present`. `unfetched` counts grid points no fetched span covers. `gaps` includes those points and every other grid point that has no stored bar, except a rejected minute. A leading range is a gap when the provider's history starts inside the window, or when a short page does not reach back to the window start. A 1m no-trade run longer than 15 minutes is a gap. A missing 5m, 15m, 1h, 4h, or 1d bucket inside a fetched span is a gap. A rejected minute is listed under `rejected` and is not a gap. A flagged synthetic bar is not a gap.
+Counts are per symbol and timeframe. `coverage_pct` is real bars divided by the expected grid, as a percent. `real` counts provider candles. `synthetic` counts flagged no-trade bars. `present` is those two, so a quiet 1m minute counts as present and is not missing. `missing` is `expected - present`. `unfetched` counts grid points no fetched span covers. `no_trade` is the synthetic count on 1m, and on 5m and above it is the number of omitted native buckets after history has started. `long_no_trade_minutes` is the threshold for this report. `long_no_trade` lists quiet runs strictly longer than that threshold, with `start`, `end`, and `minutes`. `suspect_outage` is true when that list is not empty. Those runs are not gaps.
+
+`gaps` are provider-missing ranges only. A leading range is a gap when the provider's history starts inside the window, or when a short page does not reach back to the window start. An empty page and a span the fetch never covered are gaps. A rejected minute is listed under `rejected` and is not a gap. A flagged synthetic bar is not a gap. A missing 5m, 15m, 1h, 4h, or 1d bucket after the first real candle is `no_trade`, not a gap range.
 
 Synthetic example (not a live response). SOL, five 1-minute slots. The span was fetched. 00:00 and 00:03 are real. 00:01 is rejected because high does not cover the close, so it is not a synthetic bar. 00:02 copies the 00:00 close. 00:04 copies the 00:03 close. Coverage is 2 / 5.
 
@@ -149,6 +151,10 @@ Synthetic example (not a live response). SOL, five 1-minute slots. The span was 
       "missing": 1,
       "coverage_pct": 40.0,
       "unfetched": 0,
+      "no_trade": 2,
+      "long_no_trade_minutes": 120,
+      "long_no_trade": [],
+      "suspect_outage": false,
       "gaps": [],
       "rejected": [
         {
@@ -161,9 +167,9 @@ Synthetic example (not a live response). SOL, five 1-minute slots. The span was 
 }
 ```
 
-The 00:01 candle was not repaired. 00:02 and 00:04 are synthetic bars with volume 0 and `synthetic: true`. Each of those no-trade runs is one minute, under the 15-minute cap. A later run inside the TTL does not request the span again.
+The 00:01 candle was not repaired. 00:02 and 00:04 are synthetic bars with volume 0 and `synthetic: true`. Each of those no-trade runs is one minute, so neither is a long-run flag. A later run inside the TTL does not request the span again.
 
-A window whose first candle is later than the start lists that leading range under `gaps` even though the span was fetched. `unfetched` stays 0 for that range. The same is true of a native 5m bucket the provider omitted.
+A window whose first candle is later than the start lists that leading range under `gaps` even though the span was fetched. `unfetched` stays 0 for that range. A native 5m bucket the provider omitted after the first candle is `no_trade`, not a gap. An empty page, including a multi-hour provider outage with no candles, is a gap and is not filled with synthetic bars.
 
 ## Run the backfill
 
@@ -185,7 +191,7 @@ Useful flags:
   --cache-ttl-hours 24
 ```
 
-`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits 1. `--days` above 180 exits 1 before any request. `--cache-ttl-hours` above 24 hours, or `nan`, or `inf`, does too. Usage errors from the argument parser also exit 1. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A connect or DNS failure, a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit 1 with one error line on stderr and no traceback. The report path is checked before any request. Ctrl-C exits 130 and does not print a traceback. Progress lines are separate from that error line.
+`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits 1. `--days` above 180 exits 1 before any request. `--cache-ttl-hours` above 24 hours, or `nan`, or `inf`, does too. `--long-no-trade-minutes` below 1 does too. Usage errors from the argument parser also exit 1. `python -m app.ohlcv` is the same command. While a fetch is running, stderr gets lines that start with `ohlcv:`. A connect or DNS failure, a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit 1 with one error line on stderr and no traceback. The report path is checked before any request, including a parent directory that exists but is not writable. Ctrl-C exits 130 and does not print a traceback. Progress lines are separate from that error line.
 
 ## Environment
 
