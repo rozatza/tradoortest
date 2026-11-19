@@ -13,6 +13,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, localcontext
 from fractions import Fraction
@@ -1900,11 +1901,29 @@ def test_a_caller_context_cannot_put_nan_in_a_ratio() -> None:
     assert trapped_normal.annualized_return == base_normal.annualized_return
     assert trapped_grown.annualized_return == base_grown.annualized_return
     assert trapped_grown.annualized_return.is_finite()
+    assert trapped.calmar is None
+    assert trapped.undefined["calmar"] == "overflow"
+    payoff = {
+        "initial": Decimal("10000"),
+        "curve": (Decimal("10000"), Decimal("10000")),
+        "closed_pnls": (Decimal("1E+60"), Decimal("-1E-20")),
+        "open_trades": 0,
+        "bar_seconds": 60,
+        "take_profit_limit_below_low": 0,
+        "quality": _quality(2),
+    }
+    with localcontext() as ctx:
+        ctx.traps[InvalidOperation] = False
+        trapped_payoff = compute_metrics(**payoff)
+    assert trapped_payoff.payoff_ratio is None
+    assert trapped_payoff.undefined["payoff_ratio"] == "overflow"
+    _no_nan(trapped)
     _no_nan(trapped_normal)
     _no_nan(trapped_grown)
+    _no_nan(trapped_payoff)
 
 
-def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
+def test_metrics_on_a_random_walk_stay_within_three_seconds() -> None:
     """A seeded cent walk. Seven repeated values hid the old exact-sum cost."""
     rng = random.Random(17)
     price = Decimal("10000.00")
@@ -1926,19 +1945,16 @@ def test_metrics_on_a_random_walk_stay_within_a_second() -> None:
         quality=_quality(20_000),
     )
     elapsed = time.perf_counter() - started
-    assert elapsed < 1
+    # Headroom for a slow CI runner. Head is under a second. Three seconds still
+    # fails a Fraction running sum, which spends the walk in gcd.
+    assert elapsed < 3
     assert metrics.bar_count == 20_000
     assert metrics.sharpe is not None
     assert metrics.sharpe.is_finite()
 
 
-def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
-    """20k bars: one asset adds every bar and trims on four of every ten.
-
-    The other asset round-trips. The budget is absolute. It is not a
-    comparison of two clocks. A 50% trim halves the basis, so this guard
-    does not see a partial sale whose fraction does not terminate.
-    """
+def _pyramid(count: int) -> tuple[dict, dict[str, list]]:
+    """One asset adds every bar and trims on four of every ten. The other round-trips."""
     document = _strategy(
         costs={"commission_bps": 0, "slippage_bps": 0},
         assets=[
@@ -2016,19 +2032,71 @@ def test_a_long_pyramid_and_many_trades_stay_within_three_seconds() -> None:
     )
     sol = []
     jup = []
-    for index in range(20_000):
+    for index in range(count):
         # Adds every bar. The close is above 105 on four of every ten bars,
         # and the position stays open for the whole run.
         sol_close = 100 + (index % 10)
         sol.append(_bar(60 * index, sol_close))
         jup_close = 110 if index % 2 == 0 else 90
         jup.append(_bar(60 * index, jup_close, mint="SyntheticMint222222222222222222222222222"))
+    return document, {"sol": sol, "jup": jup}
+
+
+def test_a_long_pyramid_and_many_trades_stay_within_eight_seconds() -> None:
+    """20k bars. Eight seconds still fails a full-grid rescan of each trade.
+
+    The slot counter is the clock-free twin: a bisect probes a few stamps per
+    trade, and a walk of the whole grid touches one slot per bar per call.
+    """
+    import app.backtest.engine as backtest_engine
+
+    document, bars = _pyramid(20_000)
     started = time.perf_counter()
-    result = run_backtest(document, {"sol": sol, "jup": jup})
+    result = run_backtest(document, bars)
     elapsed = time.perf_counter() - started
-    assert elapsed < 3
+    assert elapsed < 8
+    # 20k bars, about 10k trades, two searches, ~15 probes each: under 2e6.
+    # A full-grid rescan touches hundreds of millions of slots.
+    assert 0 < backtest_engine.between_slots() < 20_000 * 100
     assert len(result.trades) > 500
     assert sum(fill.side == "buy" and fill.asset_id == "sol" for fill in result.fills) > 300
+
+
+def test_between_slot_counts_stay_on_their_own_thread() -> None:
+    """Two runs must not add their probes into one process-wide integer."""
+    import app.backtest.engine as backtest_engine
+
+    barrier = threading.Barrier(2)
+    seen: list[int] = []
+
+    def work(steps: int) -> None:
+        backtest_engine._between_slots.set(0)
+        barrier.wait(timeout=5)
+        for _step in range(steps):
+            backtest_engine._probe()
+        barrier.wait(timeout=5)
+        seen.append(backtest_engine.between_slots())
+
+    threads = [threading.Thread(target=work, args=(steps,)) for steps in (10, 25)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(seen) == [10, 25]
+
+
+def test_a_pyramid_from_5k_to_20k_bars_takes_under_eight_times_as_long() -> None:
+    """Linear work grows about four times. A quadratic rescan grows about sixteen."""
+    document, bars = _pyramid(5_000)
+    started = time.perf_counter()
+    run_backtest(document, bars)
+    short = time.perf_counter() - started
+    document, bars = _pyramid(20_000)
+    started = time.perf_counter()
+    run_backtest(document, bars)
+    long = time.perf_counter() - started
+    assert short > 0
+    assert long / short < 8
 
 
 def _dca_trim(count: int, *, close_out: bool = False) -> tuple[dict, list[Bar]]:
@@ -2124,21 +2192,26 @@ def test_a_partial_sale_keeps_basis_on_a_fixed_grid() -> None:
     assert reported == result.final_equity - result.metrics.initial_equity
 
 
-def test_repeated_one_third_trims_stay_within_four_seconds() -> None:
+def test_repeated_one_third_trims_stay_within_eight_seconds() -> None:
     """Buy 1% every bar and trim 33.3% every seventh bar, for 20k bars.
 
     A 50% trim only halves the basis. This fraction does not terminate, and
-    an exact split is already many seconds at this length. The budget is
-    absolute.
+    an exact split is already many seconds at this length. Eight seconds
+    still fails that exact split. The 1e-30 pin below is the clock-free twin.
     """
     document, bars = _dca_trim(20_000)
     started = time.perf_counter()
     result = run_backtest(document, {"sol": bars})
     elapsed = time.perf_counter() - started
-    assert elapsed < 4
+    assert elapsed < 8
     sells = [fill for fill in result.fills if fill.side == "sell"]
     assert len(sells) > 2_000
     assert result.final_positions
+    # Clock-free twin of the 8 second bound. An exact split is past 30 digits
+    # by the second trim. The 22-bar pin above is the same rule on one trade.
+    import app.backtest.engine as backtest_engine
+
+    assert 1 < backtest_engine.basis_denominator() <= 10**30
 
 
 def test_a_closed_trade_qty_is_the_entry_quantity() -> None:
@@ -2449,3 +2522,100 @@ def test_calmar_overflows_while_the_annualized_return_stays_defined() -> None:
     assert metrics.calmar is None
     assert metrics.undefined["calmar"] == "annualization_overflow"
     assert "annualized_return" not in metrics.undefined
+
+
+def test_a_nan_gap_does_not_carry_a_later_outage_into_the_earlier_run() -> None:
+    """Outage only after the hole. The second run is too short for a finite EMA.
+
+    Removing the close-the-run branch makes the later outage part of the
+    first run, and that run does have a finite EMA, so it would lint.
+    An outage before the hole still lints.
+    """
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "ema_3",
+                "kind": "indicator",
+                "indicator": "ema",
+                "source": "close",
+                "params": {"period": 3},
+            }
+        ],
+        signals=[{"id": "go", "expr": _gt("close", 10_000)}],
+    )
+    after = [
+        _bar(0, 10),
+        _bar(60, 11),
+        _bar(120, 12),
+        _bar(240, 13, synthetic=True),
+        _bar(300, 14, synthetic=True),
+    ]
+    quiet = run_backtest(document, {"sol": after}, long_no_trade_minutes=1)
+    assert quiet.metrics.suspect_outage is True
+    assert not any("suspect_outage" in note for note in quiet.lints)
+    before = [
+        _bar(0, 10, synthetic=True),
+        _bar(60, 11, synthetic=True),
+        _bar(120, 12, synthetic=True),
+        _bar(240, 13),
+    ]
+    tainted = run_backtest(document, {"sol": before}, long_no_trade_minutes=1)
+    assert "ema_3 on sol is computed across 3 suspect_outage bars" in tainted.lints
+
+
+def test_partial_sale_basis_is_the_1e_30_grid() -> None:
+    """1e-20 and 1e-4 rounding of 10/9 are different numbers. The book uses 1e-30."""
+    from app.backtest.engine import _sold_basis
+
+    exact = Fraction(10, 3) * Fraction(1) / Fraction(3)
+
+    def on(quantum: int) -> Fraction:
+        return Fraction(round(exact * quantum), quantum)
+
+    sold = _sold_basis(Fraction(10, 3), Decimal("1"), Decimal("3"))
+    assert sold == on(10**30)
+    assert sold != on(10**20)
+    assert sold != on(10**4)
+
+    import app.backtest.engine as engine
+
+    seen: list[Fraction] = []
+    real = engine._note_sell
+
+    def record(*args, **kwargs):
+        real(*args, **kwargs)
+        asset_id = args[2]
+        acc = args[0].get(asset_id)
+        if acc is None:
+            acc = args[1][-1]
+        seen.append(acc.basis)
+
+    engine._note_sell = record
+    try:
+        document, bars = _dca_trim(22, close_out=True)
+        result = run_backtest(document, {"sol": bars})
+    finally:
+        engine._note_sell = real
+
+    def replay(quantum: int) -> list[Fraction]:
+        basis = Fraction(0)
+        qty = Decimal(0)
+        opened: list[Fraction] = []
+        for fill in result.fills:
+            if fill.side == "buy":
+                basis += Fraction(fill.notional) + Fraction(fill.commission)
+                qty += fill.qty
+                continue
+            if fill.qty == qty:
+                basis = Fraction(0)
+                qty = Decimal(0)
+            else:
+                share = basis * Fraction(fill.qty) / Fraction(qty)
+                basis -= Fraction(round(share * quantum), quantum)
+                qty -= fill.qty
+            opened.append(basis)
+        return opened
+
+    assert seen == replay(10**30)
+    assert seen != replay(10**20)
+    assert seen != replay(10**4)

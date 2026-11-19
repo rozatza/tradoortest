@@ -6,12 +6,15 @@ The hand-calc fixture is synthetic. Nothing here calls the network.
 from __future__ import annotations
 
 import json
-from decimal import ROUND_DOWN, Decimal, getcontext, localcontext
+import time
+import tracemalloc
+from decimal import MIN_EMIN, ROUND_DOWN, Decimal, Inexact, getcontext, localcontext
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
+import app.backtest.engine as engine
 from app.backtest import BacktestError, move_oco, run_backtest, trade_log_csv, trade_log_json
 from app.backtest.engine import _between, _flag_prefix
 from app.backtest.money import decimal_ratio, floor_qty
@@ -172,8 +175,10 @@ def test_hand_computed_round_trip_matches_to_the_cent() -> None:
 
     Buy close 100. Fill = 100 * 10005/10000 = 100.05.
     Budget = 50% of 10000.00 = 5000.00.
-    Notional = round_half_even(5000 * 10000/10010) = round_half_even(4995.004995...) = 4995.00.
-    Commission = 5000.00 - 4995.00 = 5.00. Quantity = 4995.00 / 100.05.
+    Room = round_half_even(5000 * 10000/10010) = round_half_even(4995.004995...) = 4995.00.
+    Quantity = floor(4995.00 / 100.05) to 1e-12.
+    Notional = round_half_even(quantity * 100.05) = 4995.00.
+    Commission = round_half_even(4995.00 * 10/10000) = round_half_even(4.995) = 5.00.
     Cash left = 5000.00.
     Equity marked at close 100 = round_half_even(5000 + quantity * 100) = 9992.50.
 
@@ -1825,12 +1830,23 @@ def test_fill_quantity_rounds_down_not_half_even() -> None:
 
 
 def test_floor_qty_stays_down_past_fifty_digits() -> None:
-    """A 61-digit unit count. ``scaleb`` in a 50-digit context would drop the tail."""
+    """A 61-digit unit count. ``scaleb`` keeps the tail when the context can hold it."""
     units = 10**60 + 5
-    floored = floor_qty(Fraction(units, 10**12))
+    with localcontext() as ctx:
+        ctx.prec = 80
+        floored = floor_qty(Fraction(units, 10**12))
     exact = Decimal((0, tuple(map(int, str(units))), -12))
     assert floored == exact
     assert str(floored).endswith("000000000005")
+
+
+def test_floor_qty_rejects_a_quantity_the_context_cannot_hold() -> None:
+    units = 10**60 + 5
+    with localcontext() as ctx:
+        ctx.prec = 50
+        with pytest.raises(BacktestError, match="61 digits") as caught:
+            floor_qty(Fraction(units, 10**12))
+    assert "do not match" not in caught.value.message
 
 
 def test_commission_is_clamped_when_the_room_rounds_up() -> None:
@@ -2102,3 +2118,178 @@ def test_a_same_bar_reenter_after_an_oco_fill_anchors_a_new_pair() -> None:
     assert result.fills[1].price == Decimal("95")
     assert result.fills[3].price == Decimal("91.2")
     assert result.final_positions == ()
+
+
+def test_exactly_200_000_slots_pass_the_cap_and_200_001_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``>`` accepts 200,000. ``>=`` would reject it. 200,001 never builds the grid."""
+
+    def stop(*_args, **_kwargs):
+        raise RuntimeError("past the cap")
+
+    monkeypatch.setattr(engine, "_walk", stop)
+    document = _strategy()
+    span = (engine.MAX_GRID_BARS - 1) * 60
+    with pytest.raises(RuntimeError, match="past the cap"):
+        run_backtest(document, {"sol": [_bar(0, 1), _bar(span, 1)]})
+    tracemalloc.start()
+    try:
+        with pytest.raises(BacktestError) as caught:
+            run_backtest(
+                document,
+                {"sol": [_bar(0, 1), _bar(engine.MAX_GRID_BARS * 60, 1)]},
+            )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert caught.value.code == "grid_too_large"
+    # The allocated grid of 200,001 stamps is about 30 MB. The check is first.
+    assert peak < 2_000_000
+
+
+def test_a_year_of_one_minute_slots_is_rejected_before_the_grid() -> None:
+    document = _strategy()
+    year = 365 * 86400
+    started = time.perf_counter()
+    with pytest.raises(BacktestError) as caught:
+        run_backtest(document, {"sol": [_bar(0, 1.0), _bar(year, 1.0)]})
+    assert time.perf_counter() - started < 1
+    assert caught.value.code == "grid_too_large"
+
+
+def test_the_engine_ignores_a_caller_inexact_trap() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    bars = [_bar(0, 3)]
+    plain = run_backtest(document, {"sol": bars})
+    with localcontext() as ctx:
+        ctx.traps[Inexact] = True
+        trapped = run_backtest(document, {"sol": bars})
+        assert getcontext().traps[Inexact]
+    assert trapped.fills[0].qty == plain.fills[0].qty == Decimal("1666.666666666666")
+
+
+def test_the_engine_context_keeps_the_full_emin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fill runs under the engine's own ``Emin``, which is the decimal minimum.
+
+    ``Decimal('1666.666666666666')`` has adjusted exponent 3, so forcing the
+    engine's ``Emin`` to -5 does not change this quantity. The guard reads the
+    context the fill actually uses.
+    """
+    seen: list[int] = []
+    real = engine.floor_qty
+
+    def watch(amount: Fraction) -> Decimal:
+        seen.append(getcontext().Emin)
+        return real(amount)
+
+    monkeypatch.setattr(engine, "floor_qty", watch)
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    result = run_backtest(document, {"sol": [_bar(0, 3)]})
+    assert seen
+    assert set(seen) == {MIN_EMIN}
+    assert result.fills[0].qty == Decimal("1666.666666666666")
+
+
+def test_the_engine_ignores_a_caller_emin() -> None:
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+        actions=[
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 50},
+                "risk": _risk(100, 99),
+            }
+        ],
+    )
+    bars = [_bar(0, 3)]
+    plain = run_backtest(document, {"sol": bars})
+    with localcontext() as ctx:
+        ctx.Emin = -5
+        trapped = run_backtest(document, {"sol": bars})
+    assert trapped.fills[0].qty == plain.fills[0].qty == Decimal("1666.666666666666")
+
+
+def test_a_quantity_past_context_precision_is_a_clear_error() -> None:
+    """One buy. 1e12 capital at about 1.2e-27 is more than 50 digits of units."""
+    document = _strategy(
+        capital={"initial": 1_000_000_000_000, "currency": "USDC"},
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": {"op": "lit", "value": True}}],
+    )
+    with pytest.raises(BacktestError) as caught:
+        run_backtest(document, {"sol": [_bar(0, 1.2e-27)]})
+    assert "precision" in caught.value.message
+    assert "do not match" not in caught.value.message
+
+
+def test_indicator_lints_stay_on_the_run_that_produced_them() -> None:
+    """Two threads. Flat stochastic lints do not land on the quiet run."""
+    import warnings
+    from concurrent.futures import ThreadPoolExecutor
+
+    flat = _strategy(
+        derived_series=[
+            {
+                "id": "stoch_k",
+                "kind": "indicator",
+                "indicator": "stochastic",
+                "source": "close",
+                "output": "k",
+                "params": {"k_period": 1, "d_period": 1},
+            }
+        ]
+    )
+    quiet = _strategy()
+    flat_bars = [_bar(0, 1.0), _bar(60, 1.5, high=2.0, low=0.5)]
+    quiet_bars = [_bar(0, 1.0), _bar(60, 2.0)]
+    before = list(warnings.filters)
+
+    def one(kind: str) -> tuple[str, ...]:
+        if kind == "flat":
+            return run_backtest(flat, {"sol": flat_bars}).lints
+        return run_backtest(quiet, {"sol": quiet_bars}).lints
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(one, "flat" if index % 2 == 0 else "quiet") for index in range(40)]
+        results = [item.result() for item in futures]
+    assert warnings.filters == before
+    for index, lints in enumerate(results):
+        if index % 2 == 0:
+            assert any("highest high equals the lowest low" in note for note in lints)
+        else:
+            assert lints == ()
+            assert not any("highest high" in note for note in lints)

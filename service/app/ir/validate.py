@@ -22,6 +22,7 @@ from jsonschema.exceptions import ValidationError
 
 from app.expr import ExprError, ExprType, from_ir
 from app.ir.constants import BUILTIN_SERIES
+from app.ir.depth import JsonShapeError, check_json_value
 
 SCHEMA_FILENAME = "strategy-ir-v1.schema.json"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -61,6 +62,10 @@ def _load_schema_cached() -> dict[str, Any]:
 
 def validate_ir(document: Any, schema: Mapping[str, Any] | None = None) -> list[IRIssue]:
     """Return readable issues. An empty list means the document is valid IR v1."""
+    try:
+        check_json_value(document)
+    except JsonShapeError as exc:
+        return [IRIssue(exc.path, exc.code, exc.message)]
     if not isinstance(document, dict):
         return [IRIssue("$", "type", "strategy IR must be a JSON object")]
 

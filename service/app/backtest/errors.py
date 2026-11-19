@@ -8,4 +8,20 @@ from __future__ import annotations
 
 
 class BacktestError(ValueError):
-    """The run could not start, or a bar was not usable."""
+    """The run could not start, or a bar was not usable.
+
+    ``code`` is a stable token for the job API. ``path`` is a JSONPath when
+    the failure points at one place in the document.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "backtest_error",
+        path: str | None = None,
+    ) -> None:
+        self.message = message
+        self.code = code
+        self.path = path
+        super().__init__(message)

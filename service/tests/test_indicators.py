@@ -407,3 +407,21 @@ def test_indicator_package_does_not_import_a_reference_library() -> None:
     assert "pandas" not in lowered
     assert "http://" not in lowered
     assert "https://" not in lowered
+
+
+def test_an_infinite_sma_is_indicator_non_finite() -> None:
+    with pytest.raises(IndicatorError) as caught:
+        sma([1e308, 1e308], 2)
+    assert caught.value.code == "indicator_non_finite"
+
+
+def test_an_unrepresentable_input_is_indicator_overflow() -> None:
+    with pytest.raises(IndicatorError) as caught:
+        sma([10**400, 1], 1)
+    assert caught.value.code == "indicator_overflow"
+
+
+def test_bollinger_overflow_is_indicator_overflow() -> None:
+    with pytest.raises(IndicatorError) as caught:
+        bollinger([1e200, 1.0], 2, 2)
+    assert caught.value.code == "indicator_overflow"

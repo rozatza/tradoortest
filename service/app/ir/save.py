@@ -12,6 +12,7 @@ from typing import Any
 
 from app.ir.canonical import canonicalize, ir_hash
 from app.ir.constants import IR_VERSION
+from app.ir.depth import check_json_value
 
 FORMAT = "tradoor.strategy"
 FORMAT_VERSION = "1"
@@ -56,6 +57,7 @@ def save_document(document: Mapping[str, Any]) -> dict[str, Any]:
 
 def load_document(saved: Mapping[str, Any]) -> dict[str, Any]:
     """Return the canonical IR after checking format, version, and hash."""
+    check_json_value(saved)
     if not isinstance(saved, Mapping):
         raise SaveError("save document must be an object", code="invalid_save")
     if saved.get("format") != FORMAT or saved.get("format_version") != FORMAT_VERSION:

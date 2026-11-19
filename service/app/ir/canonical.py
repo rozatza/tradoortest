@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from app.ir.constants import DOCUMENT_KEYS, INDICATOR_PARAMS
+from app.ir.depth import check_json_value
 
 _STRATEGY_KEYS = ("id", "name", "description")
 _ENGINE_KEYS = ("bar_size", "event", "fill_price_mode", "warmup_bars")
@@ -76,6 +77,7 @@ def format_number(value: int | float) -> str:
 
 def canonicalize(document: Mapping[str, Any]) -> dict[str, Any]:
     """Return a new document with stable key order and canonical numbers."""
+    check_json_value(document)
     if not isinstance(document, Mapping):
         raise TypeError("strategy IR must be a JSON object")
     return _ordered(

@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import math
 import sys
-import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.indicators.boundary import as_float_series, as_period
-from app.indicators.errors import IndicatorError, IndicatorLint
+from app.indicators.errors import IndicatorError
+from app.indicators.lints import emit_lint
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +73,7 @@ def sma(values: Sequence[float], period: int) -> list[float]:
         for index in range(start + period - 1, end):
             window = data[index - period + 1 : index + 1]
             out[index] = sum(window) / period
-    return out
+    return _finite_output(out, "sma")
 
 
 def sma_warmup(period: int) -> int:
@@ -100,7 +100,7 @@ def ema(values: Sequence[float], period: int) -> list[float]:
         for index in range(start + period, end):
             prev = (data[index] - prev) * alpha + prev
             out[index] = prev
-    return out
+    return _finite_output(out, "ema")
 
 
 def ema_warmup(period: int) -> int:
@@ -170,7 +170,7 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
                 avg_loss = (avg_loss * (period - 1) + loss) / period
             out[index] = _rsi_point(avg_gain, avg_loss, warned)
             warned = warned or _flat_rsi(avg_gain, avg_loss)
-    return out
+    return _finite_output(out, "rsi")
 
 
 def rsi_warmup(period: int) -> int:
@@ -213,7 +213,7 @@ def atr(
         for index in range(start + period + 1, end):
             prev = (prev * (period - 1) + _true_range(highs, lows, closes, index)) / period
             out[index] = prev
-    return out
+    return _finite_output(out, "atr")
 
 
 def atr_warmup(period: int) -> int:
@@ -252,7 +252,11 @@ def macd(
     for index, (line_value, signal_value) in enumerate(zip(line, signal_line, strict=True)):
         if math.isfinite(line_value) and math.isfinite(signal_value):
             histogram[index] = line_value - signal_value
-    return Macd(line, signal_line, histogram)
+    return Macd(
+        _finite_output(line, "macd"),
+        _finite_output(signal_line, "macd"),
+        _finite_output(histogram, "macd"),
+    )
 
 
 def macd_warmup(fast: int, slow: int, signal: int) -> tuple[int, int, int]:
@@ -283,11 +287,21 @@ def bollinger(values: Sequence[float], period: int, stddev: float) -> Bollinger:
         if not math.isfinite(mid):
             continue
         window = data[index - period + 1 : index + 1]
-        var = sum((sample - mid) ** 2 for sample in window) / period
-        sd = math.sqrt(var)
-        upper[index] = mid + width * sd
-        lower[index] = mid - width * sd
-    return Bollinger(upper, middle, lower)
+        try:
+            var = sum((sample - mid) ** 2 for sample in window) / period
+            sd = math.sqrt(var)
+            upper[index] = mid + width * sd
+            lower[index] = mid - width * sd
+        except OverflowError as exc:
+            raise IndicatorError(
+                "bollinger overflowed",
+                code="indicator_overflow",
+            ) from exc
+    return Bollinger(
+        _finite_output(upper, "bollinger"),
+        _finite_output(middle, "bollinger"),
+        _finite_output(lower, "bollinger"),
+    )
 
 
 def bollinger_warmup(period: int) -> int:
@@ -337,16 +351,15 @@ def stochastic(
         span = highest - lowest
         if span == 0.0:
             if not warned:
-                warnings.warn(
+                emit_lint(
                     "Stochastic %K is NaN because the highest high equals the lowest low. "
                     "TA-Lib returns 0 for this zero range.",
-                    IndicatorLint,
                     stacklevel=2,
                 )
                 warned = True
             continue
         k[index] = 100.0 * (price - lowest) / span
-    return Stochastic(k, sma(k, d_length))
+    return Stochastic(_finite_output(k, "stochastic"), sma(k, d_length))
 
 
 def stochastic_warmup(k_period: int, d_period: int) -> tuple[int, int]:
@@ -382,10 +395,9 @@ def _flat_rsi(avg_gain: float, avg_loss: float) -> bool:
 def _rsi_point(avg_gain: float, avg_loss: float, already_warned: bool) -> float:
     if _flat_rsi(avg_gain, avg_loss):
         if not already_warned:
-            warnings.warn(
+            emit_lint(
                 "RSI is NaN because average gain and average loss are both 0. "
                 "TA-Lib returns 0 for this fully flat window.",
-                IndicatorLint,
                 stacklevel=3,
             )
         return math.nan
@@ -417,7 +429,24 @@ def _band_width(value: object) -> float:
 
 
 def _series(values: object, name: str) -> list[float]:
-    return as_float_series(values, name)
+    try:
+        return as_float_series(values, name)
+    except OverflowError as exc:
+        raise IndicatorError(
+            f"{name} is too large to use as an indicator input",
+            code="indicator_overflow",
+        ) from exc
+
+
+def _finite_output(values: list[float], name: str) -> list[float]:
+    """NaN is a gap. An infinity is not a result this library returns."""
+    for index, value in enumerate(values):
+        if isinstance(value, float) and math.isinf(value):
+            raise IndicatorError(
+                f"{name} result at index {index} is not finite",
+                code="indicator_non_finite",
+            )
+    return values
 
 
 def _same_length(names: tuple[str, ...], series: tuple[list[float], ...]) -> None:
