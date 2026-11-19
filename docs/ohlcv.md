@@ -2,7 +2,7 @@
 
 SOL and four other native Solana assets. Bars are 1 minute through 1 day. The store is a local SQLite file. Gaps stay gaps.
 
-This is one user. Each row has `user_id` (the auth seam's `local-user` unless `--user-id` is set). There is no account list and no sharing. There are no wallets, keys, signatures, or swaps.
+This is one user. Each row has `user_id`, always the auth seam's `local-user`. The CLI does not take a user id. There is no account list and no sharing. There are no wallets, keys, signatures, or swaps.
 
 ## Provider
 
@@ -16,11 +16,11 @@ This is one user. Each row has `user_id` (the auth seam's `local-user` unless `-
 | Price | `currency=usd` and `token=<mint>`, so the series is that mint in USD even when the pool's quote asset is SOL. |
 | Volume | The USD volume figure GeckoTerminal returns on that candle. It is that pool's volume, not a CEX print, and it is not comparable across pools. |
 | Page size | 1000 candles. |
-| Rate | CoinGecko documents about 5 calls per minute for the keyless pool (shared by IP, and it moves). The CLI waits 12 seconds between calls. HTTP 429 backs off and retries. The error text is the status code only. Response headers are not stored or logged. |
-| History | A call returns at most about six months. `before_timestamp` pages older than that. CoinGecko's Basic / keyless historical access is about the past six months. Analyst and above goes back to September 2021, depending on when the pool was tracked. This project does not use a paid plan. |
+| Rate | CoinGecko documents about 5 calls per minute for the keyless pool (shared by IP, and it moves). The CLI waits 12 seconds between calls. HTTP 429, HTTP 5xx, and timeouts back off and retry, at most five attempts. A connect or DNS failure is reported once and is not retried. The error text does not include the response body. Response headers are not stored or logged. |
+| History | The public API serves about the past 180 days. `--days` above 180 exits before any request, with that limit in the message. A 401 from the API is reported the same way, not as a bare status code. Analyst and above goes back to September 2021, depending on when the pool was tracked. This project does not use a paid plan. |
 | Empty minutes | Omitted. The request never sets `include_empty_intervals`. That flag would copy the previous close forward and set volume to 0. That is forward-fill, and it is not used. |
 
-90 days of 1-minute bars was checked on 2026-11-19. For each pool below, a 1-minute candle existed at or within 10 minutes before 2026-08-21. A full backfill is about 130 requests per asset (90 × 1440 / 1000). Five assets is about 650 requests, about 130 minutes at a 12-second gap. Stop and run the command again: minutes already stored are not requested again.
+90 days of 1-minute bars was checked on 2026-11-19. For each pool below, a 1-minute candle existed at or within 10 minutes before 2026-08-21. A full backfill is about 130 requests per asset (90 × 1440 / 1000), because each asset is one contiguous unfetched span, paged at 1000 candles. Five assets is about 650 requests, about 130 minutes at a 12-second gap. Each page is committed before the next request. Stop and run the command again: spans already fetched are not requested again. A minute inside a fetched span with no candle had no trades. It is not a hole to refetch.
 
 CoinGecko asks for attribution when this data is displayed. This repository stores it and does not render it. A later UI has to add that attribution.
 
@@ -93,10 +93,10 @@ The window is at least `--days` long (default 90). It is floored to the coarsest
 Every 1m candle is checked. A failure is listed on the report and the candle is not stored. No field is rewritten.
 
 - open, high, low, close, and volume are finite
-- each of those is `>= 0` and `<= 1e15` (`1e15` itself is allowed)
+- each price is `> 0` and `<= 1e15` (`1e15` itself is allowed). A price of 0 is rejected
+- volume is finite, `>= 0`, and `<= 1e15`. A zero-volume bar is kept
 - `high >= max(open, close) >= min(open, close) >= low`
 - `open_time` is an integer on the timeframe grid
-- volume is finite and `>= 0`
 
 `1e15` is the ceiling because an input above about `1e154` overflows the Bollinger square and makes SMA, EMA, and ATR non-finite. The indicator functions do not clamp. See `docs/dsl-spec.md`.
 
@@ -114,7 +114,7 @@ The primary key is `(user_id, mint, timeframe, open_time)`. Inserting the same k
 
 ## Gap report
 
-The CLI prints JSON. `forward_filled` is always false. Counts are per symbol and timeframe. `gaps` are half-open ranges. `rejected` is the list of candles that failed a check.
+The CLI prints JSON. `forward_filled` is always false. Counts are per symbol and timeframe. `gaps` are half-open ranges of minutes that were not stored. On a 1m series, `unfetched` and `unfetched_gaps` are the spans a later run will still request. `no_trade` and `no_trade_gaps` are minutes inside a span that was already fetched and came back without a candle. A rejected minute is in `rejected`. It is not a no-trade minute and it is not refetched. `missing` is `expected - present`, so it counts unfetched minutes, no-trade minutes, and rejected minutes together. Resampled timeframes leave the unfetched / no-trade split at zero; their `gaps` are buckets the 1m set did not complete.
 
 Synthetic example (not a live response). SOL, five 1-minute slots, two good candles, one candle whose high does not cover the close, and two minutes the source never returned:
 
@@ -134,11 +134,26 @@ Synthetic example (not a live response). SOL, five 1-minute slots, two good cand
       "expected": 5,
       "present": 2,
       "missing": 3,
+      "unfetched": 0,
+      "no_trade": 2,
       "gaps": [
         {
           "start": "2026-01-01T00:01:00Z",
           "end": "2026-01-01T00:03:00Z",
           "missing": 2
+        },
+        {
+          "start": "2026-01-01T00:04:00Z",
+          "end": "2026-01-01T00:05:00Z",
+          "missing": 1
+        }
+      ],
+      "unfetched_gaps": [],
+      "no_trade_gaps": [
+        {
+          "start": "2026-01-01T00:02:00Z",
+          "end": "2026-01-01T00:03:00Z",
+          "missing": 1
         },
         {
           "start": "2026-01-01T00:04:00Z",
@@ -157,7 +172,7 @@ Synthetic example (not a live response). SOL, five 1-minute slots, two good cand
 }
 ```
 
-The 00:01 candle is both rejected and inside the first gap. It was not repaired.
+The 00:01 candle is both rejected and inside the first gap. It was not repaired. 00:02 and 00:04 are no-trade minutes: the window was fetched, and those minutes had no candle. A later run does not request them.
 
 ## Run the backfill
 
@@ -178,7 +193,7 @@ Useful flags:
   --report data/gap-report.json
 ```
 
-`--symbols` is case-insensitive. `python -m app.ohlcv` is the same command.
+`--symbols` is case-insensitive. An empty list, such as `--symbols ,`, exits non-zero. `python -m app.ohlcv` is the same command. A connect failure, a timeout that exhausts its retries, an unwritable data directory, `--data-dir /dev/null`, a report path whose parent is not a directory, and a SQLite error each exit non-zero with one line on stderr and no traceback.
 
 ## Environment
 
@@ -190,4 +205,4 @@ There is no provider API key variable. `.env.example` lists the name and has no 
 
 ## Tests
 
-`make test` does not call the network. `service/tests/conftest.py` blocks `socket` connects and DNS for every test. The adapter tests use `httpx.MockTransport` and the committed fixture `service/tests/fixtures/ohlcv/geckoterminal_minute.json`, which is synthetic: no headers, no key, no account id.
+`make test` does not call the network. `service/tests/conftest.py` blocks `socket.connect`, `socket.connect_ex`, `socket.create_connection`, and DNS for every test. The adapter tests use `httpx.MockTransport` and the committed fixture `service/tests/fixtures/ohlcv/geckoterminal_minute.json`, which is synthetic: no headers, no key, no account id.

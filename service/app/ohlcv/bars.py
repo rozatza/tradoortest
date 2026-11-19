@@ -58,8 +58,8 @@ def validate_bar(bar: Bar) -> list[str]:
 
     - ``mint`` is a non-empty string and ``timeframe`` is one of the six.
     - ``open_time`` is an integer on that timeframe's UTC epoch grid.
-    - open, high, low, close, and volume are finite.
-    - each of those values is ``>= 0`` and ``<= 1e15``.
+    - open, high, low, close, and volume are finite and ``<= 1e15``.
+    - each price is ``> 0``. Volume may be ``0``.
     - ``high >= max(open, close) >= min(open, close) >= low``.
     """
     reasons: list[str] = []
@@ -84,6 +84,9 @@ def validate_bar(bar: Bar) -> list[str]:
             continue
         if value < 0.0:
             reasons.append(f"{name} is negative")
+            continue
+        if name != "volume" and value == 0.0:
+            reasons.append(f"{name} must be greater than 0")
             continue
         if value > MAX_ABS_VALUE:
             reasons.append(f"{name} is above 1e15")

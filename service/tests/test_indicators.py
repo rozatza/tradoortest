@@ -222,6 +222,21 @@ def test_flat_rsi_and_zero_range_stochastic_are_nan() -> None:
     assert bands.lower[3:] == [7.0] * 9
 
 
+def test_rsi_does_not_drift_toward_50_on_a_very_long_flat_run() -> None:
+    # Period 3 underflows Wilder state after roughly two thousand flat bars.
+    # The ratio after the move has to stay put, including past that point.
+    prices = [10.0, 12.0, 11.0, 13.0] + [13.0] * 20_000
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        values = rsi(prices, 3)
+    assert not any(issubclass(item.category, IndicatorLint) for item in caught)
+    held = values[3]
+    assert math.isfinite(held)
+    assert held != 50.0
+    assert values[-1] == held
+    assert not math.isnan(values[-1])
+
+
 def test_rsi_holds_its_last_value_when_the_market_goes_flat_after_a_move() -> None:
     # Period 2. Changes +2, -2, then two flat bars. The ratio stays 50.
     with warnings.catch_warnings(record=True) as caught:

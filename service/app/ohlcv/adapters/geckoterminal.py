@@ -5,6 +5,9 @@ documents about 5 calls per minute for the keyless pool, 1000 candles per
 call, and about six months of history on the free tier. This client spaces
 calls 12 seconds apart and never sends ``include_empty_intervals`` (that
 flag copies the previous close forward). Empty minutes stay missing.
+HTTP 429, HTTP 5xx, and timeouts retry with a bounded backoff. A connect
+or DNS failure is a ``SourceError`` and is not retried. The public API
+only serves about 180 days; a 401 is reported as that limit.
 
 1m is fetched natively. Higher timeframes are resampled from those 1m bars.
 A mint that is not in ``POOLS`` raises ``UnknownMint``. A later source can
@@ -18,7 +21,8 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -32,7 +36,7 @@ from app.ohlcv.bars import (
 from app.ohlcv.errors import SourceError, UnknownMint
 from app.ohlcv.registry import BONK_MINT, JTO_MINT, JUP_MINT, SOL_MINT, WIF_MINT
 from app.ohlcv.resample import resample
-from app.ohlcv.source import FetchResult
+from app.ohlcv.source import FetchPage, FetchResult
 
 BASE_URL = "https://api.geckoterminal.com/api/v2"
 # Chosen 2026-11-19. Each pool was created more than 90 days earlier and
@@ -49,6 +53,13 @@ POOLS: dict[str, str] = {
 
 _PAGE_LIMIT = 1000
 _ATTEMPTS = 5
+# Live probe on 2026-11-19: a window of 181 days returned 200, and 185 days
+# returned 401. ``--days`` above this fails before any request.
+PUBLIC_HISTORY_DAYS = 180
+PUBLIC_HISTORY_MESSAGE = (
+    "the public GeckoTerminal API only serves about 180 days of history; "
+    "--days must be 180 or less"
+)
 
 
 class _Pace:
@@ -112,9 +123,9 @@ class GeckoTerminalSource:
             raise SourceError(f"timeframe {timeframe!r} is not supported")
         if start < 0 or end < start:
             raise SourceError("bar window is invalid")
+        minutes = self._collect_minutes(mint, start, end)
         if timeframe == "1m":
-            return self._fetch_minutes(mint, start, end)
-        minutes = self._fetch_minutes(mint, start, end)
+            return minutes
         rejected = list(minutes.rejected)
         good: list[Bar] = []
         for bar in minutes.bars:
@@ -133,7 +144,29 @@ class GeckoTerminalSource:
         ]
         return FetchResult(resampled, rejected)
 
-    def _fetch_minutes(self, mint: str, start: int, end: int) -> FetchResult:
+    def fetch_pages(self, mint: str, timeframe: str, start: int, end: int) -> Iterator[FetchPage]:
+        """Yield one HTTP page at a time. The caller commits each page.
+
+        A later page that fails does not un-yield the pages already returned.
+        Coverage is the span this response answered, not only the minutes
+        that contained a trade.
+        """
+        if timeframe != "1m":
+            raise SourceError("fetch_pages is only defined for 1m")
+        if start < 0 or end < start:
+            raise SourceError("bar window is invalid")
+        yield from self._minute_pages(mint, start, end)
+
+    def _collect_minutes(self, mint: str, start: int, end: int) -> FetchResult:
+        bars: list[Bar] = []
+        rejected: list[BarRejection] = []
+        for page in self._minute_pages(mint, start, end):
+            bars.extend(page.bars)
+            rejected.extend(page.rejected)
+        bars.sort(key=lambda bar: bar.open_time)
+        return FetchResult(bars, rejected)
+
+    def _minute_pages(self, mint: str, start: int, end: int) -> Iterator[FetchPage]:
         pool = self._pools.get(mint)
         if pool is None:
             raise UnknownMint(
@@ -141,11 +174,9 @@ class GeckoTerminalSource:
                 "A later source can accept this mint in fetch_bars without changing callers."
             )
         if start == end:
-            return FetchResult([], [])
-        by_time: dict[int, Bar] = {}
-        rejected: list[BarRejection] = []
-        conflicts: set[int] = set()
+            return
         before = end - 1
+        page_hi = end
         span = end - start
         page_budget = max(2, math.ceil(span / 60 / self._page_limit) + 3)
         pages = 0
@@ -154,45 +185,22 @@ class GeckoTerminalSource:
             candles = _ohlcv_list(payload)
             pages += 1
             if not candles:
-                break
-            oldest: int | None = None
-            for index, candle in enumerate(candles):
-                bar, rejection, stamp = _parse_candle(candle, mint, index)
-                if stamp is not None:
-                    oldest = stamp if oldest is None else min(oldest, stamp)
-                if rejection is not None:
-                    rejected.append(rejection)
-                    continue
-                assert bar is not None
-                if bar.open_time < start or bar.open_time >= end:
-                    continue
-                previous = by_time.get(bar.open_time)
-                if previous is None:
-                    by_time[bar.open_time] = bar
-                elif previous != bar:
-                    conflicts.add(bar.open_time)
-            if oldest is None:
+                yield FetchPage([], [], start, page_hi)
+                return
+            parsed = _parse_page(candles, mint)
+            if parsed.oldest is None:
                 raise SourceError("GeckoTerminal page has no candle timestamps")
-            if oldest <= start or len(candles) < self._page_limit:
-                break
-            nxt = oldest - 1
+            finished = parsed.oldest <= start or len(candles) < self._page_limit
+            cover_lo = start if finished else parsed.oldest
+            yield _page_in_range(parsed, cover_lo, page_hi)
+            if finished:
+                return
+            nxt = parsed.oldest - 1
             if nxt >= before:
                 raise SourceError("GeckoTerminal pagination did not move backward")
             before = nxt
-        else:
-            raise SourceError("GeckoTerminal pagination stopped before the window was covered")
-        for open_time in conflicts:
-            by_time.pop(open_time, None)
-            rejected.append(
-                BarRejection(
-                    mint,
-                    "1m",
-                    open_time,
-                    ("conflicting candles for the same open_time",),
-                )
-            )
-        bars = [by_time[key] for key in sorted(by_time)]
-        return FetchResult(bars, rejected)
+            page_hi = parsed.oldest
+        raise SourceError("GeckoTerminal pagination stopped before the window was covered")
 
     def _get_json(self, pool: str, mint: str, before: int) -> dict[str, Any]:
         params = {
@@ -205,11 +213,26 @@ class GeckoTerminalSource:
         url = f"{BASE_URL}/networks/solana/pools/{pool}/ohlcv/minute"
         backoff = max(self._pace.interval, 1.0)
         last_status = 0
-        for _attempt in range(_ATTEMPTS):
+        for attempt in range(_ATTEMPTS):
             self._pace.wait()
-            response = self._http().get(url, params=params)
+            try:
+                response = self._http().get(url, params=params)
+            except httpx.TimeoutException as exc:
+                if attempt == _ATTEMPTS - 1:
+                    raise SourceError("GeckoTerminal request timed out") from exc
+                self._sleep(backoff)
+                backoff = min(backoff * 2, 120.0)
+                continue
+            except httpx.HTTPError as exc:
+                raise SourceError("GeckoTerminal request failed") from exc
             last_status = response.status_code
-            if response.status_code == 429:
+            if response.status_code == 401:
+                raise SourceError(
+                    "GeckoTerminal public API only serves about 180 days of history"
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == _ATTEMPTS - 1:
+                    raise SourceError(f"GeckoTerminal returned HTTP {response.status_code}")
                 self._sleep(backoff)
                 backoff = min(backoff * 2, 120.0)
                 continue
@@ -232,6 +255,61 @@ class GeckoTerminalSource:
             )
             self._owns_client = True
         return self._client
+
+
+@dataclass
+class _ParsedPage:
+    bars: dict[int, Bar]
+    rejected: list[BarRejection]
+    conflicts: set[int]
+    oldest: int | None
+
+
+def _parse_page(candles: list[Any], mint: str) -> _ParsedPage:
+    bars: dict[int, Bar] = {}
+    rejected: list[BarRejection] = []
+    conflicts: set[int] = set()
+    oldest: int | None = None
+    for index, candle in enumerate(candles):
+        bar, rejection, stamp = _parse_candle(candle, mint, index)
+        if stamp is not None:
+            oldest = stamp if oldest is None else min(oldest, stamp)
+        if rejection is not None:
+            rejected.append(rejection)
+            continue
+        assert bar is not None
+        previous = bars.get(bar.open_time)
+        if previous is None:
+            bars[bar.open_time] = bar
+        elif previous != bar:
+            conflicts.add(bar.open_time)
+    return _ParsedPage(bars, rejected, conflicts, oldest)
+
+
+def _page_in_range(parsed: _ParsedPage, start: int, end: int) -> FetchPage:
+    """Keep candles inside ``[start, end)`` and turn conflicts into rejections."""
+    rejected = [
+        item
+        for item in parsed.rejected
+        if item.open_time is None or start <= item.open_time < end
+    ]
+    kept: dict[int, Bar] = {}
+    for open_time, bar in parsed.bars.items():
+        if open_time < start or open_time >= end:
+            continue
+        if open_time in parsed.conflicts:
+            rejected.append(
+                BarRejection(
+                    bar.mint,
+                    "1m",
+                    open_time,
+                    ("conflicting candles for the same open_time",),
+                )
+            )
+            continue
+        kept[open_time] = bar
+    ordered = [kept[key] for key in sorted(kept)]
+    return FetchPage(ordered, rejected, start, end)
 
 
 def _ohlcv_list(payload: dict[str, Any]) -> list[Any]:

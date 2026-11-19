@@ -24,6 +24,7 @@ state at a gap and seed again from the next finite run.
 from __future__ import annotations
 
 import math
+import sys
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -117,6 +118,10 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
     RSI holds its last value when a market goes flat after a move. Only a
     fully flat window, where average gain and average loss are both 0, is
     NaN. That call also emits ``IndicatorLint``. TA-Lib returns 0 there.
+    A very long flat run would scale both Wilder averages down into the
+    subnormal range and drift the ratio toward 50. TA-Lib keeps scaling.
+    This function stops scaling once the next flat step would be subnormal
+    or would flush a non-zero average to 0, so the last value stays put.
     Average loss 0 with a positive average gain produces 100. The result is
     never infinite. A non-finite price is a gap and ends the run; the next
     value needs `period + 1` new finite prices. A flat window does not reset
@@ -148,8 +153,11 @@ def rsi(values: Sequence[float], period: int) -> list[float]:
             change = data[index] - data[index - 1]
             gain = change if change > 0.0 else 0.0
             loss = -change if change < 0.0 else 0.0
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
+            if gain == 0.0 and loss == 0.0:
+                avg_gain, avg_loss = _hold_if_subnormal(avg_gain, avg_loss, period)
+            else:
+                avg_gain = (avg_gain * (period - 1) + gain) / period
+                avg_loss = (avg_loss * (period - 1) + loss) / period
             out[index] = _rsi_point(avg_gain, avg_loss, warned)
             warned = warned or _flat_rsi(avg_gain, avg_loss)
     return out
@@ -336,6 +344,25 @@ def stochastic_warmup(k_period: int, d_period: int) -> tuple[int, int]:
     k_length = _period(k_period, "k_period")
     d_length = _period(d_period, "d_period")
     return k_length - 1, k_length + d_length - 2
+
+
+def _hold_if_subnormal(avg_gain: float, avg_loss: float, period: int) -> tuple[float, float]:
+    """Scale a flat step, unless that step would underflow either average.
+
+    Both averages use the same factor, so the ratio is unchanged until one
+    of them would become subnormal. Freezing both keeps that ratio. A later
+    non-zero change still uses the frozen averages.
+    """
+    scale = (period - 1) / period
+    nxt_gain = avg_gain * scale
+    nxt_loss = avg_loss * scale
+    if _underflows(avg_gain, nxt_gain) or _underflows(avg_loss, nxt_loss):
+        return avg_gain, avg_loss
+    return nxt_gain, nxt_loss
+
+
+def _underflows(previous: float, nxt: float) -> bool:
+    return previous != 0.0 and (nxt == 0.0 or abs(nxt) < sys.float_info.min)
 
 
 def _flat_rsi(avg_gain: float, avg_loss: float) -> bool:

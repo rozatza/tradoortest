@@ -86,3 +86,70 @@ def test_dicts_are_rejected_and_not_iterated_as_keys() -> None:
 def test_numpy_float_period_is_not_an_integer_period() -> None:
     with pytest.raises(IndicatorError, match="numpy integer"):
         period_from_numpy(NumpyFloat64(14.0), "period")
+
+
+class NumpyFloat32:
+    """Stand-in for ``numpy.float32``. The name contains ``float``."""
+
+    __module__ = "numpy"
+
+    def __int__(self) -> int:
+        return 14
+
+    def __float__(self) -> float:
+        return 14.0
+
+    def __eq__(self, other: object) -> bool:
+        return other == 14 or other == 14.0
+
+
+class NumpyBool:
+    """Stand-in for ``numpy.bool_``. The name contains ``bool``."""
+
+    __module__ = "numpy"
+
+    def __int__(self) -> int:
+        return 1
+
+    def __float__(self) -> float:
+        return 1.0
+
+    def __eq__(self, other: object) -> bool:
+        return other == 1 or other is True or other == 1.0
+
+
+class NumpyStr:
+    """Stand-in for ``numpy.str_``. ``float()`` would succeed and must not run."""
+
+    __module__ = "numpy"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __float__(self) -> float:
+        raise AssertionError("numpy string must be rejected before float()")
+
+
+class NumpyComplex:
+    """Stand-in for ``numpy.complex128``. ``float()`` warns and drops the imag part."""
+
+    __module__ = "numpy"
+
+    def __float__(self) -> float:
+        raise AssertionError("numpy complex must be rejected before float()")
+
+
+def test_period_from_numpy_rejects_float32_and_bool() -> None:
+    with pytest.raises(IndicatorError, match="numpy integer"):
+        period_from_numpy(NumpyFloat32(), "period")
+    with pytest.raises(IndicatorError, match="numpy integer"):
+        period_from_numpy(NumpyBool(), "period")
+
+
+def test_floats_from_numpy_rejects_str_and_complex() -> None:
+    with pytest.raises(IndicatorError, match="numbers"):
+        floats_from_numpy(NumpyArray([NumpyStr("1.5")]), "close")
+    with pytest.raises(IndicatorError, match="numbers"):
+        floats_from_numpy(NumpyArray([NumpyComplex()]), "close")
+    with pytest.raises(IndicatorError, match="numbers"):
+        floats_from_numpy([complex(1.0, 2.0)], "close")

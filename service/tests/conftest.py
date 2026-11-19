@@ -17,5 +17,6 @@ def _block_live_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise RuntimeError("live network is disabled in tests")
 
     monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
     monkeypatch.setattr(socket, "create_connection", blocked)
     monkeypatch.setattr(socket, "getaddrinfo", blocked)

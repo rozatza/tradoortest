@@ -29,9 +29,22 @@ def _bar(**overrides: object) -> Bar:
 
 def test_a_well_formed_bar_has_no_reasons() -> None:
     assert validate_bar(_bar()) == []
-    assert validate_bar(_bar(open=0.0, high=0.0, low=0.0, close=0.0, volume=0.0)) == []
-    ceiling = _bar(open=MAX_ABS_VALUE, high=MAX_ABS_VALUE, low=0.0, close=MAX_ABS_VALUE)
+    ceiling = _bar(
+        open=MAX_ABS_VALUE,
+        high=MAX_ABS_VALUE,
+        low=MAX_ABS_VALUE,
+        close=MAX_ABS_VALUE,
+    )
     assert validate_bar(ceiling) == []
+
+
+def test_non_positive_prices_are_rejected_and_zero_volume_is_kept() -> None:
+    assert "open must be greater than 0" in validate_bar(_bar(open=0.0))
+    zeros = _bar(open=0.0, high=0.0, low=0.0, close=0.0)
+    assert "high must be greater than 0" in validate_bar(zeros)
+    assert "low must be greater than 0" in validate_bar(_bar(low=0.0))
+    assert "close must be greater than 0" in validate_bar(_bar(close=0.0))
+    assert validate_bar(_bar(open=4.0, high=4.0, low=4.0, close=4.0, volume=0.0)) == []
 
 
 @pytest.mark.parametrize(

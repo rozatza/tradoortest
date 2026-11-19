@@ -1,14 +1,15 @@
 """Resumable backfill of 1m bars, then higher timeframes resampled locally.
 
-Running twice stores the same rows. The second run asks the source only
-for minutes that are still missing. A minute the source does not return
-stays missing and shows up in the gap report. Rejected bars are listed
-there too and are not repaired.
+Each successful page is committed before the next one is requested. The
+store records the half-open span that page covered. A later run requests
+only spans that were never fetched, as a few contiguous calls. A minute
+inside a fetched span with no candle had no trades. It is not requested
+again. Rejected bars stay rejected and are not repaired.
 
 Higher timeframes are rebuilt from the stored 1m bars for the window, so
 they do not add HTTP calls. A bucket that is short a minute is omitted.
 ``replace_window`` drops a previously stored higher-timeframe candle that
-the current 1m set no longer supports.
+the current 1m set no longer supports. That resample rule is unchanged.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections.abc import Sequence
@@ -24,12 +26,13 @@ from pathlib import Path
 
 from app.auth import LOCAL_USER_ID
 from app.ohlcv.adapters import open_source
+from app.ohlcv.adapters.geckoterminal import PUBLIC_HISTORY_DAYS, PUBLIC_HISTORY_MESSAGE
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, StoreError
-from app.ohlcv.gaps import SeriesReport, missing_ranges, series_report
+from app.ohlcv.gaps import GapRange, SeriesReport, series_report, unfetched_spans
 from app.ohlcv.registry import MAJORS, Asset, require_assets
 from app.ohlcv.resample import resample
-from app.ohlcv.source import OhlcvSource
+from app.ohlcv.source import FetchPage, OhlcvSource, iter_pages
 from app.ohlcv.store import BarStore, SqliteBarStore
 
 _DEFAULT_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
@@ -43,6 +46,8 @@ def plan_window(now: int, days: int, timeframes: Sequence[str]) -> tuple[int, in
     """
     if days < 1:
         raise ValueError("days must be at least 1")
+    if days > PUBLIC_HISTORY_DAYS:
+        raise ValueError(PUBLIC_HISTORY_MESSAGE)
     if not timeframes:
         raise ValueError("at least one timeframe is required")
     unknown = [item for item in timeframes if item not in TIMEFRAME_SECONDS]
@@ -89,6 +94,13 @@ def run_backfill(
             start=start,
             end=end,
         )
+        fetched = store.fetched_ranges(
+            user_id=user_id,
+            mint=asset.mint,
+            timeframe="1m",
+            start=start,
+            end=end,
+        )
         sections.append(
             series_report(
                 symbol=asset.symbol,
@@ -98,6 +110,7 @@ def run_backfill(
                 end=end,
                 present=present,
                 rejected=tuple(rejected),
+                fetched=fetched,
             )
         )
         if any(timeframe != "1m" for timeframe in ordered):
@@ -154,40 +167,72 @@ def _fill_minutes(
     end: int,
     user_id: str,
 ) -> list[BarRejection]:
-    present = store.open_times(
+    rejected = store.rejections(
         user_id=user_id,
         mint=asset.mint,
         timeframe="1m",
         start=start,
         end=end,
     )
-    rejected: list[BarRejection] = []
-    for lo, hi in missing_ranges(present, start, end, TIMEFRAME_SECONDS["1m"]):
-        fetched = source.fetch_bars(asset.mint, "1m", lo, hi)
-        rejected.extend(fetched.rejected)
-        good: list[Bar] = []
-        for bar in fetched.bars:
-            if bar.mint != asset.mint or bar.timeframe != "1m":
-                rejected.append(
-                    BarRejection(
-                        asset.mint,
-                        "1m",
-                        bar.open_time,
-                        ("candle does not match the requested mint and timeframe",),
-                    )
-                )
-                continue
-            if bar.open_time < lo or bar.open_time >= hi:
-                continue
-            reasons = validate_bar(bar)
-            if reasons:
-                rejected.append(
-                    BarRejection(bar.mint, bar.timeframe, bar.open_time, tuple(reasons))
-                )
-                continue
-            good.append(bar)
-        store.upsert(good, user_id=user_id)
+    seen = {(item.open_time, item.reasons) for item in rejected}
+    covered = store.fetched_ranges(
+        user_id=user_id,
+        mint=asset.mint,
+        timeframe="1m",
+        start=start,
+        end=end,
+    )
+    for lo, hi in unfetched_spans(covered, start, end):
+        for page in iter_pages(source, asset.mint, "1m", lo, hi):
+            good, page_rejected = _split_page(page, asset, lo, hi)
+            store.commit_page(
+                good,
+                page_rejected,
+                user_id=user_id,
+                mint=asset.mint,
+                timeframe="1m",
+                start=page.start,
+                end=page.end,
+            )
+            for item in page_rejected:
+                key = (item.open_time, item.reasons)
+                if key not in seen:
+                    rejected.append(item)
+                    seen.add(key)
     return rejected
+
+
+def _split_page(
+    page: FetchPage,
+    asset: Asset,
+    request_start: int,
+    request_end: int,
+) -> tuple[list[Bar], list[BarRejection]]:
+    if page.end < page.start or page.start < request_start or page.end > request_end:
+        raise SourceError("fetched page is outside the requested span")
+    if page.start == page.end:
+        return [], []
+    rejected = list(page.rejected)
+    good: list[Bar] = []
+    for bar in page.bars:
+        if bar.mint != asset.mint or bar.timeframe != "1m":
+            rejected.append(
+                BarRejection(
+                    asset.mint,
+                    "1m",
+                    bar.open_time,
+                    ("candle does not match the requested mint and timeframe",),
+                )
+            )
+            continue
+        if bar.open_time < page.start or bar.open_time >= page.end:
+            continue
+        reasons = validate_bar(bar)
+        if reasons:
+            rejected.append(BarRejection(bar.mint, bar.timeframe, bar.open_time, tuple(reasons)))
+            continue
+        good.append(bar)
+    return good, rejected
 
 
 def _timeframes(timeframes: Sequence[str]) -> tuple[str, ...]:
@@ -226,10 +271,11 @@ def _section(section: SeriesReport) -> dict[str, object]:
         "expected": section.expected,
         "present": section.present,
         "missing": section.missing,
-        "gaps": [
-            {"start": _iso(gap.start), "end": _iso(gap.end), "missing": gap.missing}
-            for gap in section.gaps
-        ],
+        "unfetched": section.unfetched,
+        "no_trade": section.no_trade,
+        "gaps": [_gap(gap) for gap in section.gaps],
+        "unfetched_gaps": [_gap(gap) for gap in section.unfetched_gaps],
+        "no_trade_gaps": [_gap(gap) for gap in section.no_trade_gaps],
         "rejected": [
             {
                 "open_time": None if item.open_time is None else _iso(item.open_time),
@@ -238,6 +284,10 @@ def _section(section: SeriesReport) -> dict[str, object]:
             for item in section.rejected
         ],
     }
+
+
+def _gap(gap: GapRange) -> dict[str, object]:
+    return {"start": _iso(gap.start), "end": _iso(gap.end), "missing": gap.missing}
 
 
 def _iso(timestamp: int) -> str:
@@ -270,7 +320,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="also write the gap report JSON to this path (keep it under data/)",
     )
-    parser.add_argument("--user-id", default=LOCAL_USER_ID, help="owner stored on each row")
     parser.add_argument("--provider", default="geckoterminal", help="OHLCV source name")
     return parser
 
@@ -285,42 +334,56 @@ def main(
     args = parser.parse_args(argv)
     if args.days < 1:
         parser.error("days must be at least 1")
+    symbols = [part.strip() for part in args.symbols.split(",") if part.strip()]
+    if not symbols:
+        print("at least one symbol is required", file=sys.stderr)
+        return 1
+    if args.days > PUBLIC_HISTORY_DAYS:
+        print(PUBLIC_HISTORY_MESSAGE, file=sys.stderr)
+        return 1
+    store: SqliteBarStore | None = None
+    active: OhlcvSource | None = None
+    owns_source = source is None
     try:
-        assets = require_assets([part for part in args.symbols.split(",") if part.strip()])
+        assets = require_assets(symbols)
         timeframes = tuple(part.strip() for part in args.timeframes.split(",") if part.strip())
         clock = int(time.time()) if now is None else now
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
         store = SqliteBarStore(data_dir / "ohlcv.sqlite")
-        owns_source = source is None
         active = open_source(args.provider) if source is None else source
-        try:
-            report = run_backfill(
-                source=active,
-                store=store,
-                assets=assets,
-                start=start,
-                end=end,
-                timeframes=timeframes,
-                user_id=args.user_id,
-                generated_at=clock,
-            )
-        finally:
-            store.close()
-            if owns_source:
-                close = getattr(active, "close", None)
-                if close is not None:
-                    close()
-    except (SourceError, StoreError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
+        report = run_backfill(
+            source=active,
+            store=store,
+            assets=assets,
+            start=start,
+            end=end,
+            timeframes=timeframes,
+            user_id=LOCAL_USER_ID,
+            generated_at=clock,
+        )
+        text = json.dumps(report, indent=2) + "\n"
+        if args.report is not None:
+            destination = Path(args.report)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text, encoding="utf-8")
+        sys.stdout.write(text)
+    except (SourceError, StoreError, ValueError, OSError, sqlite3.Error) as exc:
+        print(_one_line(exc), file=sys.stderr)
         return 1
-    text = json.dumps(report, indent=2) + "\n"
-    if args.report is not None:
-        destination = Path(args.report)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
-    sys.stdout.write(text)
+    finally:
+        if store is not None:
+            store.close()
+        if owns_source and active is not None:
+            close = getattr(active, "close", None)
+            if close is not None:
+                close()
     return 0
+
+
+def _one_line(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    return text[0] if text else exc.__class__.__name__
 
 
 if __name__ == "__main__":
