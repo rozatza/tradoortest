@@ -42,6 +42,6 @@ When multi-user auth exists, replace the body of `get_current_user`. Rows alread
 
 - Accounts, sessions, invites, or access-control lists.
 - Wallets, private keys, signing, transaction building, swaps, or order routing.
-- The strategy-file parser, indicator math, market data, or a backtester. Expression text is parsed by `service/app/expr`.
+- Indicator math, market data, or a backtester. Strategy files are parsed by `service/app/dsl`. Expression text is parsed by `service/app/expr`. A saved file uses the envelope in `docs/save-format.md`; `user_id` stays on the row and is not part of that envelope.
 
 `.env.example` has no values. Do not commit secrets.

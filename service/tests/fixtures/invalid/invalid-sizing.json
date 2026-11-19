@@ -1,0 +1,137 @@
+{
+  "ir_version": "1.0",
+  "strategy": {
+    "id": "rsi_cross_sol",
+    "name": "RSI cross",
+    "description": "Enter long when RSI crosses above 30. Exit the long when RSI crosses below 70."
+  },
+  "engine": {
+    "bar_size": "1h",
+    "event": "bar_close",
+    "fill_price_mode": "on_close",
+    "warmup_bars": 14
+  },
+  "capital": {
+    "initial": 10000,
+    "currency": "USDC"
+  },
+  "costs": {
+    "commission_bps": 10,
+    "slippage_bps": 5
+  },
+  "assets": [
+    {
+      "id": "sol",
+      "symbol": "SOL",
+      "chain": "solana",
+      "market": "spot",
+      "quote": "USDC"
+    }
+  ],
+  "derived_series": [
+    {
+      "id": "rsi_14",
+      "kind": "indicator",
+      "indicator": "rsi",
+      "source": "close",
+      "params": {
+        "period": 14
+      }
+    }
+  ],
+  "signals": [
+    {
+      "id": "rsi_buy",
+      "expr": {
+        "op": "cross_above",
+        "args": [
+          {
+            "op": "ref",
+            "name": "rsi_14"
+          },
+          {
+            "op": "lit",
+            "value": 30
+          }
+        ]
+      }
+    },
+    {
+      "id": "rsi_sell",
+      "expr": {
+        "op": "cross_below",
+        "args": [
+          {
+            "op": "ref",
+            "name": "rsi_14"
+          },
+          {
+            "op": "lit",
+            "value": 70
+          }
+        ]
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "enter_sol",
+      "type": "enter",
+      "side": "long",
+      "asset": "sol",
+      "order": {
+        "type": "market"
+      },
+      "sizing": {
+        "mode": "percent_equity",
+        "percent": 0
+      },
+      "risk": {
+        "type": "oco",
+        "evaluation": "on_entry_fill",
+        "movement": "tighten_only",
+        "take_profit": {
+          "mode": "percent",
+          "percent": 6
+        },
+        "stop_loss": {
+          "mode": "percent",
+          "percent": 3
+        }
+      }
+    },
+    {
+      "id": "exit_sol",
+      "type": "exit",
+      "side": "long",
+      "asset": "sol",
+      "order": {
+        "type": "market"
+      },
+      "sizing": {
+        "mode": "percent_position",
+        "percent": 100
+      }
+    }
+  ],
+  "rules": [
+    {
+      "id": "enter_on_rsi_buy",
+      "when": "rsi_buy",
+      "do": "enter_sol"
+    },
+    {
+      "id": "exit_on_rsi_sell",
+      "when": "rsi_sell",
+      "do": "exit_sol"
+    }
+  ],
+  "portfolio": {
+    "mode": "spot",
+    "direction": "long_only",
+    "chain": "solana",
+    "max_positions": 1,
+    "allow_pyramiding": false,
+    "quote_currency": "USDC"
+  }
+}

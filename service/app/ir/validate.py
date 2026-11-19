@@ -1,7 +1,10 @@
 """Validate strategy IR v1 documents.
 
-JSON Schema (draft 2020-12) runs first. Semantic reference checks run only
-after the document matches the schema, so a reported path is meaningful.
+JSON Schema (draft 2020-12) runs first. Semantic checks run only after the
+document matches the schema, so a reported path is meaningful. A few schema
+failures are reported under a specific code (`invalid_bar_size`,
+`invalid_sizing`, `insane_stop_loss`, `insane_take_profit`) instead of the
+generic JSON Schema keyword.
 """
 
 from __future__ import annotations
@@ -17,18 +20,13 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
+from app.expr import ExprError, ExprType, from_ir
+from app.ir.constants import BUILTIN_SERIES
+
 SCHEMA_FILENAME = "strategy-ir-v1.schema.json"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = REPO_ROOT / "schemas" / SCHEMA_FILENAME
-
-BUILTIN_SERIES = frozenset({"open", "high", "low", "close", "volume"})
 _REQUIRED_MESSAGE = re.compile(r"^'([^']+)' is a required property$")
-
-_UNARY = frozenset({"not", "neg"})
-_BINARY = frozenset(
-    {"add", "sub", "mul", "div", "gt", "gte", "lt", "lte", "eq", "neq", "and", "or"}
-)
-_CALLS = frozenset({"cross_above", "cross_below", "bars_since", "entry_price"})
 
 
 @dataclass(frozen=True)
@@ -67,7 +65,7 @@ def validate_ir(document: Any, schema: Mapping[str, Any] | None = None) -> list[
         return [IRIssue("$", "type", "strategy IR must be a JSON object")]
 
     compiled = Draft202012Validator(schema if schema is not None else load_schema())
-    issues = [_from_schema_error(error) for error in compiled.iter_errors(document)]
+    issues = [_specialize(_from_schema_error(error)) for error in compiled.iter_errors(document)]
     if issues:
         return sorted(issues, key=lambda issue: (issue.path, issue.keyword))
     return sorted(_semantic(document), key=lambda issue: (issue.path, issue.keyword))
@@ -103,31 +101,76 @@ def _join(base: str, prop: str) -> str:
     return f"{base}.{prop}"
 
 
+def _specialize(issue: IRIssue) -> IRIssue:
+    """Replace generic schema keywords with the documented strategy codes."""
+    if issue.path == "$.engine.bar_size" and issue.keyword == "enum":
+        return IRIssue(
+            issue.path,
+            "invalid_bar_size",
+            "bar_size must be one of 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d",
+        )
+    if issue.path.endswith(".sizing.percent") and issue.keyword in {"exclusiveMinimum", "maximum"}:
+        return IRIssue(
+            issue.path,
+            "invalid_sizing",
+            "sizing percent must be greater than 0 and at most 100",
+        )
+    if issue.path.endswith(".stop_loss.percent") and issue.keyword in {
+        "exclusiveMinimum",
+        "maximum",
+    }:
+        return IRIssue(
+            issue.path,
+            "insane_stop_loss",
+            "stop_loss percent must be greater than 0 and less than 100 "
+            "so a long stop stays above zero",
+        )
+    if issue.path.endswith(".take_profit.percent") and issue.keyword in {
+        "exclusiveMinimum",
+        "maximum",
+    }:
+        return IRIssue(
+            issue.path,
+            "insane_take_profit",
+            "take_profit percent must be greater than 0 and at most 100",
+        )
+    return issue
+
+
 def _semantic(document: Mapping[str, Any]) -> list[IRIssue]:
     issues: list[IRIssue] = []
-    asset_ids = _collect_ids(document["assets"], "$.assets", issues)
+    asset_ids = _check_assets(document["assets"], issues)
     series_ids = _check_series(document["derived_series"], issues)
     known_series = BUILTIN_SERIES | set(series_ids)
     signal_ids = _check_signals(document["signals"], known_series, issues)
     action_ids = _check_actions(document["actions"], set(asset_ids), issues)
     _check_rules(document["rules"], set(signal_ids), set(action_ids), issues)
+    _check_entry(document["rules"], document["actions"], issues)
+    _check_long_risk(document["actions"], issues)
     return issues
 
 
-def _collect_ids(items: list[dict[str, Any]], path: str, issues: list[IRIssue]) -> list[str]:
-    seen: list[str] = []
+def _check_assets(items: list[dict[str, Any]], issues: list[IRIssue]) -> list[str]:
+    seen_ids: list[str] = []
+    seen_symbols: list[str] = []
     for index, item in enumerate(items):
         ident = item["id"]
-        if ident in seen:
+        if ident in seen_ids:
+            issues.append(
+                IRIssue(f"$.assets[{index}].id", "duplicate_id", f"duplicate id '{ident}'")
+            )
+        seen_ids.append(ident)
+        symbol = item["symbol"]
+        if symbol in seen_symbols:
             issues.append(
                 IRIssue(
-                    f"{path}[{index}].id",
-                    "duplicate_id",
-                    f"duplicate id '{ident}'",
+                    f"$.assets[{index}].symbol",
+                    "duplicate_symbol",
+                    f"duplicate symbol '{symbol}'",
                 )
             )
-        seen.append(ident)
-    return seen
+        seen_symbols.append(symbol)
+    return seen_ids
 
 
 def _check_series(series_items: list[dict[str, Any]], issues: list[IRIssue]) -> list[str]:
@@ -167,13 +210,41 @@ def _check_signals(
     for index, signal in enumerate(signals):
         ident = signal["id"]
         path = f"$.signals[{index}]"
-        if ident in seen:
+        if ident in seen or ident in known_series:
             issues.append(IRIssue(f"{path}.id", "duplicate_id", f"duplicate id '{ident}'"))
-        known = set(known_series)
-        known.update(seen)
-        _walk_expr(signal["expr"], f"{path}.expr", known, issues)
+        names = {name: ExprType.NUMERIC for name in known_series}
+        names.update({name: ExprType.BOOLEAN for name in seen})
+        _check_signal_expr(signal["expr"], f"{path}.expr", names, issues)
         seen.append(ident)
     return seen
+
+
+def _check_signal_expr(
+    expr: Any,
+    path: str,
+    names: dict[str, ExprType],
+    issues: list[IRIssue],
+) -> None:
+    """Type-check a signal expression while resolving names.
+
+    Series in `names` are NUMERIC and earlier signals are BOOLEAN. `from_ir`
+    applies those types as it walks, so a signal used as a number fails here
+    rather than in a later pass that assumed every ref was numeric.
+    """
+    try:
+        node = from_ir(expr, names=names, path=path)
+    except ExprError as err:
+        issues.append(IRIssue(err.path or path, err.code or "type_error", err.message))
+        return
+    if node.result_type is not ExprType.BOOLEAN:
+        issues.append(
+            IRIssue(
+                path,
+                "type_error",
+                "type error: signal expression expects BOOLEAN, "
+                f"got {node.result_type.value}",
+            )
+        )
 
 
 def _check_actions(
@@ -233,30 +304,42 @@ def _check_rules(
         seen.append(ident)
 
 
-def _walk_expr(expr: Any, path: str, known: set[str], issues: list[IRIssue]) -> None:
-    if not isinstance(expr, dict):
+def _check_entry(
+    rules: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    issues: list[IRIssue],
+) -> None:
+    action_types = {action["id"]: action["type"] for action in actions}
+    if any(action_types.get(rule["do"]) == "enter" for rule in rules):
         return
-    op = expr.get("op")
-    if op == "ref":
-        name = expr.get("name")
-        if name not in known:
+    issues.append(IRIssue("$.rules", "missing_entry", "strategy has no entry rule"))
+
+
+def _check_long_risk(actions: list[dict[str, Any]], issues: list[IRIssue]) -> None:
+    """Reject a long stop that schema still allows.
+
+    Stop percent of 100 prices the stop at zero. Take-profit and stop-loss
+    percents outside (0, 100] / (0, 100) are schema errors and are renamed
+    in `_specialize`. This check covers the schema-valid stop of exactly 100.
+    """
+    for index, action in enumerate(actions):
+        risk = action.get("risk")
+        if not isinstance(risk, dict):
+            continue
+        stop = risk.get("stop_loss")
+        if not isinstance(stop, dict):
+            continue
+        percent = stop.get("percent")
+        if _is_number(percent) and percent >= 100:
             issues.append(
                 IRIssue(
-                    f"{path}.name",
-                    "unknown_series",
-                    f"unknown series reference '{name}'",
+                    f"$.actions[{index}].risk.stop_loss.percent",
+                    "insane_stop_loss",
+                    "stop_loss percent must be greater than 0 and less than 100 "
+                    "so a long stop stays above zero",
                 )
             )
-        return
-    if op in _UNARY:
-        _walk_expr(expr.get("arg"), f"{path}.arg", known, issues)
-        return
-    if op in _BINARY:
-        _walk_expr(expr.get("left"), f"{path}.left", known, issues)
-        _walk_expr(expr.get("right"), f"{path}.right", known, issues)
-        return
-    if op in _CALLS:
-        args = expr.get("args")
-        if isinstance(args, list):
-            for index, arg in enumerate(args):
-                _walk_expr(arg, f"{path}.args[{index}]", known, issues)
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)

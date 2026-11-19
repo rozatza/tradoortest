@@ -41,7 +41,9 @@ class Lit:
     def __post_init__(self) -> None:
         if isinstance(self.value, bool):
             expected = ExprType.BOOLEAN
-        elif isinstance(self.value, (int, float)) and math.isfinite(self.value):
+        elif isinstance(self.value, int):
+            expected = ExprType.NUMERIC
+        elif isinstance(self.value, float) and math.isfinite(self.value):
             expected = ExprType.NUMERIC
         else:
             raise TypeError("literal value must be a bool or a finite int or float")
@@ -157,6 +159,7 @@ def to_ir(node: Expr) -> dict[str, Any]:
             offset=node.span.offset,
             line=node.span.line,
             column=node.span.column,
+            code="invalid_expr",
         )
     raise TypeError(f"unknown expression node {type(node).__name__}")
 
