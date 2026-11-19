@@ -79,9 +79,11 @@ Capital 10000.00 USDC. Commission 10 bps. Slippage 5 bps. Enter 50% of equity. T
 
 Buy fill = 100 × 10005 / 10000 = 100.05.
 Budget = 5000.00.
-Notional = round half-even of 5000 × 10000 / 10010 = round half-even of 4995.004995… = 4995.00.
-Commission = 5000.00 − 4995.00 = 5.00.
-Quantity = 4995.00 / 100.05, rounded down to `1e-12`. The cents below are the half-even cents of that grid quantity.
+Room = round half-even of 5000 × 10000 / 10010 = round half-even of 4995.004995… = 4995.00.
+Quantity = 4995.00 / 100.05, rounded down to `1e-12`.
+Notional = round half-even of that quantity × 100.05 = 4995.00.
+Commission = round half-even of 4995.00 × 10 / 10000 = round half-even of 4.995 = 5.00.
+The cents below are the half-even cents of that grid quantity.
 Cash left = 5000.00.
 Equity at close 100 = round half-even of 5000 + quantity × 100 = 9992.50.
 
@@ -128,9 +130,11 @@ A pyramid does not move the anchor. The anchor stays the first entry fill, inclu
 The hand-computed pair is synthetic and lives in `service/tests/fixtures/backtest/hand_oco.json`. It is not a market print. Capital 10000. Commission 10 bps. Slippage 5 bps. Enter 100% on the first bar, close 100. Take-profit 10%, stop-loss 5%. The first bar's high is 200 and its low is 1. Those wicks are not read.
 
 Buy fill = 100 × 10005 / 10000 = 100.05.
-Notional = round half-even of 10000 × 10000 / 10010 = 9990.01.
-Commission = 10000 − 9990.01 = 9.99.
-Quantity = 9990.01 / 100.05, rounded down to `1e-12`. The cents below are unchanged.
+Room = round half-even of 10000 × 10000 / 10010 = 9990.01.
+Quantity = 9990.01 / 100.05, rounded down to `1e-12`.
+Notional = round half-even of that quantity × 100.05 = 9990.01.
+Commission = round half-even of 9990.01 × 10 / 10000 = round half-even of 9.99001 = 9.99.
+The cents below are unchanged.
 
 The next bar trades 100–115 and hits the take-profit only.
 Take-profit = 100.05 × 1.10 = 110.055.
@@ -152,4 +156,4 @@ Sell fill = 92 × 9995 / 10000 = 91.954. Notional = 9181.62. Commission = 9.18. 
 
 ## What this does not do
 
-The ratios, the drawdown, and the trade log are `docs/metrics.md`. A ratio that is undefined, or that the cent report cannot quantize, is null on that result. It does not fail the run and it does not raise `BacktestError`. The engine does not write a result file and it does not draw a chart. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.
+The ratios, the drawdown, and the trade log are `docs/metrics.md`. A ratio that is undefined, or that the cent report cannot quantize, is null on that result. It does not fail the run and it does not raise `BacktestError`. The engine does not write a result file and it does not draw a chart. The job API in `docs/jobs.md` stores the result of a run. The engine itself still does not write a file. It does not trail a stop except by the tighten-only check above. It does not talk to a venue. Bars come from the caller. How ingest treats missing minutes, synthetic flags, and gaps is `docs/ohlcv.md`.

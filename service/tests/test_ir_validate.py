@@ -143,3 +143,21 @@ def test_unknown_expression_name_is_unknown_series() -> None:
     issue = next(issue for issue in issues if issue.keyword == "unknown_series")
     assert issue.path == "$.signals[0].expr.name"
     assert "nope" in issue.message
+
+
+def test_a_document_deeper_than_the_json_limit_is_positioned() -> None:
+    node: object = {"op": "lit", "value": True}
+    for _ in range(120):
+        node = {"op": "neg", "arg": node}
+    issues = validate_ir(node)
+    assert len(issues) == 1
+    assert issues[0].keyword == "expr_too_deep"
+    assert issues[0].path.startswith("$")
+    assert ".arg" in issues[0].path
+
+
+def test_a_lone_surrogate_is_positioned() -> None:
+    issues = validate_ir({"strategy": {"name": "bad\ud800"}})
+    assert issues[0].keyword == "invalid_string"
+    assert issues[0].path == "$.strategy.name"
+    assert "index" in issues[0].message

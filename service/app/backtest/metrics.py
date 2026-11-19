@@ -127,13 +127,21 @@ def _fresh_context() -> Context:
     Built from scratch, not copied from the caller. A caller's traps, precision,
     and ``Emax`` cannot turn a ratio into NaN or into a false overflow.
     """
-    return Context(
+    ctx = Context(
         prec=50,
         rounding=ROUND_HALF_EVEN,
         Emax=MAX_EMAX,
         Emin=MIN_EMIN,
         traps=[InvalidOperation, DivisionByZero, Overflow],
+        clamp=0,
     )
+    # Re-enable even when the caller turned InvalidOperation off. A disabled
+    # trap makes ``quantize`` return NaN, and that NaN used to leave the
+    # ratio as a number with no ``undefined`` reason.
+    ctx.traps[InvalidOperation] = True
+    ctx.traps[DivisionByZero] = True
+    ctx.traps[Overflow] = True
+    return ctx
 
 
 @contextmanager
@@ -481,4 +489,7 @@ def _ratio_fraction(amount: Fraction) -> Decimal | None:
 
 def _ratio(amount: Decimal) -> Decimal | None:
     with _local_ratio():
-        return amount.quantize(_RATIO, rounding=ROUND_HALF_EVEN)
+        quantized = amount.quantize(_RATIO, rounding=ROUND_HALF_EVEN)
+        if not quantized.is_finite():
+            return None
+        return quantized

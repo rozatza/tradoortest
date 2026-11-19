@@ -352,3 +352,13 @@ def test_save_document_is_versioned_and_checks_the_hash() -> None:
     with pytest.raises(SaveError) as unsupported:
         load_document(wrong_version)
     assert unsupported.value.code == "unsupported_format"
+
+
+def test_a_lone_surrogate_in_a_save_document_is_rejected() -> None:
+    from app.ir.depth import JsonShapeError
+
+    saved = {"format": "tradoor.strategy", "ir": {"strategy": {"name": "bad\ud800"}}}
+    with pytest.raises(JsonShapeError) as caught:
+        load_document(saved)
+    assert caught.value.code == "invalid_string"
+    assert "strategy.name" in caught.value.path

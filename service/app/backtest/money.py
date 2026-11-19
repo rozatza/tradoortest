@@ -9,7 +9,7 @@ so the cent is the half-even cent of that grid quantity times the price.
 
 from __future__ import annotations
 
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, DecimalException, getcontext, localcontext
+from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, getcontext, localcontext
 from fractions import Fraction
 
 from app.backtest.errors import BacktestError
@@ -41,16 +41,19 @@ def floor_qty(amount: Fraction) -> Decimal:
     units = scaled.numerator // scaled.denominator
     if units <= 0:
         return Decimal(0)
-    # ``scaleb`` keeps the coefficient when it already fits in the context.
-    # Past that, a wider context still rounds down. The active 50-digit
-    # context would otherwise half-even a quantity above about 1e38.
+    # ``scaleb`` keeps the coefficient when it fits in the active context.
+    # A wider context used to return the exact integer, and the 50-digit
+    # book then rounded it on ``qty += qty``. That miss showed up later as
+    # a P&L identity error. Refuse it here, with a message that names the
+    # precision, before the book records a quantity it cannot hold.
     ctx = getcontext()
-    if units < 10 ** ctx.prec:
-        return Decimal(units).scaleb(-12)
-    with localcontext(ctx) as wide:
-        wide.prec = len(str(units))
-        wide.rounding = ROUND_DOWN
-        return Decimal(units).scaleb(-12)
+    digits = len(str(units))
+    if digits > ctx.prec:
+        raise BacktestError(
+            f"fill quantity has {digits} digits, above the {ctx.prec}-digit "
+            "precision this book can price"
+        )
+    return Decimal(units).scaleb(-12)
 
 
 def decimal_ratio(amount: Fraction) -> Decimal:

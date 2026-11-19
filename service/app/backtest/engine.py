@@ -26,11 +26,22 @@ the fill price.
 from __future__ import annotations
 
 import math
-import warnings
 from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
+from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    DecimalException,
+    DivisionByZero,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    localcontext,
+)
 from fractions import Fraction
 from typing import Any
 
@@ -40,7 +51,8 @@ from app.backtest.metrics import Metrics, Trade, compute_metrics
 from app.backtest.money import decimal_ratio, floor_qty, quantize_cents
 from app.backtest.quality import AssetFlags, QualityCounts, asset_flags, outage_lints
 from app.indicators import atr, bollinger, ema, macd, rsi, sma, stochastic
-from app.indicators.errors import IndicatorLint
+from app.indicators.errors import IndicatorError
+from app.indicators.lints import collect_lints
 from app.ir.validate import format_issues, validate_ir
 from app.ohlcv.bars import MAX_ABS_VALUE, Bar
 
@@ -63,6 +75,10 @@ _BAR_SECONDS = {
 
 _BPS = Decimal(10000)
 _BUILTINS = ("open", "high", "low", "close", "volume")
+# Two 1m bars a year apart build about half a million slots. That grid is
+# rejected before it is allocated. 200_000 covers a 90-day 1m series
+# (129_600 bars) and refuses the year-long 1m span.
+MAX_GRID_BARS = 200_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +255,41 @@ def _finite_price(level: object) -> bool:
     return isinstance(level, Decimal) and level.is_finite()
 
 
+def _engine_context() -> Context:
+    """50-digit half-even context. Built from scratch, not copied.
+
+    The caller's traps, precision, and exponent range do not apply. Inexact
+    is not trapped. ``Emin`` is the full decimal minimum, not a caller's
+    narrow bound.
+    """
+    ctx = Context(
+        prec=50,
+        rounding=ROUND_HALF_EVEN,
+        Emax=MAX_EMAX,
+        Emin=MIN_EMIN,
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+        clamp=0,
+    )
+    ctx.traps[InvalidOperation] = True
+    ctx.traps[DivisionByZero] = True
+    ctx.traps[Overflow] = True
+    ctx.traps[Inexact] = False
+    return ctx
+
+
+def grid_bar_count(bar_size: str, open_times: Sequence[int]) -> int:
+    """How many slots ``open_times`` would place on ``bar_size``.
+
+    An empty list is 0. This does not allocate the grid.
+    """
+    if bar_size not in _BAR_SECONDS:
+        raise BacktestError(f"unsupported bar size {bar_size}", code="invalid_bar_size")
+    if not open_times:
+        return 0
+    step = _BAR_SECONDS[bar_size]
+    return (max(open_times) - min(open_times)) // step + 1
+
+
 def run_backtest(
     document: Mapping[str, Any],
     bars: Mapping[str, Sequence[Bar]],
@@ -257,12 +308,11 @@ def run_backtest(
     if long_no_trade_minutes < 1:
         raise BacktestError("long_no_trade_minutes must be at least 1")
     try:
-        with localcontext() as ctx:
-            # 1e12 capital marked at 1e15 after a 1e-9 fill needs more than
-            # the default 28 digits. Anything still outside this precision
-            # becomes BacktestError instead of an uncaught Decimal error.
-            ctx.prec = 50
-            ctx.rounding = ROUND_HALF_EVEN
+        # A fresh context, not a copy of the caller's. Copying kept the
+        # caller's traps and Emin: Inexact then aborted the run, and Emin -5
+        # changed a fill quantity. Precision, rounding, exponents, and traps
+        # are fixed here.
+        with localcontext(_engine_context()):
             return _run_backtest(document, bars, long_no_trade_minutes)
     except DecimalException as exc:
         raise BacktestError("order amount is outside the range this book can price") from exc
@@ -275,7 +325,8 @@ def _run_backtest(
 ) -> BacktestResult:
     issues = validate_ir(document)
     if issues:
-        raise BacktestError(format_issues(issues))
+        first = issues[0]
+        raise BacktestError(format_issues(issues), code=first.keyword, path=first.path)
     bar_size = document["engine"]["bar_size"]
     step = _BAR_SECONDS[bar_size]
     warmup = int(document["engine"]["warmup_bars"])
@@ -289,6 +340,12 @@ def _run_backtest(
     times = [bar.open_time for frame in frames.values() for bar in frame.by_time.values()]
     if not times:
         return _empty_result(initial, step, long_no_trade_minutes)
+    slots = (max(times) - min(times)) // step + 1
+    if slots > MAX_GRID_BARS:
+        raise BacktestError(
+            f"time grid is {slots} bars, above the limit of {MAX_GRID_BARS}",
+            code="grid_too_large",
+        )
     grid = list(range(min(times), max(times) + step, step))
     _align(frames, grid)
     flags = {
@@ -387,61 +444,87 @@ def _align(frames: dict[str, _Frame], grid: list[int]) -> None:
 
 
 def _derive(specs: Sequence[Mapping[str, Any]], frames: dict[str, _Frame]) -> tuple[str, ...]:
-    """Write derived series and return indicator warnings moved onto the result.
+    """Write derived series and return this run's indicator lints.
 
-    ``catch_warnings`` takes the warning off the caller's filter, so it is
-    not also emitted. The text names the series and the asset.
+    Lints are collected on a context-local list. The warnings registry is
+    not touched, so a second run in another thread cannot take these texts
+    or leave a filter installed.
     """
     notes: list[str] = []
     seen: set[str] = set()
-    for spec in specs:
-        series_id = str(spec["id"])
-        for asset_id, frame in frames.items():
-            source = frame.series.get(spec["source"])
-            if source is None:
-                raise BacktestError(f"unknown series {spec['source']}")
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", IndicatorLint)
-                frame.series[series_id] = _indicator(spec, source, frame)
-            for item in caught:
-                if not issubclass(item.category, IndicatorLint):
-                    continue
-                text = str(item.message).strip()
-                if not text:
-                    continue
-                note = f"{series_id} on {asset_id}: {text}"
-                if note not in seen:
-                    seen.add(note)
-                    notes.append(note)
+    with collect_lints() as caught:
+        for index, spec in enumerate(specs):
+            series_id = str(spec["id"])
+            path = f"$.derived_series[{index}]"
+            for asset_id, frame in frames.items():
+                source = frame.series.get(spec["source"])
+                if source is None:
+                    raise BacktestError(f"unknown series {spec['source']}", path=path)
+                caught.clear()
+                frame.series[series_id] = _indicator(spec, source, frame, path=path)
+                for text in caught:
+                    cleaned = text.strip()
+                    if not cleaned:
+                        continue
+                    note = f"{series_id} on {asset_id}: {cleaned}"
+                    if note not in seen:
+                        seen.add(note)
+                        notes.append(note)
     return tuple(notes)
 
 
-def _indicator(spec: Mapping[str, Any], source: Sequence[float], frame: _Frame) -> list[float]:
+def _indicator(
+    spec: Mapping[str, Any],
+    source: Sequence[float],
+    frame: _Frame,
+    *,
+    path: str,
+) -> list[float]:
     name = spec["indicator"]
     params = spec["params"]
     high = frame.series["high"]
     low = frame.series["low"]
     close = frame.series["close"]
-    if name == "sma":
-        return sma(source, int(params["period"]))
-    if name == "ema":
-        return ema(source, int(params["period"]))
-    if name == "rsi":
-        return rsi(source, int(params["period"]))
-    if name == "atr":
-        return atr(high, low, close, int(params["period"]))
-    if name == "macd":
-        result = macd(source, int(params["fast"]), int(params["slow"]), int(params["signal"]))
-        return list(getattr(result, spec["output"]))
-    if name == "bollinger":
-        result = bollinger(source, int(params["period"]), float(params["stddev"]))
-        return list(getattr(result, spec["output"]))
-    if name == "stochastic":
-        result = stochastic(
-            high, low, close, int(params["k_period"]), int(params["d_period"])
-        )
-        return list(getattr(result, spec["output"]))
-    raise BacktestError(f"unknown indicator {name}")
+    try:
+        if name == "sma":
+            values = sma(source, int(params["period"]))
+        elif name == "ema":
+            values = ema(source, int(params["period"]))
+        elif name == "rsi":
+            values = rsi(source, int(params["period"]))
+        elif name == "atr":
+            values = atr(high, low, close, int(params["period"]))
+        elif name == "macd":
+            result = macd(
+                source, int(params["fast"]), int(params["slow"]), int(params["signal"])
+            )
+            values = list(getattr(result, spec["output"]))
+        elif name == "bollinger":
+            result = bollinger(source, int(params["period"]), float(params["stddev"]))
+            values = list(getattr(result, spec["output"]))
+        elif name == "stochastic":
+            result = stochastic(
+                high, low, close, int(params["k_period"]), int(params["d_period"])
+            )
+            values = list(getattr(result, spec["output"]))
+        else:
+            raise BacktestError(f"unknown indicator {name}", path=path)
+    except OverflowError as exc:
+        raise BacktestError(
+            f"indicator {name} overflowed",
+            code="indicator_overflow",
+            path=path,
+        ) from exc
+    except IndicatorError as exc:
+        raise BacktestError(str(exc), code=exc.code, path=path) from exc
+    for index, value in enumerate(values):
+        if isinstance(value, float) and math.isinf(value):
+            raise BacktestError(
+                f"indicator {name} result at index {index} is not finite",
+                code="indicator_non_finite",
+                path=path,
+            )
+    return values
 
 
 def _series_lints(

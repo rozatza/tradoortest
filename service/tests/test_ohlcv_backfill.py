@@ -1739,3 +1739,153 @@ def test_an_invalid_seed_is_dropped_and_the_page_still_commits(tmp_path: Path) -
         ]
     finally:
         store.close()
+
+
+def _paged(
+    path: Path,
+    candles: list[list[object]],
+    windows: list[tuple[int, int]],
+    *,
+    page_limit: int,
+    load_start: int,
+    load_end: int,
+) -> tuple[list[tuple[int, float, bool]], list[tuple[int | None, tuple[str, ...]]]]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        before = int(request.url.params["before_timestamp"])
+        limit = int(request.url.params["limit"])
+        page = sorted(
+            (row for row in candles if int(row[0]) <= before),
+            key=lambda row: int(row[0]),
+            reverse=True,
+        )[:limit]
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": page}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    source = GeckoTerminalSource(
+        client, page_limit=page_limit, min_interval=0, sleep=lambda _seconds: None
+    )
+    store = SqliteBarStore(path)
+    try:
+        for start, end in windows:
+            run_backfill(
+                source=source,
+                store=store,
+                assets=(MAJORS[0],),
+                start=start,
+                end=end,
+                timeframes=("1m",),
+                user_id=LOCAL_USER_ID,
+                generated_at=end,
+            )
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=load_start,
+            end=load_end,
+        )
+        rejected = store.rejections(
+            user_id=LOCAL_USER_ID,
+            mint=_MINT,
+            timeframe="1m",
+            start=load_start,
+            end=load_end,
+        )
+        bars = [(bar.open_time, bar.close, bar.synthetic) for bar in stored]
+        flags = [(item.open_time, item.reasons) for item in rejected]
+        return bars, flags
+    finally:
+        store.close()
+        client.close()
+
+
+def test_a_page_of_bad_older_candles_still_finds_the_next_seed(tmp_path: Path) -> None:
+    """Page size 7. The crossing page's older candles all fail, and the seed is next."""
+    start = _START + 20 * 60
+    end = start + 3 * 60
+    seed_time = start - 10 * 60
+    candles: list[list[object]] = [[seed_time, 4.0, 4.0, 4.0, 4.0, 1.0]]
+    candles.extend([start - 60 * offset, 1.0, 1.0, 0.5, 9.0, 1.0] for offset in range(1, 9))
+    candles.append([start, 2.0, 2.0, 2.0, 2.0, 1.0])
+    candles.append([start + 60, 2.5, 2.5, 2.5, 2.5, 1.0])
+    narrow = [(start, end)]
+    wide = [(seed_time, end)]
+    narrow_first, narrow_rejected = _paged(
+        tmp_path / "narrow-first.sqlite",
+        candles,
+        narrow,
+        page_limit=7,
+        load_start=seed_time,
+        load_end=end,
+    )
+    wide_first, wide_rejected = _paged(
+        tmp_path / "wide-first.sqlite",
+        candles,
+        wide,
+        page_limit=7,
+        load_start=seed_time,
+        load_end=end,
+    )
+    both, both_rejected = _paged(
+        tmp_path / "both.sqlite",
+        candles,
+        [narrow[0], wide[0]],
+        page_limit=7,
+        load_start=seed_time,
+        load_end=end,
+    )
+    assert narrow_first == wide_first == both
+    assert (seed_time, 4.0, False) in narrow_first
+    assert any(synthetic and open_time < start for open_time, _close, synthetic in narrow_first)
+    assert narrow_rejected == wide_rejected == both_rejected
+    assert any(
+        open_time is not None and open_time < start for open_time, _reasons in narrow_rejected
+    )
+
+
+def test_rejection_text_uses_the_timestamp_not_the_page_index(tmp_path: Path) -> None:
+    stamp = _START + 10 * 60
+    bad = [stamp, "nope", 2.0, 0.5, 1.5, 1.0]
+    candles: list[list[object]] = [
+        _candle(_START + 60 * offset) for offset in range(0, 16) if _START + 60 * offset != stamp
+    ]
+    candles.append(bad)
+    early, early_flags = _paged(
+        tmp_path / "early.sqlite",
+        candles,
+        [(_START, stamp + 60)],
+        page_limit=3,
+        load_start=_START,
+        load_end=stamp + 60,
+    )
+    later, later_flags = _paged(
+        tmp_path / "later.sqlite",
+        candles,
+        [(_START, _START + 16 * 60)],
+        page_limit=3,
+        load_start=_START,
+        load_end=_START + 16 * 60,
+    )
+    early_reason = next(reasons for open_time, reasons in early_flags if open_time == stamp)
+    later_reason = next(reasons for open_time, reasons in later_flags if open_time == stamp)
+    expected = f"candle at {stamp} open is not a number"
+    assert early_reason == later_reason
+    assert expected in early_reason
+    assert "candle 0" not in " ".join(early_reason)
+    assert "candle 1" not in " ".join(early_reason)
+    assert all(open_time != stamp for open_time, _close, _synthetic in early)
+    assert all(open_time != stamp for open_time, _close, _synthetic in later)
+
+
+def test_a_seed_older_than_a_day_is_not_used(tmp_path: Path) -> None:
+    old = _START - 10 * 86400
+    end = _START + 30 * 60
+    bars, _rejected = _paged(
+        tmp_path / "old.sqlite",
+        [_candle(old, 1.5)],
+        [(_START, end)],
+        page_limit=1000,
+        load_start=old,
+        load_end=end,
+    )
+    assert bars == []

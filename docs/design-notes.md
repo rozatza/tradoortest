@@ -19,9 +19,11 @@ A stored row wraps the IR. `StoredStrategy` in `service/app/models.py` is that e
 | `ir_version` | Copied from the IR (`"1.0"`). |
 | `ir` | The validated IR object. |
 
-`user_id` is required by the model. Callers validate the IR with `validate_ir` before constructing a row. This repository does not open a database and does not create a users table.
+`user_id` is required by the model. Callers validate the IR with `validate_ir` before constructing a row. There is no users table.
 
-Any later stored entity (a backtest run, a saved result) uses the same rule: a required `user_id` on the row, and no shared access list.
+A backtest job uses the same rule. The row in `data/backtest-jobs.sqlite` has a required `user_id`, and a read filters on the id `get_current_user` returned. See `docs/jobs.md`.
+
+Any later stored entity uses the same rule: a required `user_id` on the row, and no shared access list.
 
 ## Auth seam
 

@@ -20,7 +20,7 @@ for `i = 1..N`. If `E_{i-1}` is 0, that return is 0. The division is skipped. Th
 
 **Net return** is `(final - initial) / initial`. It uses the last mark, so an open long is in the number. Flat equity is a real 0. If `initial` quantizes to 0 the reason is `zero_initial`. An empty grid is `no_bars`. A net return the `1e-10` quantize cannot hold is null, reason `overflow`.
 
-**Annualized return** is `(1 + net) ^ (bars_per_year / N) - 1`. The exponent is `bars_per_year / N`, not `N + 1`. A run shorter than one day (`bar_count * bar_seconds < 86400`) is not annualized: the value is null and the reason is `too_short`. 60 one-minute bars are an hour. 1440 one-minute bars, or one daily bar, are a full day and are annualized. `net = 0` on a run of at least one day is a real 0. A base of 0 or less (the account is at or through zero) is `-1`. The half-even quantize to `1e-10` at 50 digits cannot hold a ratio whose absolute value reaches `1e40`. That result is null and the reason is `annualization_overflow`. It is not a crash, and it is not a reported 0.
+**Annualized return** is `(1 + net) ^ (bars_per_year / N) - 1`. The exponent is `bars_per_year / N`, not `N + 1`. A run shorter than one day (`bar_count * bar_seconds < 86400`) is not annualized: the value is null and the reason is `too_short`. 60 one-minute bars are an hour. 1440 one-minute bars, or one daily bar, are a full day and are annualized. `net = 0` on a run of at least one day is a real 0. A base of 0 or less (the account is at or through zero) is `-1`. The half-even quantize to `1e-10` at 50 digits cannot hold a ratio whose absolute value reaches `1e40`. That result is null and the reason is `annualization_overflow`. It is not a crash, and it is not a reported 0. When the net return itself is `overflow`, the annualized return is null for that same reason, `overflow`, not `annualization_overflow`.
 
 **Max drawdown** is the largest peak-to-trough drop on the path `initial, E_1, …, E_N`, as a positive fraction `(peak - equity) / peak`. The peak starts at `initial` and moves up only when equity is strictly higher. A peak of 0 does not divide. If equity never drops, drawdown is 0.
 
@@ -86,7 +86,7 @@ After the identity holds, each open trade's realized and unrealized pnl are half
 | `initial` quantizes to `0.00` | Net return, annualized return, Sharpe, Sortino, and Calmar are null, `zero_initial` |
 | Grid has no slots | `bar_count` is 0. Those return ratios are null, `no_bars`. Final equity is the initial cent. Drawdown is 0 |
 | Total loss (`1 + net <= 0`) on a run of at least one day | Annualized return is `-1` |
-| Ratio at or beyond `1e40` | Annualized return and Calmar are null, `annualization_overflow`. Net return, Sharpe, Sortino, win rate, and payoff are null, `overflow`. The run still returns |
+| Ratio at or beyond `1e40` | When the net return itself fit, annualized return and Calmar are null, `annualization_overflow`. When the net return is `overflow`, annualized return and Calmar are `overflow` too. Net return, Sharpe, Sortino, win rate, and payoff are null, `overflow`. The run still returns |
 | Exactly 1440 one-minute bars | A full day. Annualized return is computed. 1439 one-minute bars are `too_short` |
 
 ## Data quality

@@ -32,6 +32,7 @@ from app.expr import (
 )
 from app.ir.canonical import canonicalize
 from app.ir.constants import BUILTIN_SERIES, IR_VERSION
+from app.ir.depth import lone_surrogate_at
 
 _IDENT = r"[a-z][a-z0-9_]{0,63}"
 _SERIES = re.compile(rf"^series\s+({_IDENT})\s*=\s*(.+)$")
@@ -529,10 +530,12 @@ def parse_strategy(source: str) -> dict[str, Any]:
 
     Raises `StrategyError` for syntax errors, expression errors, duplicate
     expression ids, and reserved series names. Other semantic failures are
-    left in the IR for `validate_ir`.
+    left in the IR for `validate_ir`. A lone surrogate is rejected here,
+    before canonicalization would try to encode it.
     """
     if not isinstance(source, str):
         raise TypeError("strategy must be a string")
+    _reject_lone_surrogate(source)
     lines = _collect_lines(source)
     document = _StrategyParser(source, lines).parse()
     return canonicalize(document)
@@ -646,6 +649,20 @@ def _group(body: list[_Line]) -> list[tuple[_Line, list[_Line]]]:
                 index += 1
         grouped.append((line, children))
     return grouped
+
+
+def _reject_lone_surrogate(source: str) -> None:
+    index = lone_surrogate_at(source)
+    if index is None:
+        return
+    line, column = _position(source, index)
+    raise StrategyError(
+        "lone surrogate is not valid text",
+        code="invalid_string",
+        offset=index,
+        line=line,
+        column=column,
+    )
 
 
 def _position(source: str, offset: int) -> tuple[int, int]:

@@ -62,6 +62,12 @@ POOLS: dict[str, str] = {
 
 _PAGE_LIMIT = 1000
 _ATTEMPTS = 5
+# A seed older than this is not a prior close. Using it would mark every
+# quiet minute back to that candle as fetched and store a synthetic bar for
+# each one. A token idle for 10 days, requested for 1 day, used to store
+# about 14,404 of those rows. One day of lookback still covers a quiet open
+# and a bad candle that hides the real prior close on the last page.
+MAX_SEED_LOOKBACK_SECONDS = 24 * 60 * 60
 # Misconfiguration, not a blip. Retrying cannot make the URL or the proxy valid.
 _NO_RETRY = (httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.ProxyError)
 # Live probe on 2026-11-19: a window of 181 days returned 200, and 185 days
@@ -165,44 +171,89 @@ class GeckoTerminalSource:
         before = end - 1
         page_hi = end
         span = end - start
-        page_budget = max(2, math.ceil(span / step / self._page_limit) + 3)
+        lookback_pages = math.ceil(MAX_SEED_LOOKBACK_SECONDS / step / self._page_limit) + 1
+        page_budget = max(2, math.ceil(span / step / self._page_limit) + 3) + lookback_pages
         pages = 0
+        # The page that first reaches before the window stays unyielded while
+        # older pages are read for a seed. Committing it first would store a
+        # span with no prior close, and a seed found later could not widen it.
+        held: FetchPage | None = None
+        carried: list[BarRejection] = []
         while pages < page_budget:
             payload = self._get_json(pool, mint, before, path, aggregate)
             candles = _ohlcv_list(payload)
             pages += 1
             if not candles:
                 # No candles at all. This is provider-missing, not a quiet market.
+                if held is not None:
+                    yield held
+                    return
                 yield FetchPage([], [], start, page_hi, True)
                 return
             parsed = _parse_page(candles, mint, timeframe)
             if parsed.oldest is None:
                 raise SourceError("GeckoTerminal page has no candle timestamps")
-            finished = parsed.oldest <= start or len(candles) < self._page_limit
-            cover_lo = start if finished else parsed.oldest
-            page = _page_in_range(parsed, cover_lo, page_hi)
-            if finished and parsed.oldest < start:
-                # The page reached before the window. The latest usable older
-                # candle is the prior close. A conflict or a rejected candle
-                # is not that close, and it is not copied into a synthetic bar.
+            if held is None:
+                # A short page is the end of history. Coverage starts at the
+                # window, so the minutes before the first candle are a gap
+                # rather than an unfetched range. A full page that is still
+                # inside the window covers only its own candles.
+                reached = parsed.oldest <= start or len(candles) < self._page_limit
+                cover_lo = start if reached else parsed.oldest
+                page = _page_in_range(parsed, cover_lo, page_hi)
+            else:
+                page = held
+            if parsed.oldest < start:
                 seed, older_rejected = _prior_close(parsed, start)
+                if seed is not None and start - seed.open_time > MAX_SEED_LOOKBACK_SECONDS:
+                    # Older than the cap. A further page is older still.
+                    seed = None
+                    older_rejected = []
+                    stop = True
+                else:
+                    stop = False
                 if seed is not None:
-                    page = FetchPage(
+                    between = [
+                        *carried,
+                        *older_rejected,
+                    ]
+                    between = [
+                        item
+                        for item in between
+                        if isinstance(item.open_time, int)
+                        and not isinstance(item.open_time, bool)
+                        and seed.open_time < item.open_time < start
+                    ]
+                    between.sort(
+                        key=lambda item: item.open_time if isinstance(item.open_time, int) else 0
+                    )
+                    yield FetchPage(
                         page.bars,
-                        [*page.rejected, *older_rejected],
+                        [*page.rejected, *between],
                         page.start,
                         page.end,
                         False,
                         seed,
                     )
-            yield page
-            if finished:
-                return
+                    return
+                if not stop:
+                    carried.extend(older_rejected)
+                page_is_short = len(candles) < self._page_limit
+                beyond = parsed.oldest <= start - MAX_SEED_LOOKBACK_SECONDS
+                if stop or page_is_short or beyond:
+                    yield page
+                    return
+                held = page
+            else:
+                yield page
+                if parsed.oldest <= start or len(candles) < self._page_limit:
+                    return
             nxt = parsed.oldest - 1
             if nxt >= before:
                 raise SourceError("GeckoTerminal pagination did not move backward")
             before = nxt
-            page_hi = parsed.oldest
+            if held is None:
+                page_hi = parsed.oldest
         raise SourceError("GeckoTerminal pagination stopped before the window was covered")
 
     def _get_json(
@@ -336,7 +387,9 @@ def _prior_close(parsed: _ParsedPage, start: int) -> tuple[Bar | None, list[BarR
     did not parse, and a candle that fails ``validate_bar`` are skipped.
     Skipped candles that sit strictly after the chosen seed are returned so
     the fetched span keeps them as rejections instead of synthetic bars.
-    Without a usable seed there is no span to protect, and the list is empty.
+    With no usable seed, the skipped candles inside the lookback cap are
+    still returned. A later page can use them once it finds a seed. A seed
+    older than ``MAX_SEED_LOOKBACK_SECONDS`` is not used.
     """
     skipped: list[BarRejection] = []
     for item in parsed.rejected:
@@ -364,7 +417,17 @@ def _prior_close(parsed: _ParsedPage, start: int) -> tuple[Bar | None, list[BarR
             continue
         candidates.append(bar)
     if not candidates:
-        return None, []
+        # No usable seed on this page. The bad candles stay available so a
+        # later page can reject the minutes between its seed and the window.
+        # A candle older than the lookback cap is not part of that span.
+        kept = [
+            item
+            for item in skipped
+            if isinstance(item.open_time, int)
+            and not isinstance(item.open_time, bool)
+            and 0 <= start - item.open_time <= MAX_SEED_LOOKBACK_SECONDS
+        ]
+        return None, kept
     seed = max(candidates, key=lambda bar: bar.open_time)
     between = [
         item
@@ -389,22 +452,27 @@ def _ohlcv_list(payload: dict[str, Any]) -> list[Any]:
 def _parse_candle(
     candle: object,
     mint: str,
-    index: int,
+    _index: int,
     timeframe: str = "1m",
 ) -> tuple[Bar | None, BarRejection | None, int | None]:
-    """Parse one candle. Extra elements and any sibling metadata are ignored."""
+    """Parse one candle. Extra elements and any sibling metadata are ignored.
+
+    The reason text names the candle by its timestamp when one was parsed.
+    It does not use ``_index``. That index is the position on this page, so
+    the same candle would be stored under a different reason after a
+    different request order.
+    """
     if not isinstance(candle, list) or len(candle) < 6:
-        rejection = BarRejection(
-            mint, timeframe, None, (f"candle {index} does not have 6 values",)
-        )
+        rejection = BarRejection(mint, timeframe, None, ("candle does not have 6 values",))
         return None, rejection, None
     stamp, stamp_ok = _integer_second(candle[0])
     numbers, bad = _numbers(candle[1:6])
     if not stamp_ok or bad:
+        label = f"candle at {stamp}" if stamp_ok and stamp is not None else "candle"
         reasons: list[str] = []
         if not stamp_ok:
-            reasons.append(f"candle {index} open_time is not an integer second")
-        reasons.extend(f"candle {index} {name} is not a number" for name in bad)
+            reasons.append(f"{label} open_time is not an integer second")
+        reasons.extend(f"{label} {name} is not a number" for name in bad)
         return None, BarRejection(mint, timeframe, stamp if stamp_ok else None, tuple(reasons)), (
             stamp if stamp_ok else None
         )
