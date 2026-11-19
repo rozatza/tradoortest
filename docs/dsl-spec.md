@@ -388,7 +388,7 @@ The pair is not read on the bar the entry fills. That bar's high and low do not 
 
 A take-profit is a limit sell. Its price is the take-profit level, including when the bar opens above the level. A stop-loss fills at the stop when the bar opens above the stop, and at the open when the bar opens at or below the stop. Sell slippage and commission then apply as they do on a market sell.
 
-A synthetic bar can touch a leg and does not fill. That leg is deferred to the next real bar. A missing bar has no high or low, so it cannot touch a leg, and a deferred leg stays deferred across the hole. The deferred fill is the minimum of that real bar's open and the level, then sell slippage. A deferred stop never fills above the stop, and a deferred take-profit never fills above the limit. If the run ends before a real bar, the deferred leg does not fill. `docs/backtest.md` has the cents.
+A synthetic bar is not a trade print. For the OCO pair it is the same as a missing bar: it does not touch either leg and it does not arm one. The next real bar is read under the live rules above. If the run ends on the synthetic bar, the long stays open. `docs/backtest.md` has the cents.
 
 ```text
   risk oco:

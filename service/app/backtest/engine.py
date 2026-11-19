@@ -10,8 +10,8 @@ Fills happen at that bar's close (``fill_price_mode=on_close``) after
 slippage. The book is long-only spot: cash plus open longs, in USDC cents.
 An entry's OCO pair is attached at the fill and is not read on that bar.
 Take-profit fills at its limit. Stop-loss fills at the stop, or at the open
-when the bar gaps through the stop. A synthetic bar that touches a leg
-defers the exit to the next real bar. A missing bar cannot touch a leg.
+when the bar gaps through the stop. A synthetic bar cannot touch a leg, the
+same as a missing bar. The next real bar is read on its own.
 
 The decision for bar ``i`` reads bars ``0..i`` only. Indicator functions are
 the causal library in ``app.indicators``, called on the grid with holes left
@@ -128,13 +128,12 @@ class _Position:
 
 @dataclass
 class _Oco:
-    """Levels anchored to the first entry fill. ``deferred`` waits for a real bar."""
+    """Levels anchored to the first entry fill."""
 
     take_profit: Decimal
     stop_loss: Decimal
     attached_at: int
     anchor: Decimal
-    deferred: str | None = None
 
 
 @dataclass
@@ -539,12 +538,12 @@ def _settle_ocos(
     commission_bps: Decimal,
     slippage_bps: Decimal,
 ) -> None:
-    """Fill armed or touched OCO legs before this bar's rules.
+    """Fill a touched OCO leg before this bar's rules.
 
     The entry bar is skipped: the pair is attached later in the bar, and a
-    pair whose ``attached_at`` is this bar is not read. A missing bar cannot
-    touch a level. A synthetic touch is remembered and filled on the next
-    real bar, at ``min(open, level)`` before sell slippage.
+    pair whose ``attached_at`` is this bar is not read. A missing bar and a
+    synthetic bar are not touches. The next real bar is evaluated on its own
+    high and low.
     """
     for asset_id in frames:
         oco = book.ocos.get(asset_id)
@@ -554,26 +553,10 @@ def _settle_ocos(
         if oco.attached_at == open_time:
             continue
         bar = frames[asset_id].by_time.get(open_time)
-        if oco.deferred is not None:
-            if bar is None or bar.synthetic:
-                continue
-            _fill_oco(
-                book,
-                asset_id,
-                oco.deferred,
-                _deferred_price(bar, oco, oco.deferred),
-                open_time,
-                fills,
-                marks,
-                commission_bps=commission_bps,
-                slippage_bps=slippage_bps,
-            )
+        if bar is None or bar.synthetic:
             continue
         leg = _oco_leg(bar, oco)
-        if leg is None or bar is None:
-            continue
-        if bar.synthetic:
-            oco.deferred = leg
+        if leg is None:
             continue
         _fill_oco(
             book,
@@ -607,15 +590,6 @@ def _live_price(bar: Bar, oco: _Oco, leg: str) -> Decimal:
     if leg == "stop_loss":
         return oco.stop_loss
     return oco.take_profit
-
-
-def _deferred_price(bar: Bar, oco: _Oco, leg: str) -> Decimal:
-    """First tradable open, and never a better price than the armed level."""
-    opened = _price(bar.open)
-    level = oco.stop_loss if leg == "stop_loss" else oco.take_profit
-    if opened < level:
-        return opened
-    return level
 
 
 def _fill_oco(

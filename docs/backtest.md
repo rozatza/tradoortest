@@ -37,7 +37,7 @@ Native 5m and higher buckets that the provider omitted show up here as holes, be
 
 A bar with `synthetic: true` is a flagged 1m no-trade minute from ingest. Its close may sit in the indicator inputs, because the bar exists and the price is the prior real close. It is not a trade print.
 
-A market order whose signal is true on that bar is skipped with reason `synthetic_bar`. The order is not queued and it does not fill on the next real bar. The next bar is evaluated on its own. A real bar with volume 0 is still a trade print and can fill. Only the flag blocks the market fill. An OCO leg that the synthetic bar's high or low would touch is not filled here either. It is deferred to the next real bar, at the price in the OCO section.
+A market order whose signal is true on that bar is skipped with reason `synthetic_bar`. The order is not queued and it does not fill on the next real bar. The next bar is evaluated on its own. A real bar with volume 0 is still a trade print and can fill. Only the flag blocks the market fill. An OCO leg is not filled on a synthetic bar either. The minute is not a touch, so it does not arm a leg. The next real bar is evaluated on its own.
 
 ## Orders and the book
 
@@ -119,7 +119,7 @@ Sell slippage and commission then match a market sell. The price above is multip
 
 OCO runs before the bar's rules. A stop-out closes the long, and a signal exit on the same bar is `no_position`. An enter on that bar can open a new long. The new pair waits until the next bar. A signal exit that closes the long cancels the pair. A partial exit leaves the pair on the remaining quantity at the same prices.
 
-A synthetic bar is not a fill. If its low or high would touch a leg, that leg is armed and the fill waits for the next real bar. The price is the minimum of that bar's open and the armed level, then sell slippage. A deferred stop never fills above the stop. A deferred take-profit never fills above the limit. A missing bar has no high or low, so it cannot arm a leg. An armed leg stays armed across the hole and still fills on the next real bar. If the run ends on the synthetic bar, the armed leg does not fill and the long stays open.
+A synthetic bar is not a fill, and it is not a touch. It does not arm a leg. A missing bar has no high or low, so it is not a touch either. The next real bar uses the live rules: the stop fills when that bar's low is at or below the stop, at the stop or at the open when the bar gaps through, and the take-profit fills at the limit. If that bar touches both, the stop wins. Inserting a no-trade minute does not change the fill. If the run ends on the synthetic bar, the long stays open.
 
 A pyramid does not move the anchor. The anchor stays the first entry fill. If the added enter names percents that leave both levels where they are, or move the stop up, or move the target down, the levels update. `move_oco` is that check. A lower stop or a higher target rejects the whole change. Neither price moves. The added quantity still fills. The rejection is a lint, and the same text is what `move_oco` raises. OCO is settled before the bar's rules, so a tighten or a rejected loosen on this bar is first read on the next bar. The entry bar is the exception: the pair is attached during that bar's rules, and the next bar is still the first check.
 
@@ -145,8 +145,7 @@ Notional = 9485.76. Commission = 9.49. Cash = 9476.27.
 A bar that opens at 80 gaps through that stop, so the raw price is 80 rather than 95.0475.
 Sell fill = 80 × 9995 / 10000 = 79.96. Notional = 7984.02. Commission = 7.98. Cash = 7976.04.
 
-A synthetic bar flat at 90 arms the stop and does not fill. The next real bar opens at 92.
-Deferred raw price = min(92, 95.0475) = 92.
+A synthetic bar flat at 90 sits between the entry and the next real bar. It does not touch the stop. The real bar opens at 92, below the stop, so the raw price is the open.
 Sell fill = 92 × 9995 / 10000 = 91.954. Notional = 9181.62. Commission = 9.18. Cash = 9172.44.
 
 ## What this does not do

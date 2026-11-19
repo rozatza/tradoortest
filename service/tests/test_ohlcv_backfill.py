@@ -1588,6 +1588,14 @@ def test_a_conflicting_prior_candle_is_not_the_seed(tmp_path: Path) -> None:
         for index, order in enumerate(itertools.permutations(windows))
     ]
     assert runs[0] == runs[1]
+    narrow = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t2, t4)],
+        load_start=t0,
+        load_end=t4,
+    )
+    assert narrow == runs[0]
     bars, rejected = runs[0]
     assert (t0, 1.5, False) in bars
     assert all(open_time != t1 for open_time, _close, _synthetic in bars)
@@ -1630,6 +1638,14 @@ def test_an_unparseable_newest_candle_is_not_synthetic_in_either_order(
         for index, order in enumerate(itertools.permutations(windows))
     ]
     assert runs[0] == runs[1]
+    narrow = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t2, t4)],
+        load_start=t0,
+        load_end=t4,
+    )
+    assert narrow == runs[0]
     bars, rejected = runs[0]
     assert (t0, 1.5, False) in bars
     assert all(open_time != t1 for open_time, _close, _synthetic in bars)
@@ -1638,6 +1654,41 @@ def test_an_unparseable_newest_candle_is_not_synthetic_in_either_order(
     assert len(rejected) == 1
     assert rejected[0][0] == t1
     assert any(reason in item for item in rejected[0][1])
+
+
+def test_a_narrow_window_alone_seeds_the_latest_valid_older_close(tmp_path: Path) -> None:
+    """The seed is the newest older candle that passed, not an earlier one.
+
+    t0 close 1.5 and t1 close 4 are both valid. The window starts at t3, so
+    the seed is t1. The invalid minute between them stays rejected. A wide
+    window is not required to reach that result.
+    """
+    t0 = _START
+    t1 = _START + 60
+    t2 = _START + 120
+    t3 = _START + 180
+    t5 = _START + 300
+    candles: list[list[object]] = [
+        _candle(t0, 1.5),
+        [t1, 4.0, 5.0, 3.0, 4.0, 1.0],
+        [t2, 1.0, 1.0, 0.5, 9.0, 1.0],
+    ]
+    bars, rejected = _orders(
+        tmp_path / "narrow.sqlite",
+        candles,
+        [(t3, t5)],
+        load_start=t0,
+        load_end=t5,
+    )
+    assert (t1, 4.0, False) in bars
+    assert all(open_time != t0 for open_time, _close, _synthetic in bars)
+    assert all(open_time != t2 for open_time, _close, _synthetic in bars)
+    assert (t3, 4.0, True) in bars
+    assert (t3 + 60, 4.0, True) in bars
+    assert all(close == 4.0 for _open_time, close, synthetic in bars if synthetic)
+    assert len(rejected) == 1
+    assert rejected[0][0] == t2
+    assert any("high is below" in item for item in rejected[0][1])
 
 
 def test_an_invalid_seed_is_dropped_and_the_page_still_commits(tmp_path: Path) -> None:

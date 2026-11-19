@@ -1259,19 +1259,20 @@ def test_a_take_profit_gap_still_fills_at_the_limit() -> None:
     assert result.final_cash == _money(payload, "take_profit_cash")
 
 
-def test_oco_on_a_synthetic_bar_is_deferred_to_the_next_real_bar() -> None:
-    """A flat synthetic bar at 90 arms the stop and does not fill.
+def test_a_synthetic_minute_does_not_fill_and_the_next_real_bar_can_gap() -> None:
+    """A flat synthetic bar at 90 is not a touch and does not fill.
 
-    The next real bar opens at 92. Deferred price = min(92, 95.0475) = 92.
-    Sell fill = 91.954. Notional = 9181.62. Commission = 9.18. Cash = 9172.44.
+    The next real bar opens at 92, below the 95.0475 stop, so the stop gaps
+    through at the open. Sell fill = 91.954. Notional = 9181.62.
+    Commission = 9.18. Cash = 9172.44.
     """
     payload, document = _oco_hand()
     synthetic = _bar(60, 90, synthetic=True)
     real = _fixture_bar(payload["deferred_bar"])
-    armed = run_backtest(document, {"sol": [_fixture_bar(payload["entry"]), synthetic]})
-    assert [fill.leg for fill in armed.fills] == ["market"]
-    assert len(armed.final_positions) == 1
-    assert armed.final_cash == Decimal("0.00")
+    held = run_backtest(document, {"sol": [_fixture_bar(payload["entry"]), synthetic]})
+    assert [fill.leg for fill in held.fills] == ["market"]
+    assert len(held.final_positions) == 1
+    assert held.final_cash == Decimal("0.00")
 
     result = run_backtest(
         document, {"sol": [_fixture_bar(payload["entry"]), synthetic, real]}
@@ -1286,27 +1287,28 @@ def test_oco_on_a_synthetic_bar_is_deferred_to_the_next_real_bar() -> None:
     assert result.final_positions == ()
 
 
-def test_a_deferred_stop_survives_a_hole_and_a_hole_cannot_arm_one() -> None:
+def test_a_synthetic_minute_and_a_hole_leave_the_oco_for_the_next_real_bar() -> None:
+    """A synthetic bar flat at 90 is not a touch. A hole is not a touch.
+
+    The following real bar opens at 100 and trades 100–101, above the stop.
+    Neither run fills. The long stays open.
+    """
     payload, document = _oco_hand()
     synthetic = _bar(60, 90, synthetic=True)
-    # Opens at 100, so the armed stop fills at the stop, the same cents as a
-    # live stop. Close 101 does not pass the entry signal.
     resumed = _bar(180, 101, open_=100, high=101, low=100)
-    deferred = run_backtest(
+    with_minute = run_backtest(
         document,
         {"sol": [_fixture_bar(payload["entry"]), synthetic, resumed]},
     )
-    assert [fill.open_time for fill in deferred.fills] == [_START, _START + 180]
-    assert deferred.fills[1].leg == "stop_loss"
-    assert deferred.fills[1].price == _money(payload, "stop_loss_fill")
-    assert deferred.final_cash == _money(payload, "stop_loss_cash")
-
-    quiet = run_backtest(
+    hole = run_backtest(
         document,
         {"sol": [_fixture_bar(payload["entry"]), resumed]},
     )
-    assert [fill.leg for fill in quiet.fills] == ["market"]
-    assert len(quiet.final_positions) == 1
+    assert [fill.leg for fill in with_minute.fills] == ["market"]
+    assert with_minute.fills == hole.fills
+    assert with_minute.final_positions == hole.final_positions
+    assert len(with_minute.final_positions) == 1
+    assert with_minute.final_cash == Decimal("0.00")
 
 
 def test_a_future_stop_does_not_change_earlier_equity() -> None:
@@ -1429,6 +1431,214 @@ def test_tighten_only_rejects_a_looser_level_and_allows_a_tighter_one() -> None:
     assert tight_result.fills[2].price == Decimal("96")
     assert tight_result.fills[2].notional == Decimal("9600.00")
     assert tight_result.final_cash == Decimal("9600.00")
+
+
+def test_inserting_a_synthetic_minute_does_not_change_the_oco_exit() -> None:
+    """A no-trade minute must not relabel or invent an exit.
+
+    Case A: the pyramid tightens the target from 120 to 105 while price is
+    108, and the stop stays 97. A synthetic minute flat at 108 used to arm
+    the target, so the next bar's open at 95 filled as take_profit. Without
+    that minute the same bar is a gap-through stop at 95.
+
+    Case C: 50 bps of buy slippage puts a 0.3% stop at 100.1985, above the
+    entry close. A synthetic copy of that close used to arm the stop, and the
+    next bar (100.8–101.5) filled at 100.1985, a price it never traded.
+    Without the minute there is no exit.
+    """
+    tightened = _pyramid_levels(_risk(20, 3), _risk(5, 3))
+    entry = _bar(0, 100)
+    added = _bar(60, 108)
+    quiet = _bar(120, 108, synthetic=True)
+    gap = _bar(180, 95, open_=95, high=95, low=90)
+    with_minute = run_backtest(tightened, {"sol": [entry, added, quiet, gap]})
+    without = run_backtest(tightened, {"sol": [entry, added, gap]})
+    assert [fill.leg for fill in without.fills] == ["market", "market", "stop_loss"]
+    assert without.fills[-1].price == Decimal("95")
+    assert with_minute.fills == without.fills
+    assert with_minute.final_cash == without.final_cash
+    assert with_minute.final_positions == ()
+
+    slipped = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 50},
+        signals=[{"id": "go", "expr": _eq("close", 100)}],
+    )
+    slipped["actions"][0]["risk"] = _risk(6, 0.3)
+    bought = _bar(0, 100)
+    copied = _bar(60, 100, synthetic=True)
+    traded = _bar(120, 101.2, open_=101.0, high=101.5, low=100.8)
+    armed = run_backtest(slipped, {"sol": [bought, copied, traded]})
+    plain = run_backtest(slipped, {"sol": [bought, traded]})
+    assert [fill.leg for fill in plain.fills] == ["market"]
+    assert plain.fills[0].price == Decimal("100.5")
+    assert len(plain.final_positions) == 1
+    assert armed.fills == plain.fills
+    assert armed.final_positions == plain.final_positions
+    assert all(fill.price != Decimal("100.1985") for fill in armed.fills)
+
+
+def test_oco_settles_before_the_same_bars_signal_exit() -> None:
+    """The stop fills before rules, so the signal exit finds no position.
+
+    Moving settlement to after the rules would sell at the close instead,
+    and the skip would disappear.
+    """
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "stop", "expr": _eq("close", 96)},
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "exit_rule", "when": "stop", "do": "exit_sol"},
+        ],
+    )
+    document["actions"][0]["risk"] = _risk(10, 5)
+    result = run_backtest(
+        document,
+        {"sol": [_bar(0, 100), _bar(60, 96, open_=100, high=100, low=90)]},
+    )
+    assert [fill.leg for fill in result.fills] == ["market", "stop_loss"]
+    assert result.fills[1].price == Decimal("95")
+    assert [(item.action_id, item.reason) for item in result.skipped] == [
+        ("exit_sol", "no_position")
+    ]
+
+
+def test_a_level_touched_at_equality_fills() -> None:
+    """low == stop fills the stop. high == target fills the target."""
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[{"id": "go", "expr": _eq("close", 100)}],
+    )
+    document["actions"][0]["risk"] = _risk(10, 5)
+    entry = _bar(0, 100)
+    stopped = run_backtest(
+        document,
+        {"sol": [entry, _bar(60, 96, open_=100, high=100, low=95)]},
+    )
+    targeted = run_backtest(
+        document,
+        {"sol": [entry, _bar(60, 105, open_=100, high=110, low=100)]},
+    )
+    assert [fill.leg for fill in stopped.fills] == ["market", "stop_loss"]
+    assert stopped.fills[1].price == Decimal("95")
+    assert [fill.leg for fill in targeted.fills] == ["market", "take_profit"]
+    assert targeted.fills[1].price == Decimal("110")
+
+
+def test_a_same_bar_exit_and_reenter_anchors_a_fresh_oco() -> None:
+    """A full exit drops the pair. The re-enter on that bar starts a new one.
+
+    The new fill is 120, so a 3% stop is 116.4. The old pair was anchored at
+    100 with a stop at 1, and a low of 116 would not reach it.
+    """
+    enter = {
+        "type": "enter",
+        "side": "long",
+        "asset": "sol",
+        "order": {"type": "market"},
+        "sizing": {"mode": "percent_equity", "percent": 100},
+    }
+    document = _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "out", "expr": _eq("close", 120)},
+            {"id": "again", "expr": _eq("close", 120)},
+        ],
+        actions=[
+            {"id": "enter_sol", **enter, "risk": _risk(100, 99)},
+            {
+                "id": "exit_sol",
+                "type": "exit",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_position", "percent": 100},
+            },
+            {"id": "reenter_sol", **enter, "risk": _risk(6, 3)},
+        ],
+        rules=[
+            {"id": "exit_rule", "when": "out", "do": "exit_sol"},
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "reenter_rule", "when": "again", "do": "reenter_sol"},
+        ],
+    )
+    result = run_backtest(
+        document,
+        {
+            "sol": [
+                _bar(0, 100),
+                _bar(60, 120),
+                _bar(120, 117, open_=118, high=118, low=116),
+            ]
+        },
+    )
+    assert [fill.leg for fill in result.fills] == ["market", "market", "market", "stop_loss"]
+    assert result.fills[-1].price == Decimal("116.4")
+    assert result.final_positions == ()
+
+
+def test_a_pyramid_keeps_the_first_entry_anchor() -> None:
+    """Same percents stay on the first fill. 10% of 100 is 110, not 115.5.
+
+    The added fill is 105. A target anchored there would be 115.5, and a
+    high of 112 would not reach it.
+    """
+    document = _pyramid_oco(_risk(10, 10))
+    document["signals"] = [
+        {"id": "go", "expr": _eq("close", 100)},
+        {"id": "add", "expr": _eq("close", 105)},
+    ]
+    result = run_backtest(
+        document,
+        {
+            "sol": [
+                _bar(0, 100),
+                _bar(60, 105),
+                _bar(120, 108, open_=100, high=112, low=100),
+            ]
+        },
+    )
+    assert [fill.leg for fill in result.fills] == ["market", "market", "take_profit"]
+    assert result.fills[2].price == Decimal("110")
+    assert result.final_positions == ()
+
+
+def _pyramid_levels(first: dict, second: dict) -> dict:
+    """50% at close 100, then 50% at close 108, on the first fill's anchor."""
+    enter = {
+        "type": "enter",
+        "side": "long",
+        "asset": "sol",
+        "order": {"type": "market"},
+        "sizing": {"mode": "percent_equity", "percent": 50},
+    }
+    return _strategy(
+        costs={"commission_bps": 0, "slippage_bps": 0},
+        signals=[
+            {"id": "go", "expr": _eq("close", 100)},
+            {"id": "add", "expr": _eq("close", 108)},
+        ],
+        actions=[
+            {"id": "enter_sol", **enter, "risk": first},
+            {"id": "add_sol", **enter, "risk": second},
+        ],
+        rules=[
+            {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+            {"id": "add_rule", "when": "add", "do": "add_sol"},
+        ],
+        portfolio={
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": True,
+            "quote_currency": "USDC",
+        },
+    )
 
 
 def _pyramid_oco(second_risk: dict) -> dict:
