@@ -7,7 +7,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | Path | What it is |
 | --- | --- |
 | `web/` | Next.js placeholder page. No product features. |
-| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), and the strategy-file parser (`app/dsl`). |
+| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), and the indicator library (`app/indicators`). |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
 | `docs/dsl-spec.md` | Strategy DSL, IR contract, semantic error codes, and the canonical hash. |
 | `docs/save-format.md` | Versioned save envelope (`ir_version`, `format_version`, `ir_hash`). |

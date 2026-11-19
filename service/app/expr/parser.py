@@ -453,6 +453,7 @@ def _finish_indicator(
             raise _at_span(
                 span,
                 f"wrong arity: {indicator.name} expects arguments ({listed}), missing source",
+                code="missing_param",
             )
         source = found[1]
     elif "source" in kw:
@@ -473,6 +474,7 @@ def _finish_indicator(
             raise _at_span(
                 span,
                 f"wrong arity: {indicator.name} expects arguments ({listed}), missing {pname}",
+                code="missing_param",
             )
         _expect(value, ExprType.NUMERIC, f"{indicator.name} argument {pname}")
         bound.append((pname, value))
@@ -811,6 +813,11 @@ def _at_span(
 
 
 def _with_span(node: Expr, span: Span) -> Expr:
+    # Grouping parentheses usually cover the inner node. An indicator call
+    # keeps the span of the call, so `(RSI(close, period=14))` reports the
+    # inline-indicator error at `RSI` and not at the opening parenthesis.
+    if isinstance(node, IndicatorCall):
+        return node
     if isinstance(node, Lit):
         return Lit(node.value, node.result_type, span)
     if isinstance(node, Ref):
@@ -821,4 +828,4 @@ def _with_span(node: Expr, span: Span) -> Expr:
         return Binary(node.op, node.left, node.right, node.result_type, span)
     if isinstance(node, Call):
         return Call(node.op, node.args, node.result_type, span)
-    return IndicatorCall(node.name, node.source, node.params, node.output, node.result_type, span)
+    raise TypeError(f"unknown expression node {type(node).__name__}")
