@@ -51,7 +51,11 @@ def main() -> None:
         "tolerance": {"rel": REL_TOL, "abs": ABS_TOL},
         "notes": {
             "ema": "TA-Lib EMA. Seed is an SMA, then alpha = 2/(period+1).",
-            "rsi": "TA-Lib RSI. Wilder smoothing. Both averages at 0 yield 0.",
+            "rsi": (
+                "TA-Lib RSI. Wilder smoothing. This seeded series has no fully "
+                "flat window. The library returns NaN there, which TA-Lib calls "
+                "0. That case is not in this fixture."
+            ),
             "atr": "TA-Lib ATR. Wilder smoothing of true range. Warmup is the period.",
             "bollinger": "TA-Lib BBANDS with matype SMA. Population stddev, ddof 0.",
             "macd": (
@@ -60,7 +64,9 @@ def main() -> None:
             ),
             "stochastic": (
                 "Fast %K from TA-Lib MIN and MAX, no extra smoothing. %D is an SMA. "
-                "Overlapping bars were checked against TA-Lib STOCHF. A zero range is 0."
+                "Overlapping bars were checked against TA-Lib STOCHF. This seeded "
+                "series has no zero range. The library returns NaN there, which "
+                "TA-Lib calls 0. That case is not in this fixture."
             ),
         },
         "ohlcv": {
@@ -134,9 +140,10 @@ def _stochastic_case(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> di
             continue
         span = float(highest[index] - lowest[index])
         if span == 0.0:
-            k[index] = 0.0
-        else:
-            k[index] = 100.0 * (float(close[index]) - float(lowest[index])) / span
+            # TA-Lib would store 0. The library returns NaN, so a zero range
+            # in this walk would make the committed golden disagree with it.
+            raise SystemExit("synthetic series has a zero stochastic range")
+        k[index] = 100.0 * (float(close[index]) - float(lowest[index])) / span
     d = _sma(k, d_period)
     reference_k, reference_d = talib.STOCHF(high, low, close, k_period, d_period, fastd_matype=0)
     _assert_overlap(k, reference_k, "stochastic %K vs STOCHF")

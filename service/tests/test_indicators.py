@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
 
 import pytest
 
 from app.indicators import (
     IndicatorError,
+    IndicatorLint,
     atr,
     atr_warmup,
     bollinger,
@@ -143,9 +145,14 @@ def test_period_one_matches_the_definition() -> None:
     high = [2.0, 4.0, 4.0]
     low = [0.0, 2.0, 4.0]
     close = [1.0, 3.0, 4.0]
-    stoch = stochastic(high, low, close, 1, 1)
-    assert stoch.k == [50.0, 50.0, 0.0]
-    assert stoch.d == stoch.k
+    with pytest.warns(IndicatorLint, match="highest high equals the lowest low"):
+        stoch = stochastic(high, low, close, 1, 1)
+    assert stoch.k[0] == 50.0
+    assert stoch.k[1] == 50.0
+    assert math.isnan(stoch.k[2])
+    assert stoch.d[0] == 50.0
+    assert stoch.d[1] == 50.0
+    assert math.isnan(stoch.d[2])
     ranges = atr(high, low, close, 1)
     assert math.isnan(ranges[0])
     assert ranges[1] == max(2.0, abs(4.0 - 1.0), abs(2.0 - 1.0))
@@ -198,20 +205,70 @@ def test_bollinger_stddev_of_ten_uses_population_sd() -> None:
     assert bands.lower[1] == -8.0
 
 
-def test_constant_rsi_and_stochastic_stay_finite() -> None:
+def test_flat_rsi_and_zero_range_stochastic_are_nan() -> None:
     flat = [7.0] * 12
-    rsi_values = rsi(flat, 5)
-    _assert_prefix(rsi_values, 5)
-    assert rsi_values[5:] == [0.0] * 7
-    stoch = stochastic(flat, flat, flat, 4, 3)
-    _assert_prefix(stoch.k, 3)
-    _assert_prefix(stoch.d, 5)
-    assert stoch.k[3:] == [0.0] * 9
-    assert stoch.d[5:] == [0.0] * 7
+    with pytest.warns(IndicatorLint, match="average gain and average loss are both 0") as caught:
+        rsi_values = rsi(flat, 5)
+    assert len(caught) == 1
+    assert all(math.isnan(value) for value in rsi_values)
+    with pytest.warns(IndicatorLint, match="highest high equals the lowest low") as stoch_warnings:
+        stoch = stochastic(flat, flat, flat, 4, 3)
+    assert len(stoch_warnings) == 1
+    assert all(math.isnan(value) for value in stoch.k)
+    assert all(math.isnan(value) for value in stoch.d)
     bands = bollinger(flat, 4, 2)
     assert bands.middle[3:] == [7.0] * 9
     assert bands.upper[3:] == [7.0] * 9
     assert bands.lower[3:] == [7.0] * 9
+
+
+def test_rsi_does_not_drift_toward_50_on_a_very_long_flat_run() -> None:
+    # Period 3 underflows Wilder state after roughly two thousand flat bars.
+    # The ratio after the move has to stay put, including past that point.
+    prices = [10.0, 12.0, 11.0, 13.0] + [13.0] * 20_000
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        values = rsi(prices, 3)
+    assert not any(issubclass(item.category, IndicatorLint) for item in caught)
+    held = values[3]
+    assert math.isfinite(held)
+    assert held != 50.0
+    assert values[-1] == held
+    assert not math.isnan(values[-1])
+
+
+def test_rsi_holds_its_last_value_when_the_market_goes_flat_after_a_move() -> None:
+    # Period 2. Changes +2, -2, then two flat bars. The ratio stays 50.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        held = rsi([10.0, 12.0, 10.0, 10.0, 10.0], 2)
+        stayed = rsi([10.0, 12.0, 12.0, 12.0], 2)
+    assert not any(issubclass(item.category, IndicatorLint) for item in caught)
+    assert math.isnan(held[0]) and math.isnan(held[1])
+    assert held[2] == 50.0
+    assert held[3] == 50.0
+    assert held[4] == 50.0
+    assert stayed[2:] == [100.0, 100.0]
+
+
+def test_flat_rsi_keeps_state_so_a_later_move_is_defined() -> None:
+    # The first window is fully flat (NaN). The next change still uses those
+    # zero averages, so it does not wait for a new seed.
+    with pytest.warns(IndicatorLint, match="average gain and average loss are both 0"):
+        values = rsi([10.0, 10.0, 10.0, 14.0], 2)
+    assert math.isnan(values[2])
+    assert values[3] == 100.0
+
+
+def test_zero_range_stochastic_is_not_copied_forward() -> None:
+    high = [2.0, 1.0, 4.0]
+    low = [0.0, 1.0, 2.0]
+    close = [1.0, 1.0, 3.0]
+    with pytest.warns(IndicatorLint, match="highest high equals the lowest low"):
+        stoch = stochastic(high, low, close, 1, 1)
+    assert stoch.k[0] == 50.0
+    assert math.isnan(stoch.k[1])
+    assert stoch.k[2] == 50.0
 
 
 def test_rsi_wilder_step_on_a_short_series() -> None:

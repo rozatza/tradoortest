@@ -10,11 +10,11 @@
   },
   "notes": {
     "ema": "TA-Lib EMA. Seed is an SMA, then alpha = 2/(period+1).",
-    "rsi": "TA-Lib RSI. Wilder smoothing. Both averages at 0 yield 0.",
+    "rsi": "TA-Lib RSI. Wilder smoothing. This seeded series has no fully flat window. The library returns NaN there, which TA-Lib calls 0. That case is not in this fixture.",
     "atr": "TA-Lib ATR. Wilder smoothing of true range. Warmup is the period.",
     "bollinger": "TA-Lib BBANDS with matype SMA. Population stddev, ddof 0.",
     "macd": "TA-Lib EMA(fast) minus TA-Lib EMA(slow), then TA-Lib EMA of that line. TA-Lib MACD() re-seeds the faster EMA and is not this series.",
-    "stochastic": "Fast %K from TA-Lib MIN and MAX, no extra smoothing. %D is an SMA. Overlapping bars were checked against TA-Lib STOCHF. A zero range is 0."
+    "stochastic": "Fast %K from TA-Lib MIN and MAX, no extra smoothing. %D is an SMA. Overlapping bars were checked against TA-Lib STOCHF. This seeded series has no zero range. The library returns NaN there, which TA-Lib calls 0. That case is not in this fixture."
   },
   "ohlcv": {
     "open": [
