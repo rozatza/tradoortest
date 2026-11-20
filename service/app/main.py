@@ -29,7 +29,7 @@ def create_app(
         return error_response(422, "expr_too_deep", "expression nested too deeply", None)
 
     @application.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     return application

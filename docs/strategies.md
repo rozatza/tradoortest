@@ -82,13 +82,15 @@ A strategy owned by any other `user_id` is invisible. The running process does n
 }
 ```
 
-`dsl_diff` is a unified diff. Identical DSL is an empty string. Otherwise the header lines are `--- vN` and `+++ vN`.
+`dsl_diff` is a unified diff in the same form as `diff -u`. Identical DSL is an empty string. Otherwise the header lines are `--- vN` and `+++ vN`. A source line with no trailing newline is followed by `\ No newline at end of file`.
 
 `ir_diff` walks the canonical IR. Object keys are sorted. List indexes are numbers in the path, so `$.rules[2]` sorts before `$.rules[10]`. `op` is `replace` (`from` and `to`), `add` (`value`), or `remove` (`value`). Identical versions produce an empty list. The same two documents produce the same list under any `PYTHONHASHSEED`.
 
 ## Errors
 
-Every 4xx and 5xx body is `{"error": {"code", "message", "path"}}`. `path` is a JSONPath or null. The body never includes a traceback, a filesystem path, or SQLite's own text.
+Strategy routes return `{"error": {"code", "message", "path"}}` for the statuses in the table below. `path` is a JSONPath or null. Those bodies never include a traceback, a filesystem path, or SQLite's own text.
+
+A path this router does not define, and a method it does not allow, are FastAPI's `{"detail": ...}` (HTTP 404 or 405). A malformed `Content-Length` header can be rejected by the server with a plain HTTP 400 before the application runs. The 400 `invalid_request` row is what the application returns when that header reaches it.
 
 | HTTP | `code` | When |
 | --- | --- | --- |
@@ -110,7 +112,7 @@ A locked or corrupt database is 503 on every strategy route, including a route t
 
 The body cap is checked on the declared `Content-Length` and again while reading `request.stream()`, so a chunked request with no `Content-Length` stops at the cap instead of buffering the rest.
 
-SQLite work and parsing run in a thread pool. The connection uses `PRAGMA foreign_keys=ON`, `PRAGMA secure_delete=ON`, and `PRAGMA busy_timeout`. Writes take a process `RLock` and `BEGIN IMMEDIATE`. The next version is `MAX(version) + 1` in that transaction. `(strategy_id, version)` is the primary key, so a version number is not reused.
+SQLite work and parsing run in a thread pool. The connection uses `PRAGMA foreign_keys=ON`, `PRAGMA secure_delete=ON`, and `PRAGMA busy_timeout`. Writes take a process `RLock` and `BEGIN IMMEDIATE`. The next version is `MAX(version) + 1` in that transaction. `(strategy_id, version)` is the primary key, so a version number is not reused. `BEFORE UPDATE` and `BEFORE DELETE` triggers on `strategy_versions` abort with `strategy_versions rows are immutable`.
 
 ## Environment
 

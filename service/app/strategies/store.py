@@ -2,7 +2,8 @@
 
 One connection, one ``RLock``, and ``BEGIN IMMEDIATE`` for every write.
 The next version is ``MAX(version) + 1`` inside that transaction, and
-``(strategy_id, version)`` is the primary key.
+``(strategy_id, version)`` is the primary key. ``BEFORE UPDATE`` and
+``BEFORE DELETE`` triggers reject changes to a version row.
 
 Rows hold the owner, the DSL text, the canonical IR JSON, and ``ir_hash``.
 There is no bar table and no column for prices.
@@ -55,6 +56,18 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
 
 CREATE INDEX IF NOT EXISTS strategies_by_owner
 ON strategies (user_id, created_at, strategy_id);
+
+CREATE TRIGGER IF NOT EXISTS strategy_versions_no_update
+BEFORE UPDATE ON strategy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'strategy_versions rows are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS strategy_versions_no_delete
+BEFORE DELETE ON strategy_versions
+BEGIN
+    SELECT RAISE(ABORT, 'strategy_versions rows are immutable');
+END;
 """
 
 

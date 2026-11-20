@@ -13,7 +13,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | `docs/backtest.md` | How the engine fills market orders on bar close. Simulation only. |
 | `docs/metrics.md` | Return, drawdown, and risk ratios, plus the CSV and JSON trade log. |
 | `docs/ohlcv.md` | Provider, cost, timeframes, bar checks, and the backfill command. |
-| `data/` | Local OHLCV cache. Gitignored. Expires within 24 hours. Not created until a backfill runs. |
+| `data/` | Gitignored local SQLite. `strategies.sqlite` is saved strategies, `backtest-jobs.sqlite` is the job queue, and `ohlcv.sqlite` is the OHLCV cache. The cache expires within 24 hours and is created by a backfill. |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
 | `docs/dsl-spec.md` | Strategy DSL, IR contract, semantic error codes, and the canonical hash. |
 | `docs/save-format.md` | Versioned save envelope (`ir_version`, `format_version`, `ir_hash`). |

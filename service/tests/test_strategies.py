@@ -1008,3 +1008,274 @@ def test_parent_delete_is_rejected_by_the_foreign_key(tmp_path: Path) -> None:
             assert store._conn is not None
             store._conn.execute("DELETE FROM strategies")
         assert store._conn.execute("SELECT COUNT(*) FROM strategy_versions").fetchone()[0] == 1
+
+
+def test_unified_diff_marks_a_missing_trailing_newline() -> None:
+    """A body line without ``\\n`` stays its own line, with the diff -u marker."""
+    prefix = "engine:\n  bar_size: 1h\n"
+    marker = "\\ No newline at end of file\n"
+
+    both = dsl_unified_diff(prefix + "# end A", prefix + "# end B", 1, 2)
+    assert both.startswith("--- v1\n+++ v2\n")
+    assert "@@ " in both
+    assert f"-# end A\n{marker}+# end B\n{marker}" in both
+    assert "-# end A+" not in both
+
+    old_missing = dsl_unified_diff(prefix + "# end A", prefix + "# end B\n", 1, 2)
+    assert f"-# end A\n{marker}+# end B\n" in old_missing
+    assert "+# end B\n\\ No newline" not in old_missing
+    assert "-# end A+" not in old_missing
+
+    new_missing = dsl_unified_diff(prefix + "# end A\n", prefix + "# end B", 3, 4)
+    assert new_missing.startswith("--- v3\n+++ v4\n")
+    assert f"-# end A\n+# end B\n{marker}" in new_missing
+    assert "-# end A\n\\ No newline" not in new_missing
+    assert "-# end A+" not in new_missing
+
+    bare = prefix + "  quote_currency: USDC"
+    newline_only = dsl_unified_diff(bare, bare + "\n", 1, 2)
+    assert f"-  quote_currency: USDC\n{marker}+  quote_currency: USDC\n" in newline_only
+    assert "-  quote_currency: USDC+" not in newline_only
+
+    assert dsl_unified_diff(bare, bare, 1, 1) == ""
+    assert dsl_unified_diff(bare + "\n", bare + "\n", 2, 2) == ""
+
+
+def test_structural_diff_distinguishes_types_and_shape() -> None:
+    """Kills D1, D5, D6, and D12."""
+    assert ir_structural_diff(1, True) == [{"op": "replace", "path": "$", "from": 1, "to": True}]
+    assert ir_structural_diff(0, False) == [{"op": "replace", "path": "$", "from": 0, "to": False}]
+    assert ir_structural_diff(1, 1.0) == [{"op": "replace", "path": "$", "from": 1, "to": 1.0}]
+    assert ir_structural_diff({"a": 1}, {"a": 1, "b": 2}) == [
+        {"op": "add", "path": "$.b", "value": 2}
+    ]
+    assert ir_structural_diff({"a": 1, "b": 2}, {"a": 1}) == [
+        {"op": "remove", "path": "$.b", "value": 2}
+    ]
+    assert ir_structural_diff([1], [1, 2]) == [{"op": "add", "path": "$[1]", "value": 2}]
+    assert ir_structural_diff([1, 2], [1]) == [{"op": "remove", "path": "$[1]", "value": 2}]
+
+
+def test_second_user_is_hidden_on_every_route(tmp_path: Path) -> None:
+    """Kills O1. A row seeded for another owner stays hidden and unchanged."""
+    dsl, _document = _ema()
+    bob = "cd" * 16
+    digest = "ab" * 32
+    with _client(tmp_path / "strategies.sqlite") as (client, store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        assert created.status_code == 201, created.text
+        local_id = created.json()["strategy_id"]
+        assert store._conn is not None
+        store._conn.execute(
+            """
+            INSERT INTO strategies (
+                strategy_id, user_id, name, ir_strategy_id,
+                created_at, updated_at, archived_at
+            ) VALUES (?, 'other-user', 'other-owner-name', 'bob_sol', ?, ?, NULL)
+            """,
+            (bob, "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z"),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO strategy_versions (
+                strategy_id, version, user_id, dsl, ir_json, ir_hash, created_at
+            ) VALUES (?, 1, 'other-user', 'bob-dsl', '{}', ?, ?)
+            """,
+            (bob, digest, "2026-01-01T00:00:01Z"),
+        )
+
+        def bob_rows() -> list[tuple[Any, ...]]:
+            assert store._conn is not None
+            return list(
+                store._conn.execute(
+                    """
+                    SELECT s.user_id, s.archived_at, v.version, v.user_id, v.dsl
+                    FROM strategies AS s
+                    JOIN strategy_versions AS v ON v.strategy_id = s.strategy_id
+                    WHERE s.strategy_id = ?
+                    ORDER BY v.version
+                    """,
+                    (bob,),
+                )
+            )
+
+        before = bob_rows()
+        listed = client.get("/strategies")
+        assert listed.status_code == 200
+        page = listed.json()
+        assert page["total"] == 1
+        assert [item["strategy_id"] for item in page["strategies"]] == [local_id]
+        included = client.get("/strategies?include_archived=true")
+        assert included.status_code == 200
+        assert included.json()["total"] == 1
+        assert [item["strategy_id"] for item in included.json()["strategies"]] == [local_id]
+        calls = [
+            ("GET", f"/strategies/{bob}", None),
+            ("PUT", f"/strategies/{bob}", {"dsl": dsl}),
+            ("DELETE", f"/strategies/{bob}", None),
+            ("GET", f"/strategies/{bob}/versions", None),
+            ("GET", f"/strategies/{bob}/versions/1", None),
+            ("GET", f"/strategies/{bob}/diff?from=1&to=1", None),
+        ]
+        for method, path, payload in calls:
+            response = client.request(method, path, json=payload)
+            error = _error(response, 404, "not_found")
+            assert error["message"] == "strategy was not found"
+        assert bob_rows() == before
+
+
+def test_mid_write_failure_rolls_back_and_keeps_the_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills M8 and M9. A failed write rolls back, then another write works."""
+    dsl, _document = _ema()
+    compiled = compile_body(json.dumps({"dsl": dsl}).encode("utf-8"))
+    store = StrategyStore(tmp_path / "strategies.sqlite")
+    try:
+        store.create(LOCAL_USER_ID, compiled)
+        assert _strategy_count(store) == 1
+
+        def unavailable(*_args: object, **_kwargs: object) -> None:
+            raise StoreUnavailable()
+
+        monkeypatch.setattr(store, "_insert_version", unavailable)
+        with pytest.raises(StoreUnavailable):
+            store.create(LOCAL_USER_ID, compiled)
+        assert _strategy_count(store) == 1
+        monkeypatch.undo()
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("mid-write")
+
+        monkeypatch.setattr(store, "_insert_version", boom)
+        with pytest.raises(RuntimeError, match="mid-write"):
+            store.create(LOCAL_USER_ID, compiled)
+        assert _strategy_count(store) == 1
+        monkeypatch.undo()
+
+        store.create(LOCAL_USER_ID, compiled)
+        assert _strategy_count(store) == 2
+    finally:
+        store.close()
+
+
+def test_body_cap_exact_boundary_and_duplicate_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills B3, B4, B5, B7, and B9."""
+    monkeypatch.setenv("STRATEGIES_MAX_BODY_BYTES", "32")
+    with _client(tmp_path / "strategies.sqlite", raise_server_exceptions=False) as (
+        _client_http,
+        _store,
+        application,
+    ):
+        _assert_cap(application, 32)
+        status, raw = _invoke(
+            application,
+            "POST",
+            "/strategies",
+            body=b"{}",
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-length", b"2"),
+                (b"content-length", b"2"),
+            ],
+        )
+        assert status == 400, raw
+        assert json.loads(raw)["error"]["code"] == "invalid_request"
+
+        monkeypatch.delenv("STRATEGIES_MAX_BODY_BYTES")
+        _assert_cap(application, 65_536)
+
+
+def test_corrupt_ir_json_is_503(tmp_path: Path) -> None:
+    """Kills S10. Unreadable canonical IR is 503, not a traceback."""
+    bad_id = "ef" * 16
+    with _client(tmp_path / "strategies.sqlite", raise_server_exceptions=False) as (
+        client,
+        store,
+        _app,
+    ):
+        assert store._conn is not None
+        store._conn.execute(
+            """
+            INSERT INTO strategies (
+                strategy_id, user_id, name, ir_strategy_id,
+                created_at, updated_at, archived_at
+            ) VALUES (?, ?, 'Broken', 'broken', ?, ?, NULL)
+            """,
+            (bad_id, LOCAL_USER_ID, "2026-01-01T00:00:02Z", "2026-01-01T00:00:02Z"),
+        )
+        store._conn.execute(
+            """
+            INSERT INTO strategy_versions (
+                strategy_id, version, user_id, dsl, ir_json, ir_hash, created_at
+            ) VALUES (?, 1, ?, 'dsl', 'NOT-JSON', ?, ?)
+            """,
+            (bad_id, LOCAL_USER_ID, "cd" * 32, "2026-01-01T00:00:02Z"),
+        )
+        response = client.get(f"/strategies/{bad_id}")
+        _error(response, 503, "store_unavailable")
+        assert "NOT-JSON" not in response.text
+        assert "Expecting value" not in response.text
+
+
+def test_version_rows_reject_update_and_delete(tmp_path: Path) -> None:
+    """Version rows cannot be updated or deleted, including by raw SQL."""
+    dsl, _document = _ema()
+    with _client(tmp_path / "strategies.sqlite") as (client, store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        assert created.status_code == 201, created.text
+        assert store._conn is not None
+        with pytest.raises(sqlite3.IntegrityError) as updated:
+            store._conn.execute("UPDATE strategy_versions SET dsl = 'tampered'")
+        assert "strategy_versions rows are immutable" in str(updated.value)
+        with pytest.raises(sqlite3.IntegrityError) as deleted:
+            store._conn.execute("DELETE FROM strategy_versions")
+        assert "strategy_versions rows are immutable" in str(deleted.value)
+        row = store._conn.execute("SELECT dsl, COUNT(*) FROM strategy_versions").fetchone()
+        assert row is not None
+        assert row[0] == dsl
+        assert row[1] == 1
+
+
+def _strategy_count(store: StrategyStore) -> int:
+    assert store._conn is not None
+    return int(store._conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0])
+
+
+def _assert_cap(application: Any, cap: int) -> None:
+    exact = b"{" + b"x" * (cap - 2) + b"}"
+    over = exact + b"x"
+    assert len(exact) == cap
+    assert len(over) == cap + 1
+    for payload, limited in ((exact, False), (over, True)):
+        status, raw = _invoke(application, "POST", "/strategies", body=payload)
+        _expect_cap(status, raw, limited)
+        status, raw = _invoke(
+            application,
+            "POST",
+            "/strategies",
+            headers=[(b"content-type", b"application/json")],
+            receive=_one_chunk(payload),
+        )
+        _expect_cap(status, raw, limited)
+
+
+def _one_chunk(payload: bytes) -> Any:
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    return receive
+
+
+def _expect_cap(status: int, raw: bytes, limited: bool) -> None:
+    assert len(raw) < 500
+    assert b"xx" not in raw
+    body = json.loads(raw)
+    if limited:
+        assert status == 413
+        assert body["error"]["code"] == "payload_too_large"
+        return
+    assert status == 422
+    assert body["error"]["code"] == "invalid_json"

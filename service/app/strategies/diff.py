@@ -14,11 +14,16 @@ from typing import Any
 _SEGMENT = re.compile(r"\.([^.\[\]]+)|\[(\d+)\]")
 
 
+_NO_NEWLINE = "\\ No newline at end of file\n"
+
+
 def dsl_unified_diff(before: str, after: str, from_version: int, to_version: int) -> str:
     """Unified diff of two DSL texts.
 
     Identical texts return an empty string. Otherwise the result starts
-    with ``--- vN`` and ``+++ vN`` and uses ``\\n`` line endings.
+    with ``--- vN`` and ``+++ vN``. A body line that has no trailing
+    newline is ended, then marked ``\\ No newline at end of file``,
+    matching ``diff -u``.
     """
     before_lines = before.splitlines(keepends=True)
     after_lines = after.splitlines(keepends=True)
@@ -30,7 +35,14 @@ def dsl_unified_diff(before: str, after: str, from_version: int, to_version: int
         n=3,
         lineterm="\n",
     )
-    return "".join(rendered)
+    parts: list[str] = []
+    for line in rendered:
+        if line.endswith("\n"):
+            parts.append(line)
+            continue
+        parts.append(line + "\n")
+        parts.append(_NO_NEWLINE)
+    return "".join(parts)
 
 
 def ir_structural_diff(before: Any, after: Any) -> list[dict[str, Any]]:
