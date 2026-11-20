@@ -61,6 +61,10 @@ INTEGER_COLUMNS = frozenset(
 TIMESTAMP_COLUMNS: frozenset[str] = frozenset()
 
 _FORMULA_LEAD = frozenset("=+-@\t\r")
+# Fullwidth ＝ ＋ － ＠. A spreadsheet can treat these as formula starts.
+_FORMULA_LOOKALIKE = frozenset("\uff1d\uff0b\uff0d\uff20")
+# Space, tab, CR, LF, NBSP, and a BOM may sit in front of a formula start.
+_FORMULA_PAD = frozenset(" \t\r\n\u00a0\ufeff")
 
 
 def _strict_decimal(value: str) -> bool:
@@ -73,8 +77,10 @@ def csv_cell(column: str, value: str | None) -> str:
 
     Raw when ``value`` is a strict decimal, or when ``column`` is a declared
     integer or ISO timestamp column and ``value`` matches that format.
-    Otherwise a leading ``= + - @`` tab or CR is prefixed with an apostrophe.
-    ``None`` is an empty cell. An unknown column cannot skip the apostrophe.
+    Otherwise a formula start is prefixed with an apostrophe. That includes
+    ``= + - @`` tab or CR, a fullwidth lookalike, and the same characters
+    after leading space, NBSP, or a BOM. ``None`` is an empty cell. An
+    unknown column cannot skip the apostrophe.
     """
     if value is None:
         return ""
@@ -84,9 +90,22 @@ def csv_cell(column: str, value: str | None) -> str:
         return value
     if column in TIMESTAMP_COLUMNS and _ISO_TIMESTAMP.fullmatch(value):
         return value
-    if value[:1] in _FORMULA_LEAD:
+    if _formula_prefixed(value):
         return "'" + value
     return value
+
+
+def _formula_prefixed(value: str) -> bool:
+    """True when the cell would open as a formula, including a padded start."""
+    if value[:1] in _FORMULA_LEAD or value[:1] in _FORMULA_LOOKALIKE:
+        return True
+    index = 0
+    while index < len(value) and value[index] in _FORMULA_PAD:
+        index += 1
+    if index == 0 or index >= len(value):
+        return False
+    character = value[index]
+    return character in _FORMULA_LEAD or character in _FORMULA_LOOKALIKE
 
 
 def render_export(name: str, result: Mapping[str, Any]) -> str:

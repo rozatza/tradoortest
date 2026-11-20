@@ -1209,6 +1209,50 @@ def test_csv_formula_escape_is_fail_closed() -> None:
     assert metrics_json_body["undefined"]["sortino"] == "too_few_returns"
 
 
+def test_csv_escapes_padded_and_lookalike_formula_starts() -> None:
+    """A leading pad or a fullwidth formula mark is escaped. Decimals stay raw.
+
+    Dropping the pad and lookalike check lets `` =1+1`` and ``＝1+1`` out raw.
+    """
+    samples = (
+        " =1+1",
+        "\n=1+1",
+        "\u00a0=1+1",
+        "\ufeff=1+1",
+        "＝1+1",
+        "＋1",
+        "－12",
+        "＠SUM(A1)",
+        " ＝1",
+        "\ufeff＋1",
+        "\u00a0＝1",
+        " -12.34",
+    )
+    for sample in samples:
+        trade = {column: "1" for column in TRADE_COLUMNS}
+        trade["exit_time"] = None
+        trade["asset_id"] = sample
+        trade["entry_price"] = "-12.34"
+        trade["qty"] = "-0.5"
+        values = {column: "0.1000000000" for column in METRIC_COLUMNS}
+        values["sharpe"] = sample
+        values["net_return"] = "-12.34"
+        result = {
+            "metrics": {"values": values, "undefined": {}},
+            "trades": [trade],
+        }
+        trades = render_export("trades.csv", result)
+        metrics = render_export("metrics.csv", result)
+        row = list(csv.DictReader(io.StringIO(trades)))[0]
+        metric = list(csv.DictReader(io.StringIO(metrics)))[0]
+        assert row["asset_id"] == "'" + sample
+        assert metric["sharpe"] == "'" + sample
+        assert row["entry_price"] == "-12.34"
+        assert row["qty"] == "-0.5"
+        assert metric["net_return"] == "-12.34"
+        assert csv_cell("entry_price", sample) == "'" + sample
+
+
 def test_an_unknown_csv_column_defaults_to_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
     """A column that is not an integer or timestamp column cannot stay raw."""
     columns = (*TRADE_COLUMNS, "note", "noted_at")

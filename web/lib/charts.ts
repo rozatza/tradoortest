@@ -5,7 +5,7 @@
  * This module does not compute an indicator, a return, or a bucket.
  */
 
-import { isRecord } from "@/lib/backtest";
+import { isRecord, isStoredMark, markText } from "@/lib/backtest";
 
 export const TRADINGVIEW_NOTICE =
   "TradingView Lightweight Charts™\nCopyright (с) 2025 TradingView, Inc. https://www.tradingview.com/";
@@ -412,15 +412,12 @@ function whole(value: unknown): number | null {
   return value;
 }
 
+/** The equity-curve spelling. Hex, exponent, blank, and whitespace are not prices. */
 function finiteSpell(value: unknown): string | null {
-  if (typeof value !== "string" || value === "") {
+  if (!isStoredMark(value)) {
     return null;
   }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return value;
+  return markText(value);
 }
 
 /** The trade-log timestamp as an integer second, or null when it is not that integer. */

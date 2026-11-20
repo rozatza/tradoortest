@@ -3,7 +3,15 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { chartNotes, exactUnix, markersFor, parseAnalysis, parseBars, replayIndex } from "@/lib/charts";
+import {
+  chartNotes,
+  exactUnix,
+  markersFor,
+  parseAnalysis,
+  parseBars,
+  parseIndicators,
+  replayIndex,
+} from "@/lib/charts";
 
 describe("trade markers", () => {
   const candles = [{ open_time: 1_700_000_000 }, { open_time: 1_700_000_060 }];
@@ -179,6 +187,94 @@ describe("bar payload", () => {
     ]);
     expect(parsed.assets[0]?.dropped).toBe(1);
     expect(chartNotes(1, 2, 2, 2, "bars shown")).toEqual(["1 of 2 points valid"]);
+  });
+
+  it("drops hex, exponent, blank, and non-finite spellings on bars and indicators", () => {
+    const junk = ["0x10", "1e10", " ", "", "NaN", "Infinity"];
+    const bars = parseBars({
+      schema: "tradoortest.backtest_bars.v1",
+      available: true,
+      bar_size: "1m",
+      slots_total: 8,
+      slots_shown: 8,
+      assets: [
+        {
+          asset_id: "sol",
+          total: 8,
+          shown: 8,
+          rejected: 0,
+          bars: [
+            {
+              open_time: 1_700_000_000,
+              open: "10",
+              high: "11",
+              low: "9",
+              close: "10",
+              volume: "1",
+              synthetic: false,
+            },
+            {
+              open_time: 1_700_000_060,
+              open: 12,
+              high: 13,
+              low: 11,
+              close: 12,
+              volume: 1,
+              synthetic: false,
+            },
+            ...junk.map((close, index) => ({
+              open_time: 1_700_000_120 + index * 60,
+              open: "10",
+              high: "11",
+              low: "9",
+              close,
+              volume: "1",
+              synthetic: false,
+            })),
+          ],
+        },
+      ],
+    });
+    const indicators = parseIndicators({
+      schema: "tradoortest.backtest_indicators.v1",
+      available: true,
+      slots_total: 8,
+      slots_shown: 8,
+      series: [
+        {
+          id: "sma_2",
+          asset_id: "sol",
+          indicator: "sma",
+          output: null,
+          total: 8,
+          shown: 8,
+          valid: 2,
+          rejected: 0,
+          points: [
+            { open_time: 1_700_000_000, value: "15.0" },
+            { open_time: 1_700_000_060, value: 16 },
+            ...junk.map((value, index) => ({
+              open_time: 1_700_000_120 + index * 60,
+              value,
+            })),
+          ],
+        },
+      ],
+    });
+    expect(bars?.available).toBe(true);
+    expect(indicators?.available).toBe(true);
+    if (!bars?.available || !indicators?.available) {
+      return;
+    }
+    expect(bars.assets[0]?.bars.map((bar) => bar.close)).toEqual(["10", "12"]);
+    expect(bars.assets[0]?.dropped).toBe(junk.length);
+    expect(indicators.series[0]?.points.map((point) => point.valueText)).toEqual(["15.0", "16"]);
+    expect(indicators.series[0]?.dropped).toBe(junk.length);
+    const kept = JSON.stringify({ bars, indicators });
+    for (const bad of ["0x10", "1e10", "NaN", "Infinity"]) {
+      expect(kept).not.toContain(bad);
+    }
+    expect(chartNotes(2, 2 + junk.length, 8, 8, "bars shown")).toEqual(["2 of 8 points valid"]);
   });
 });
 

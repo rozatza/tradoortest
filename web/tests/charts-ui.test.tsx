@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { JobCharts } from "@/components/job-charts";
+import { PriceChart } from "@/components/price-chart";
+import { parseBars, parseIndicators } from "@/lib/charts";
 
 const markers = vi.hoisted(() => vi.fn());
 const createChart = vi.hoisted(() => vi.fn());
@@ -193,5 +195,107 @@ describe("price chart", () => {
     expect(await screen.findByText("Time of day unavailable")).toBeTruthy();
     expect(screen.getByText("Weekday unavailable")).toBeTruthy();
     expect(screen.queryByText("00 UTC")).toBeNull();
+  });
+
+  it("shows the valid-point note and no fabricated close or SMA from a loose number parse", async () => {
+    const payloads: unknown[] = [];
+    const setData = vi.fn((data: unknown) => {
+      payloads.push(data);
+    });
+    createChart.mockImplementation(() => ({
+      addSeries: () => ({ setData }),
+      remove: vi.fn(),
+      timeScale: () => ({ fitContent: vi.fn() }),
+    }));
+    const junk = ["0x10", "1e10", " ", "", "NaN", "Infinity"];
+    const start = 1_700_000_000;
+    const parsedBars = parseBars({
+      schema: "tradoortest.backtest_bars.v1",
+      available: true,
+      bar_size: "1m",
+      slots_total: 7,
+      slots_shown: 7,
+      assets: [
+        {
+          asset_id: "sol",
+          total: 7,
+          shown: 7,
+          rejected: 0,
+          bars: [
+            candle(start, "10"),
+            ...junk.map((close, index) => ({
+              ...candle(start + (index + 1) * 60, "10"),
+              close,
+            })),
+          ],
+        },
+      ],
+    });
+    const parsedIndicators = parseIndicators({
+      schema: "tradoortest.backtest_indicators.v1",
+      available: true,
+      slots_total: 7,
+      slots_shown: 7,
+      series: [
+        {
+          id: "sma_2",
+          asset_id: "sol",
+          indicator: "sma",
+          output: null,
+          total: 7,
+          shown: 7,
+          valid: 1,
+          rejected: 0,
+          points: [
+            { open_time: start, value: "15.0" },
+            ...junk.map((value, index) => ({
+              open_time: start + (index + 1) * 60,
+              value,
+            })),
+          ],
+        },
+      ],
+    });
+    expect(parsedBars?.available).toBe(true);
+    expect(parsedIndicators?.available).toBe(true);
+    if (!parsedBars?.available || !parsedIndicators?.available) {
+      return;
+    }
+    render(<PriceChart bars={parsedBars} indicators={parsedIndicators} trades={[]} />);
+    expect(await screen.findByText(/Bar 1 of 1/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Last bar" }));
+    expect(screen.getByText(/Bar 1 of 1/)).toBeTruthy();
+    expect(screen.getAllByText(/1 of 7 points valid/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/open 10 high 10 low 10 close 10 volume 1/)).toBeTruthy();
+    expect(screen.getByText("sma_2 · 15.0 to 15.0 · 1 of 7 points valid")).toBeTruthy();
+    expect(screen.queryByText(/0x10/)).toBeNull();
+    expect(screen.queryByText(/1e10/)).toBeNull();
+    expect(screen.queryByText(/NaN/)).toBeNull();
+    expect(screen.queryByText(/Infinity/)).toBeNull();
+    expect(screen.queryByText(/close 16/)).toBeNull();
+    expect(screen.queryByText(/close 0\b/)).toBeNull();
+    await waitFor(() => expect(setData.mock.calls.length).toBeGreaterThanOrEqual(2));
+    const drawn = JSON.stringify(payloads);
+    expect(drawn).not.toContain("0x10");
+    expect(drawn).not.toContain("1e10");
+    expect(drawn).not.toContain("10000000000");
+    const closes = payloads.flatMap((payload) =>
+      Array.isArray(payload)
+        ? payload.flatMap((row) => {
+            const close = (row as { close?: unknown }).close;
+            return typeof close === "number" ? [close] : [];
+          })
+        : [],
+    );
+    const values = payloads.flatMap((payload) =>
+      Array.isArray(payload)
+        ? payload.flatMap((row) => {
+            const value = (row as { value?: unknown }).value;
+            return typeof value === "number" ? [value] : [];
+          })
+        : [],
+    );
+    expect(closes).toEqual([10]);
+    expect(values).toEqual([15]);
   });
 });

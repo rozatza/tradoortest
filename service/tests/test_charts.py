@@ -16,9 +16,10 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from app.auth import CurrentUser
+from app.auth import CurrentUser, get_current_user
 from app.indicators import sma
 from app.jobs.analysis import WEEKDAYS, trade_timing
 from app.jobs.chart import CHART_SLOT_CAP, _window
@@ -486,4 +487,37 @@ def test_health_answers_while_bars_are_read(
         asyncio.run(probe())
     finally:
         release.set()
+        queue.close()
+
+
+def test_another_user_gets_404_on_bars_indicators_and_analysis(tmp_path: Path) -> None:
+    """The three chart reads use the caller, not a hardcoded local-user.
+
+    ``queue.get("local-user", job_id)`` would return this job to someone-else
+    and the status assertion fails.
+    """
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    application = create_app(jobs=queue)
+    client = TestClient(application)
+    try:
+        created = client.post("/backtests", json=_payload("owner-chart"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        owned = client.get(f"/backtests/{job_id}/bars")
+        assert owned.status_code == 200
+        assert owned.json()["available"] is True
+        application.dependency_overrides[get_current_user] = lambda: CurrentUser(
+            user_id="someone-else"
+        )
+        for suffix in ("bars", "indicators", "analysis"):
+            response = client.get(f"/backtests/{job_id}/{suffix}")
+            assert response.status_code == 404, suffix
+            body = response.json()
+            assert body["error"]["code"] == "not_found"
+            assert "assets" not in body
+            assert "series" not in body
+            assert "hours" not in body
+    finally:
+        application.dependency_overrides.clear()
         queue.close()
