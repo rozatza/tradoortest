@@ -202,11 +202,14 @@ describe("strategy editor", () => {
     expect((screen.getByLabelText("Strategy DSL") as HTMLTextAreaElement).value).toBe(EDITED);
   });
 
-  it("shows a stale save as a conflict and does not retry it", async () => {
+  it("sends the concurrency pair and shows a stale save as a conflict", async () => {
     const fetchMock = install(
       () => jsonResponse({ valid: true }),
-      () =>
-        jsonResponse(
+      (body) => {
+        expect(body.expected_version).toBe(2);
+        expect(body.expected_ir_hash).toBe(HEAD_HASH);
+        expect(body.dsl).toBe(EDITED);
+        return jsonResponse(
           {
             error: {
               code: "version_conflict",
@@ -217,7 +220,8 @@ describe("strategy editor", () => {
             },
           },
           409,
-        ),
+        );
+      },
     );
     renderEditor();
     const box = await loadedBox();

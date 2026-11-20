@@ -1,4 +1,4 @@
-import { forwardGet, forwardJson, isAgentId, jsonError } from "@/lib/upstream";
+import { forwardGet, forwardStrategySave, isAgentId, jsonError } from "@/lib/upstream";
 
 export const dynamic = "force-dynamic";
 
@@ -21,5 +21,5 @@ export async function PUT(
   if (!isAgentId(strategyId)) {
     return jsonError(422, "invalid_id", "strategy_id is invalid");
   }
-  return forwardJson(`/strategies/${strategyId}`, request, "PUT");
+  return forwardStrategySave(`/strategies/${strategyId}`, request);
 }

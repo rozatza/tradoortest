@@ -168,10 +168,11 @@ describe("author proxy", () => {
     expect(rejected.status).toBe(422);
     expect(calls).toHaveLength(1);
 
+    const hash = "ab".repeat(32);
     const saved = await putStrategy(
       new Request("http://chat.local/api", {
         method: "PUT",
-        body: JSON.stringify({ dsl: "strategy x:", expected_version: 2, expected_ir_hash: "ab" }),
+        body: JSON.stringify({ dsl: "strategy x:", expected_version: 2, expected_ir_hash: hash }),
       }),
       { params: Promise.resolve({ strategyId: STRATEGY_ID }) },
     );
@@ -179,6 +180,124 @@ describe("author proxy", () => {
     expect(calls[1]?.url).toBe(`${ORIGIN}/strategies/${STRATEGY_ID}`);
     expect(calls[1]?.init?.method).toBe("PUT");
     expect(calls[1]?.init?.body).toContain("expected_ir_hash");
+    expect(new Headers(calls[1]?.init?.headers).get("x-tradoor-client")).toBe("web");
     expect(calls.some((call) => call.url.includes("/tools/"))).toBe(false);
+  });
+
+  it("refuses a strategy save that lacks a valid concurrency pair", async () => {
+    process.env.AGENT_API_ORIGIN = ORIGIN;
+    const hash = "ab".repeat(32);
+    const cases: Array<{ body: string; code: string; path: string | null }> = [
+      { body: JSON.stringify({ dsl: "strategy x:" }), code: "invalid_request", path: "$" },
+      { body: JSON.stringify({ dsl: "strategy x:", expected_version: 1 }), code: "invalid_request", path: "$" },
+      {
+        body: JSON.stringify({ dsl: "strategy x:", expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$",
+      },
+      {
+        body: JSON.stringify({ expected_version: null, expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$",
+      },
+      {
+        body: JSON.stringify({ expected_version: 1, expected_ir_hash: null }),
+        code: "invalid_request",
+        path: "$",
+      },
+      {
+        body: JSON.stringify({ expected_version: null, expected_ir_hash: null }),
+        code: "invalid_request",
+        path: "$",
+      },
+      {
+        body: JSON.stringify({ expected_version: true, expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$.expected_version",
+      },
+      {
+        body: JSON.stringify({ expected_version: "1", expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$.expected_version",
+      },
+      {
+        body: JSON.stringify({ expected_version: 0, expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$.expected_version",
+      },
+      {
+        body: JSON.stringify({ expected_version: 1.5, expected_ir_hash: hash }),
+        code: "invalid_request",
+        path: "$.expected_version",
+      },
+      {
+        body: JSON.stringify({ expected_version: 1, expected_ir_hash: "ab" }),
+        code: "invalid_request",
+        path: "$.expected_ir_hash",
+      },
+      {
+        body: JSON.stringify({ expected_version: 1, expected_ir_hash: "AB".repeat(32) }),
+        code: "invalid_request",
+        path: "$.expected_ir_hash",
+      },
+      { body: "not-json", code: "invalid_json", path: null },
+      { body: "[1]", code: "invalid_json", path: null },
+      { body: "null", code: "invalid_json", path: null },
+    ];
+    for (const item of cases) {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const response = await putStrategy(
+        new Request("http://chat.local/api", { method: "PUT", body: item.body }),
+        { params: Promise.resolve({ strategyId: STRATEGY_ID }) },
+      );
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual({
+        error: {
+          code: item.code,
+          message: expect.any(String),
+          path: item.path,
+        },
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const oversized = await putStrategy(
+      new Request("http://chat.local/api", {
+        method: "PUT",
+        body: "x".repeat(MAX_PROXY_BODY_BYTES + 1),
+      }),
+      { params: Promise.resolve({ strategyId: STRATEGY_ID }) },
+    );
+    expect(oversized.status).toBe(413);
+    expect(await oversized.json()).toEqual({
+      error: { code: "payload_too_large", message: "request body is too large", path: null },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards a valid strategy save unchanged", async () => {
+    process.env.AGENT_API_ORIGIN = ORIGIN;
+    const hash = "cd".repeat(32);
+    const raw = `{"dsl":"strategy x:","expected_version":2,"expected_ir_hash":"${hash}"}`;
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        calls.push({ url, init });
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+    const saved = await putStrategy(new Request("http://chat.local/api", { method: "PUT", body: raw }), {
+      params: Promise.resolve({ strategyId: STRATEGY_ID }),
+    });
+    expect(saved.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.method).toBe("PUT");
+    expect(calls[0]?.init?.body).toBe(raw);
+    expect(new Headers(calls[0]?.init?.headers).get("x-tradoor-client")).toBe("web");
   });
 });

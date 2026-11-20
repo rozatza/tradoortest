@@ -3,7 +3,9 @@
 ``PUT /strategies/{strategy_id}`` appends an immutable version. It does not
 edit version 1. When the body includes both ``expected_version`` and
 ``expected_ir_hash``, a stale pair is HTTP 409 and writes nothing. Omitting
-both still appends. ``POST /strategies/{strategy_id}/validate`` compiles and
+both still appends. A request whose ``x-tradoor-client`` header is ``web``
+must include that pair. The header is the Next proxy's mark, not an auth
+check. ``POST /strategies/{strategy_id}/validate`` compiles and
 does not write. ``DELETE`` archives. An archived strategy is 404 on every
 route except ``GET /strategies?include_archived=true``.
 
@@ -212,7 +214,8 @@ async def save_version(
     raw = await _read_body(request)
     if isinstance(raw, JSONResponse):
         return raw
-    result = await _call(ready, _save, user.user_id, ident, raw)
+    web_client = request.headers.get("x-tradoor-client") == "web"
+    result = await _call(ready, _save, user.user_id, ident, raw, web_client)
     if isinstance(result, JSONResponse):
         return result
     return JSONResponse(status_code=200, content=result)
@@ -392,9 +395,15 @@ def _create(store: StrategyStore, user_id: str, raw: bytes) -> dict[str, Any]:
     return _detail(record, version)
 
 
-def _save(store: StrategyStore, user_id: str, strategy_id: str, raw: bytes) -> dict[str, Any]:
+def _save(
+    store: StrategyStore,
+    user_id: str,
+    strategy_id: str,
+    raw: bytes,
+    web_client: bool = False,
+) -> dict[str, Any]:
     compiled = compile_body(raw)
-    expected_version, expected_ir_hash = _concurrency(raw)
+    expected_version, expected_ir_hash = _concurrency(raw, require_pair=web_client)
     record, version = store.add_version(
         user_id,
         strategy_id,
@@ -422,11 +431,12 @@ def _validate(
     }
 
 
-def _concurrency(raw: bytes) -> tuple[int | None, str | None]:
+def _concurrency(raw: bytes, *, require_pair: bool = False) -> tuple[int | None, str | None]:
     """Return the version guard, or ``(None, None)`` for a legacy append.
 
     The body has already passed ``compile_body``. A malformed pair is
-    rejected here, before ``add_version``, so nothing is written.
+    rejected here, before ``add_version``, so nothing is written. The Next
+    proxy sets ``require_pair`` via ``x-tradoor-client: web``.
     """
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -437,6 +447,12 @@ def _concurrency(raw: bytes) -> tuple[int | None, str | None]:
     version_set = "expected_version" in payload and payload["expected_version"] is not None
     hash_set = "expected_ir_hash" in payload and payload["expected_ir_hash"] is not None
     if not version_set and not hash_set:
+        if require_pair:
+            raise Rejected(
+                "invalid_request",
+                "expected_version and expected_ir_hash must be sent together",
+                "$",
+            )
         return None, None
     if version_set != hash_set:
         raise Rejected(

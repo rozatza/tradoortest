@@ -47,9 +47,14 @@ export function authorOrigin(): string | null {
   return url.origin;
 }
 
-export function jsonError(status: number, code: string, message: string): Response {
+export function jsonError(
+  status: number,
+  code: string,
+  message: string,
+  path: string | null = null,
+): Response {
   return Response.json(
-    { error: { code, message, path: null } },
+    { error: { code, message, path } },
     { status, headers: { "cache-control": "no-store" } },
   );
 }
@@ -90,6 +95,79 @@ export async function forwardStream(path: string, request: Request): Promise<Res
 
 export async function forwardGet(path: string): Promise<Response> {
   return sendUpstream(path, "GET", "application/json", null);
+}
+
+const IR_HASH = /^[0-9a-f]{64}$/;
+const MAX_STRATEGY_VERSION = 1_000_000;
+
+/**
+ * Refuse a strategy save that does not carry a usable concurrency pair.
+ * Returns null when the original text may be forwarded unchanged.
+ */
+export function strategySaveError(text: string): Response | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return jsonError(422, "invalid_json", "request body is not JSON");
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return jsonError(422, "invalid_json", "request body must be a JSON object");
+  }
+  const record = payload as Record<string, unknown>;
+  const versionSet = Object.hasOwn(record, "expected_version") && record.expected_version !== null;
+  const hashSet = Object.hasOwn(record, "expected_ir_hash") && record.expected_ir_hash !== null;
+  if (!versionSet || !hashSet) {
+    return jsonError(
+      422,
+      "invalid_request",
+      "expected_version and expected_ir_hash must be sent together",
+      "$",
+    );
+  }
+  const version = record.expected_version;
+  if (
+    typeof version !== "number" ||
+    !Number.isInteger(version) ||
+    version < 1 ||
+    version > MAX_STRATEGY_VERSION
+  ) {
+    return jsonError(
+      422,
+      "invalid_request",
+      "expected_version must be a whole number from 1 to 1000000",
+      "$.expected_version",
+    );
+  }
+  const digest = record.expected_ir_hash;
+  if (typeof digest !== "string" || !IR_HASH.test(digest)) {
+    return jsonError(
+      422,
+      "invalid_request",
+      "expected_ir_hash must be 64 lowercase hex characters",
+      "$.expected_ir_hash",
+    );
+  }
+  return null;
+}
+
+/** Read, require the concurrency pair, then PUT the original bytes. */
+export async function forwardStrategySave(path: string, request: Request): Promise<Response> {
+  const capped = await readCappedBody(request, MAX_PROXY_BODY_BYTES);
+  if (capped instanceof Response) {
+    return capped;
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(capped);
+  } catch {
+    return jsonError(422, "invalid_json", "request body is not JSON");
+  }
+  const rejected = strategySaveError(text);
+  if (rejected) {
+    return rejected;
+  }
+  return sendUpstream(path, "PUT", "application/json", text, { "x-tradoor-client": "web" });
 }
 
 /**
@@ -169,6 +247,7 @@ async function sendUpstream(
   method: string,
   accept: string,
   body: string | null,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const origin = authorOrigin();
   if (origin === null) {
@@ -181,6 +260,7 @@ async function sendUpstream(
       headers: {
         accept,
         ...(body === null ? {} : { "content-type": "application/json" }),
+        ...extraHeaders,
       },
       body: body === null ? undefined : body,
       cache: "no-store",

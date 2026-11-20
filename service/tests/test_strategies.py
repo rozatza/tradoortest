@@ -1374,6 +1374,48 @@ def test_stale_save_conflicts_and_does_not_overwrite(tmp_path: Path) -> None:
         assert legacy.json()["latest_version"] == 3
 
 
+def test_web_client_header_requires_the_concurrency_pair(tmp_path: Path) -> None:
+    dsl, _document = _ema()
+    edited = _warmup(dsl, 30)
+    with _client(tmp_path / "strategies.sqlite") as (client, store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        assert created.status_code == 201, created.text
+        strategy_id = created.json()["strategy_id"]
+        head_hash = created.json()["version"]["ir_hash"]
+
+        missing = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": edited},
+            headers={"x-tradoor-client": "web"},
+        )
+        error = _error(missing, 422, "invalid_request")
+        assert error["path"] == "$"
+        assert "together" in error["message"]
+        assert _rows(store.path, "SELECT COUNT(*) FROM strategy_versions") == [(1,)]
+
+        legacy = client.put(f"/strategies/{strategy_id}", json={"dsl": edited})
+        assert legacy.status_code == 200, legacy.text
+        assert legacy.json()["latest_version"] == 2
+        next_hash = legacy.json()["version"]["ir_hash"]
+
+        saved = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": _warmup(dsl, 40), "expected_version": 2, "expected_ir_hash": next_hash},
+            headers={"x-tradoor-client": "web"},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["latest_version"] == 3
+
+        other = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": _warmup(dsl, 50)},
+            headers={"x-tradoor-client": "other"},
+        )
+        assert other.status_code == 200, other.text
+        assert other.json()["latest_version"] == 4
+        assert head_hash != next_hash
+
+
 def test_validate_stays_off_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     dsl, _document = _ema()
     entered = threading.Event()
