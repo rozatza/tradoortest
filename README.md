@@ -7,7 +7,8 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | Path | What it is |
 | --- | --- |
 | `web/` | Next.js placeholder page. No product features. |
-| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), historical OHLCV ingest (`app/ohlcv`), the backtest engine (`app/backtest`), and the backtest job API (`app/jobs`). |
+| `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), historical OHLCV ingest (`app/ohlcv`), the backtest engine (`app/backtest`), the backtest job API (`app/jobs`), and saved strategies (`app/strategies`). |
+| `docs/strategies.md` | Strategy CRUD, immutable versions, canonical `ir_hash`, and diffs. |
 | `docs/jobs.md` | Async backtest jobs. Idempotent start, status, persisted results, and the SQLite queue. |
 | `docs/backtest.md` | How the engine fills market orders on bar close. Simulation only. |
 | `docs/metrics.md` | Return, drawdown, and risk ratios, plus the CSV and JSON trade log. |
@@ -40,7 +41,7 @@ Run the API locally, after `make install`:
 .venv/bin/python -m uvicorn app.main:app --app-dir service --port 8000
 ```
 
-`GET /health` returns `{"status": "ok"}`. `POST /backtests` starts a simulation job for the local user. Status and results are `GET /backtests/{job_id}` and `GET /backtests/{job_id}/results`. The queue is a SQLite file, `data/backtest-jobs.sqlite`, which git ignores. Details are in `docs/jobs.md`. The web placeholder is `npm run dev --prefix web`.
+`GET /health` returns `{"status": "ok"}`. `POST /backtests` starts a simulation job for the local user. Status and results are `GET /backtests/{job_id}` and `GET /backtests/{job_id}/results`. The queue is a SQLite file, `data/backtest-jobs.sqlite`, which git ignores. Details are in `docs/jobs.md`. Saved strategies are a different SQLite file, `data/strategies.sqlite`, also gitignored. `POST /strategies` validates DSL or IR and stores version 1. `PUT /strategies/{strategy_id}` appends the next immutable version. Diffs, archive, and the env vars are in `docs/strategies.md`. The web placeholder is `npm run dev --prefix web`.
 
 Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Any other Solana mint is `--mints`. GeckoTerminal stays the primary source. Birdeye is an optional fallback and stays off unless `BIRDEYE_API_KEY` is set in the environment. Details, rate limits, and the gap report are in `docs/ohlcv.md`. A local live check, not part of CI, is `scripts/acceptance_roz92.py`.
 

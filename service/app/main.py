@@ -1,4 +1,4 @@
-"""FastAPI app. Health, and the single-user backtest job API."""
+"""FastAPI app. Health, backtest jobs, and saved strategies."""
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -6,14 +6,23 @@ from fastapi.responses import JSONResponse
 from app.jobs.queue import JobQueue
 from app.jobs.routes import error_response, router
 from app.ohlcv.routes import router as ohlcv_router
+from app.strategies.routes import router as strategies_router
+from app.strategies.store import StrategyStore
 
 
-def create_app(*, jobs: JobQueue | None = None, ohlcv: object | None = None) -> FastAPI:
+def create_app(
+    *,
+    jobs: JobQueue | None = None,
+    ohlcv: object | None = None,
+    strategies: StrategyStore | None = None,
+) -> FastAPI:
     application = FastAPI(title="tradoortest", version="0.1.0")
     application.state.jobs = jobs
     application.state.ohlcv = ohlcv
+    application.state.strategies = strategies
     application.include_router(router)
     application.include_router(ohlcv_router)
+    application.include_router(strategies_router)
 
     @application.exception_handler(RecursionError)
     def recursion_too_deep(_request: Request, _exc: RecursionError) -> JSONResponse:
