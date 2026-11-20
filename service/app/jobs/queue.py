@@ -91,6 +91,7 @@ class JobRecord:
     status: str
     error: dict[str, Any] | None
     created: bool
+    created_at: float | None = None
 
 
 class JobQueue:
@@ -128,9 +129,7 @@ class JobQueue:
         self._lock = threading.Lock()
         self._lock_file = _lock_file(path)
         try:
-            self._conn = sqlite3.connect(
-                str(path), check_same_thread=False, isolation_level=None
-            )
+            self._conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA secure_delete=ON")
@@ -143,6 +142,11 @@ class JobQueue:
             self._release_lock()
             raise
         self._executor = _Pool(max_concurrent)
+
+    @property
+    def result_ttl_seconds(self) -> int:
+        """How long a finished result stays stored. Never above 24 hours."""
+        return self._ttl
 
     def close(self) -> None:
         """Wait for running jobs, close the database, and release the lock."""
@@ -230,7 +234,7 @@ class JobQueue:
                 removed, changed = self._purge_unlocked()
                 row = self._conn.execute(
                     """
-                    SELECT job_id, user_id, request_key, status, error_json
+                    SELECT job_id, user_id, request_key, status, error_json, created_at
                     FROM jobs WHERE job_id = ? AND user_id = ?
                     """,
                     (job_id, user_id),
@@ -246,7 +250,7 @@ class JobQueue:
         if row is None:
             raise KeyError(job_id)
         error = json.loads(row[4]) if row[4] else None
-        return JobRecord(row[0], row[1], row[2], row[3], error, created)
+        return JobRecord(row[0], row[1], row[2], row[3], error, created, float(row[5]))
 
     def result_json(self, user_id: str, job_id: str) -> str | None:
         """The stored result text, or ``None`` when the job has not finished.
@@ -471,12 +475,8 @@ class JobQueue:
             (cutoff,),
         )
         self._conn.execute("DELETE FROM jobs WHERE created_at <= ?", (cutoff,))
-        self._conn.execute(
-            "DELETE FROM job_results WHERE job_id NOT IN (SELECT job_id FROM jobs)"
-        )
-        self._conn.execute(
-            "DELETE FROM job_bodies WHERE job_id NOT IN (SELECT job_id FROM jobs)"
-        )
+        self._conn.execute("DELETE FROM job_results WHERE job_id NOT IN (SELECT job_id FROM jobs)")
+        self._conn.execute("DELETE FROM job_bodies WHERE job_id NOT IN (SELECT job_id FROM jobs)")
         removed = {(str(row[0]), str(row[1])) for row in rows}
         return removed, self._changes() != before
 

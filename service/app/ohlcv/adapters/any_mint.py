@@ -156,6 +156,27 @@ class AnyMintSource:
             return found
         return None
 
+    def resolve_mint(self, mint: str) -> ChosenPool:
+        """Resolve one mint to the pool ``fetch_pages`` would read.
+
+        This is the ingest path: a fresh call budget, then ``_resolve``,
+        then ``pool_for``. It does not fetch candles and it does not write
+        the bar cache. Callers persist the pool with ``SqliteBarStore``
+        when they want the 24-hour row.
+        """
+        checked = require_mint(mint)
+        token = self.begin_run()
+        try:
+            failure = self._resolve(checked)
+            if isinstance(failure, (NoPool, NoDexPoolYet)):
+                raise failure
+            chosen = self.pool_for(checked)
+            if chosen is None:
+                raise NoPool(f"no pool for mint {checked}")
+            return chosen
+        finally:
+            self.end_run(token)
+
     def served_provider(self, mint: str, timeframe: str) -> str:
         found = self._recall(self._served, (mint, timeframe))
         if isinstance(found, str) and found != "":

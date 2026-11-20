@@ -24,7 +24,12 @@ from typing import Any
 
 from app.strategies.compile import CompiledStrategy
 from app.strategies.diff import dsl_unified_diff, ir_structural_diff
-from app.strategies.errors import StoreUnavailable, StrategyNotFound, VersionNotFound
+from app.strategies.errors import (
+    StoreUnavailable,
+    StrategyNotFound,
+    VersionConflict,
+    VersionNotFound,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategies (
@@ -207,20 +212,30 @@ class StrategyStore:
         user_id: str,
         strategy_id: str,
         compiled: CompiledStrategy,
+        expected_version: int | None = None,
+        expected_ir_hash: str | None = None,
     ) -> tuple[StrategyRecord, VersionRecord]:
-        """Append the next version. Version 1 is never updated."""
+        """Append the next version. Version 1 is never updated.
+
+        ``expected_version`` and ``expected_ir_hash`` are optional. ``None``
+        skips that check, which is what the HTTP save route does. When either
+        is set, the comparison runs inside this write transaction after the
+        row is locked. A mismatch raises ``VersionConflict`` and writes
+        nothing, so two overlapping saves cannot both pass a stale version.
+        """
+        _check_expected(expected_version, expected_ir_hash)
         with self._immediate():
             row = self._locked_strategy(user_id, strategy_id, active_only=True)
             if row is None:
                 raise StrategyNotFound()
-            current = self._conn_or_raise().execute(
-                """
-                SELECT COALESCE(MAX(version), 0) FROM strategy_versions
-                WHERE strategy_id = ? AND user_id = ?
-                """,
-                (strategy_id, user_id),
-            ).fetchone()[0]
-            number = int(current) + 1
+            latest = self._latest_version(strategy_id, user_id)
+            if latest is None:
+                raise StrategyNotFound()
+            if expected_version is not None and latest.version != expected_version:
+                raise VersionConflict(latest.version, latest.ir_hash)
+            if expected_ir_hash is not None and latest.ir_hash != expected_ir_hash:
+                raise VersionConflict(latest.version, latest.ir_hash)
+            number = latest.version + 1
             now = self._clock()
             version = self._insert_version(strategy_id, user_id, number, compiled, now)
             self._conn_or_raise().execute(
@@ -272,6 +287,21 @@ class StrategyStore:
                 ir_hash=latest.ir_hash,
             )
         return record
+
+    def find(self, user_id: str, strategy_id: str) -> StrategyRecord | None:
+        """Return this owner's row, including an archived strategy.
+
+        ``None`` means this owner has no row with that id. A row owned by
+        someone else is also ``None``.
+        """
+        with self._lock:
+            row = self._locked_strategy(user_id, strategy_id, active_only=False)
+            if row is None:
+                return None
+            latest = self._latest_version(strategy_id, user_id)
+            if latest is None:
+                raise StoreUnavailable()
+            return _record_from_row(row, latest.version, latest.ir_hash)
 
     def get(self, user_id: str, strategy_id: str) -> tuple[StrategyRecord, VersionRecord]:
         """Return an active strategy and its latest version."""
@@ -409,7 +439,7 @@ class StrategyStore:
             try:
                 yield
                 conn.execute("COMMIT")
-            except (StrategyNotFound, VersionNotFound):
+            except (StrategyNotFound, VersionNotFound, VersionConflict):
                 self._rollback()
                 raise
             except StoreUnavailable:
@@ -494,15 +524,19 @@ class StrategyStore:
 
     def _latest_version(self, strategy_id: str, user_id: str) -> VersionRecord | None:
         try:
-            row = self._conn_or_raise().execute(
-                """
+            row = (
+                self._conn_or_raise()
+                .execute(
+                    """
                 SELECT version FROM strategy_versions
                 WHERE strategy_id = ? AND user_id = ?
                 ORDER BY version DESC
                 LIMIT 1
                 """,
-                (strategy_id, user_id),
-            ).fetchone()
+                    (strategy_id, user_id),
+                )
+                .fetchone()
+            )
         except sqlite3.Error:
             raise StoreUnavailable from None
         if row is None:
@@ -511,14 +545,18 @@ class StrategyStore:
 
     def _version(self, strategy_id: str, user_id: str, number: int) -> VersionRecord | None:
         try:
-            row = self._conn_or_raise().execute(
-                """
+            row = (
+                self._conn_or_raise()
+                .execute(
+                    """
                 SELECT strategy_id, user_id, version, dsl, ir_json, ir_hash, created_at
                 FROM strategy_versions
                 WHERE strategy_id = ? AND user_id = ? AND version = ?
                 """,
-                (strategy_id, user_id, number),
-            ).fetchone()
+                    (strategy_id, user_id, number),
+                )
+                .fetchone()
+            )
         except sqlite3.Error:
             raise StoreUnavailable from None
         if row is None:
@@ -538,6 +576,23 @@ class StrategyStore:
             ir_hash=str(row["ir_hash"]),
             created_at=str(row["created_at"]),
         )
+
+
+def _check_expected(expected_version: int | None, expected_ir_hash: str | None) -> None:
+    """Reject a bool or a malformed guard before a transaction starts."""
+    if expected_version is not None and (
+        isinstance(expected_version, bool)
+        or not isinstance(expected_version, int)
+        or expected_version < 1
+        or expected_version > 1_000_000
+    ):
+        raise ValueError("expected_version must be a whole number from 1 to 1000000")
+    if expected_ir_hash is not None and (
+        not isinstance(expected_ir_hash, str)
+        or len(expected_ir_hash) != 64
+        or any(char not in "0123456789abcdef" for char in expected_ir_hash)
+    ):
+        raise ValueError("expected_ir_hash must be 64 lowercase hex characters")
 
 
 def _strategy(

@@ -27,6 +27,19 @@ class VersionNotFound(Exception):
     """The strategy is active and the version number is not stored."""
 
 
+class VersionConflict(Exception):
+    """The saved version changed before this write. Nothing was written.
+
+    ``version`` and ``ir_hash`` are the row stored now. The message stays
+    generic so a log of ``str(exc)`` has no hash and no path.
+    """
+
+    def __init__(self, version: int, ir_hash: str) -> None:
+        self.version = version
+        self.ir_hash = ir_hash
+        super().__init__("strategy version conflict")
+
+
 class Rejected(Exception):
     """The body is not a valid strategy. Nothing was written.
 

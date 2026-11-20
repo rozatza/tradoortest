@@ -40,6 +40,8 @@ When multi-user auth exists, replace the body of `get_current_user`. Rows alread
 
 `GET /health` stays public and returns `{"status": "ok"}`. It does not accept or reveal a user.
 
+The agent tools use the same seam. `POST /tools/{tool_name}` passes `CurrentUser` into the dispatcher, and every store or job call uses `user.user_id`. Arguments, headers, and query parameters cannot set the owner. A row for any other id is `not_found`. See `docs/agent-tools.md`.
+
 ## What this runtime does not include
 
 - Accounts, sessions, invites, or access-control lists.
