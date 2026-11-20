@@ -132,6 +132,7 @@ class GeckoTerminalSource:
         pace: _Pace | None = None,
         rng: Callable[[], float] | None = None,
         payloads: list[bytes] | None = None,
+        stop: threading.Event | None = None,
     ) -> None:
         if page_limit < 1 or page_limit > _PAGE_LIMIT:
             raise ValueError("page_limit must be from 1 to 1000")
@@ -142,6 +143,7 @@ class GeckoTerminalSource:
         self._sleep = sleep
         self._rng = rng
         self.payloads = payloads
+        self._stop = stop
         # A shared pace keeps the pool lookup and the candle calls on one clock.
         self._pace = _Pace(min_interval, sleep, monotonic) if pace is None else pace
 
@@ -290,13 +292,15 @@ class GeckoTerminalSource:
         backoff = max(self._pace.interval, 1.0)
         last_status = 0
         for attempt in range(_ATTEMPTS):
+            if self._stop is not None and self._stop.is_set():
+                raise SourceError("stopped")
             self._pace.wait()
             try:
                 response = self._http().get(url, params=params)
             except httpx.TimeoutException as exc:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request timed out") from exc
-                self._sleep(self._retry_sleep(backoff, None, None))
+                self._pause_for_retry(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.TransportError as exc:
@@ -308,7 +312,7 @@ class GeckoTerminalSource:
                     raise SourceError("GeckoTerminal request failed") from exc
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request failed") from exc
-                self._sleep(self._retry_sleep(backoff, None, None))
+                self._pause_for_retry(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.HTTPError as exc:
@@ -321,7 +325,7 @@ class GeckoTerminalSource:
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError(f"GeckoTerminal returned HTTP {response.status_code}")
-                self._sleep(self._retry_sleep(backoff, response, response.status_code))
+                self._pause_for_retry(self._retry_sleep(backoff, response, response.status_code))
                 backoff = min(backoff * 2, 120.0)
                 continue
             if response.status_code != 200:
@@ -341,6 +345,12 @@ class GeckoTerminalSource:
         self, backoff: float, response: httpx.Response | None, status: int | None
     ) -> float:
         return retry_delay(backoff, rng=self._rng, response=response, status=status)
+
+    def _pause_for_retry(self, delay: float) -> None:
+        """Sleep, or return early when the live scheduler is stopping."""
+        self._sleep(delay)
+        if self._stop is not None and self._stop.is_set():
+            raise SourceError("stopped")
 
     def _http(self) -> httpx.Client:
         if self._client is None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -14,7 +16,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import LOCAL_USER_ID
-from app.live.feed import LiveFeed, bar_is_closed, closed_real_bars, last_closed_open
+from app.live.feed import (
+    CLOSE_GRACE_SECONDS,
+    LiveFeed,
+    bar_is_closed,
+    closed_real_bars,
+    last_closed_open,
+)
 from app.live.scheduler import PaperScheduler, register_paper_strategy
 from app.main import app, create_app
 from app.ohlcv.adapters.birdeye import BirdeyeSource
@@ -28,6 +36,7 @@ from app.runner import step as real_step
 
 _STEP = 60
 _T0 = 1_700_000_040
+_DUE = _STEP + CLOSE_GRACE_SECONDS
 _DAY = 86_400
 _DAY_OPEN = 1_699_920_000
 _KEY = "test-birdeye-key"
@@ -166,17 +175,25 @@ def _gecko_json(candles: list[list[float]]) -> dict:
 def test_closed_bar_rule_uses_the_injected_clock() -> None:
     step = _STEP
     assert _T0 % step == 0
-    assert bar_is_closed(_T0, step, _T0 + step)
-    assert not bar_is_closed(_T0, step, _T0 + step - 1)
-    assert last_closed_open(_T0 + 150, step) == _T0 + step
+    assert CLOSE_GRACE_SECONDS >= 40
+    assert bar_is_closed(_T0, step, _T0 + _DUE)
+    assert not bar_is_closed(_T0, step, _T0 + _DUE - 1)
+    assert last_closed_open(_T0 + 150, step) == _T0
     forming = _bar(_T0 + 2 * step)
     closed = _bar(_T0)
     kept = closed_real_bars([forming, closed, _bar(_T0 + step, synthetic=True)], "1m", _T0 + 150)
     assert [bar.open_time for bar in kept] == [_T0]
+    # Probe: the bar opened at _T0+60 still has 30s left, and the clock is 40s fast.
+    fast = _T0 + 90 + 40
+    assert not bar_is_closed(_T0 + step, step, fast)
+    assert bar_is_closed(_T0, step, fast)
+    assert forming.open_time not in {
+        bar.open_time for bar in closed_real_bars([forming, _bar(_T0 + step)], "1m", fast)
+    }
 
 
 def test_gecko_is_primary_and_birdeye_without_a_key_is_not_called(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     called = {"birdeye": 0}
 
@@ -201,7 +218,7 @@ def test_gecko_is_primary_and_birdeye_without_a_key_is_not_called(tmp_path: Path
 
 
 def test_disabled_birdeye_is_not_called_when_gecko_fails(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     disabled = BirdeyeSource(api_key="  ", client=_client(lambda _request: httpx.Response(500)))
     assert disabled.enabled is False
@@ -221,7 +238,7 @@ def test_disabled_birdeye_is_not_called_when_gecko_fails(tmp_path: Path) -> None
 
 
 def test_birdeye_is_the_fallback_only_after_gecko_fails(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     seen: dict[str, str] = {}
 
@@ -272,7 +289,7 @@ def test_birdeye_is_the_fallback_only_after_gecko_fails(tmp_path: Path) -> None:
 
 
 def test_retry_after_and_attempt_cap_are_bounded(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     sleeps: list[float] = []
     calls = {"n": 0}
@@ -309,7 +326,7 @@ def test_retry_after_and_attempt_cap_are_bounded(tmp_path: Path) -> None:
 
 
 def test_exhausted_retries_stop_at_five(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     sleeps: list[float] = []
     calls = {"n": 0}
@@ -338,7 +355,7 @@ def test_exhausted_retries_stop_at_five(tmp_path: Path) -> None:
 
 
 def test_timeouts_use_jitter_and_stop_at_five(tmp_path: Path) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     sleeps: list[float] = []
     calls = {"n": 0}
@@ -367,7 +384,7 @@ def test_timeouts_use_jitter_and_stop_at_five(tmp_path: Path) -> None:
 
 def test_bars_and_payloads_are_purged_after_24h_and_the_cursor_remains(tmp_path: Path) -> None:
     assert _DAY_OPEN % _DAY == 0
-    clock = {"now": _DAY_OPEN + _DAY}
+    clock = {"now": _DAY_OPEN + _DAY + CLOSE_GRACE_SECONDS}
     store = _store(tmp_path, clock, ttl=MAX_CACHE_TTL_SECONDS)
     calls = {"n": 0}
 
@@ -412,6 +429,7 @@ def test_bars_and_payloads_are_purged_after_24h_and_the_cursor_remains(tmp_path:
         assert _decisions(store) == []
         kept = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
         assert kept is not None and kept[1] == _DAY_OPEN
+        assert kept[2].strip() in {"", "null", "[]"}
         restarted = PaperScheduler(store, feed, now=lambda: clock["now"], interval=3600)
         restarted.tick()
         assert _decisions(store) == []
@@ -475,7 +493,7 @@ def test_missed_and_late_bars_are_logged(tmp_path: Path, caplog: pytest.LogCaptu
     caplog.set_level(logging.INFO, logger="app.live")
     t1 = _T0 + _STEP
     t2 = _T0 + 2 * _STEP
-    clock = {"now": _T0 + 4 * _STEP}
+    clock = {"now": _T0 + 4 * _STEP + CLOSE_GRACE_SECONDS}
     store = _store(tmp_path, clock)
     store.upsert([_bar(_T0), _bar(t2)], user_id=LOCAL_USER_ID)
     scheduler = _scheduler(store, _Quiet(), clock)
@@ -501,7 +519,7 @@ def test_missed_and_late_bars_are_logged(tmp_path: Path, caplog: pytest.LogCaptu
 
 
 def test_a_bar_is_not_evaluated_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
     scheduler = _scheduler(store, _Quiet(), clock)
@@ -530,7 +548,7 @@ def test_a_bar_is_not_evaluated_twice(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_restart_does_not_double_fire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
     first = _scheduler(store, _Quiet(), clock)
@@ -549,7 +567,7 @@ def test_restart_does_not_double_fire(tmp_path: Path, monkeypatch: pytest.Monkey
         second.tick()
         assert calls["n"] == 1
         assert [open_time for open_time, _payload in _decisions(store)] == [_T0]
-        clock["now"] = _T0 + 2 * _STEP
+        clock["now"] = _T0 + 2 * _STEP + CLOSE_GRACE_SECONDS
         store.upsert([_bar(_T0 + _STEP)], user_id=LOCAL_USER_ID)
         second.tick()
         assert calls["n"] == 2
@@ -560,7 +578,7 @@ def test_restart_does_not_double_fire(tmp_path: Path, monkeypatch: pytest.Monkey
 
 def test_duplicate_and_out_of_order_bars(tmp_path: Path) -> None:
     t2 = _T0 + 2 * _STEP
-    clock = {"now": _T0 + 4 * _STEP}
+    clock = {"now": _T0 + 4 * _STEP + CLOSE_GRACE_SECONDS}
     store = _store(tmp_path, clock)
     batches = [
         FetchResult([_bar(t2), _bar(_T0), _bar(_T0)], []),
@@ -604,7 +622,7 @@ def test_duplicate_and_out_of_order_bars(tmp_path: Path) -> None:
 
 
 def test_versions_do_not_share_a_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = {"now": _T0 + _STEP}
+    clock = {"now": _T0 + _DUE}
     store = _store(tmp_path, clock)
     store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
     scheduler = _scheduler(store, _Quiet(), clock)
@@ -706,6 +724,284 @@ def test_enabled_flag_does_not_fetch_before_start(
     assert scheduler is not None
     assert scheduler.running is False
     scheduler.stop()
+
+
+def _cross_doc() -> dict:
+    document = _paper()
+    document["engine"]["warmup_bars"] = 3
+    document["derived_series"] = [
+        {
+            "id": "ema_fast",
+            "kind": "indicator",
+            "indicator": "ema",
+            "source": "close",
+            "params": {"period": 2},
+        }
+    ]
+    document["signals"] = [
+        {
+            "id": "go",
+            "expr": {
+                "op": "cross_above",
+                "args": [
+                    {"op": "ref", "name": "close"},
+                    {"op": "ref", "name": "ema_fast"},
+                ],
+            },
+        }
+    ]
+    return document
+
+
+def _table_cells(path: Path) -> list[str]:
+    connection = sqlite3.connect(path)
+    try:
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        cells: list[str] = []
+        for table in tables:
+            columns = [str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")]
+            for row in connection.execute(f"SELECT * FROM {table}"):
+                for column, value in zip(columns, row, strict=True):
+                    cells.append(f"{table}.{column}={value}")
+        return cells
+    finally:
+        connection.close()
+
+
+class _Batches:
+    name = "geckoterminal"
+    enabled = True
+
+    def __init__(self, batches: list[FetchResult | BaseException]) -> None:
+        self._batches = list(batches)
+        self.payloads: list[bytes] = []
+        self.calls = 0
+
+    def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+        self.calls += 1
+        self.payloads.append(b"{}")
+        if not self._batches:
+            return FetchResult([], [])
+        item = self._batches.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self) -> None:
+        return None
+
+
+def test_purged_memory_keeps_no_prices_and_the_next_tick_warms_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closes = [10.0, 10.2, 10.1, 10.5, 10.4, 11.0, 10.8]
+    last = _T0 + (len(closes) - 1) * _STEP
+    clock = {"now": last + _DUE}
+    store = _store(tmp_path, clock)
+    first = [_bar(_T0 + index * _STEP, close=close) for index, close in enumerate(closes)]
+    primary = _Batches([FetchResult(first, [])])
+    feed = LiveFeed(store, primary, now=lambda: clock["now"])
+    scheduler = _scheduler(store, feed, clock)
+    register_paper_strategy(scheduler, "sol-paper", 1, _cross_doc())
+    seen: list[int] = []
+    decided_at: list[int] = []
+
+    def spy(config, state, window, view):
+        seen.append(window.t)
+        result = real_step(config, state, window, view)
+        if any(rule.close is not None for rule in result.decision.rules):
+            decided_at.append(window.t)
+        return result
+
+    monkeypatch.setattr("app.live.scheduler.step", spy)
+    try:
+        scheduler.tick()
+        cursor = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert cursor is not None
+        prices = set(re.findall(r"\d+\.\d+", cursor[2]))
+        assert "10.8" in prices
+        clock["now"] += MAX_CACHE_TTL_SECONDS
+        assert (
+            store.load(
+                user_id=LOCAL_USER_ID,
+                mint=SOL_MINT,
+                timeframe="1m",
+                start=0,
+                end=clock["now"],
+            )
+            == []
+        )
+        kept = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert kept is not None and kept[1] == last
+        assert store.live_registrations(user_id=LOCAL_USER_ID)
+        blob = "\n".join(_table_cells(tmp_path / "ohlcv.sqlite"))
+        for price in prices:
+            assert price not in blob
+        end = last_closed_open(clock["now"], _STEP)
+        assert end is not None and end > last
+        opens = [end - index * _STEP for index in range(3, -1, -1)]
+        primary._batches.append(
+            FetchResult(
+                [_bar(stamp, close=20.0 + index) for index, stamp in enumerate(opens)],
+                [],
+            )
+        )
+        seen.clear()
+        decided_at.clear()
+        scheduler.tick()
+        assert seen[:3] == [0, 1, 2]
+        assert any(index >= 3 for index in seen)
+        assert all(index >= 3 for index in decided_at)
+    finally:
+        store.close()
+
+
+def test_failover_does_not_overwrite_a_decided_bar(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="app.live")
+    t2 = _T0 + _STEP
+    clock = {"now": _T0 + 4 * _STEP + CLOSE_GRACE_SECONDS}
+    store = _store(tmp_path, clock)
+    gecko = _Batches(
+        [
+            FetchResult([_bar(_T0, close=100.0), _bar(t2, close=101.0)], []),
+            SourceError("gecko down"),
+        ]
+    )
+    birdeye = _Batches([FetchResult([_bar(t2, close=999.0)], [])])
+    birdeye.name = "birdeye"
+    feed = LiveFeed(store, gecko, birdeye, now=lambda: clock["now"])
+    scheduler = _scheduler(store, feed, clock)
+    _register(scheduler)
+    try:
+        scheduler.tick()
+        scheduler.tick()
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=SOL_MINT,
+            timeframe="1m",
+            start=0,
+            end=clock["now"],
+        )
+        by_close = {bar.open_time: bar.close for bar in stored}
+        conflicts = store.live_bar_conflicts(user_id=LOCAL_USER_ID)
+        decisions = _decisions(store)
+    finally:
+        store.close()
+    assert by_close[_T0] == 100.0
+    assert by_close[t2] == 101.0
+    assert 999.0 not in by_close.values()
+    assert [(item[0], item[1], item[4]) for item in conflicts] == [(t2, "birdeye", "999")]
+    decided = {open_time: payload for open_time, payload in decisions}
+    assert decided[t2]["rules"][0]["close"] != "999.0"
+    assert "live bar conflict provider=birdeye" in caplog.text
+    assert "999" not in caplog.text
+
+
+def test_a_strategy_failure_is_stored_and_purged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"now": _T0 + _DUE}
+    store = _store(tmp_path, clock)
+    store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    _register(scheduler)
+
+    def boom(config, state, window, view):
+        raise RuntimeError("indicator failed")
+
+    monkeypatch.setattr("app.live.scheduler.step", boom)
+    try:
+        scheduler.tick()
+        errors = store.live_errors(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert _decisions(store) == []
+        assert errors == [(_T0, "RuntimeError", "indicator failed")]
+        clock["now"] += MAX_CACHE_TTL_SECONDS
+        assert store.live_errors(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1) == []
+    finally:
+        store.close()
+
+
+def test_stop_returns_while_a_tick_is_blocked(tmp_path: Path) -> None:
+    started = threading.Event()
+    stop = threading.Event()
+
+    class _Block:
+        def fetch(self, mint: str, timeframe: str, start: int, end: int) -> list[Bar]:
+            started.set()
+            stop.wait(30)
+            return []
+
+        def close(self) -> None:
+            return None
+
+    clock = {"now": _T0 + _DUE}
+    store = _store(tmp_path, clock)
+    scheduler = PaperScheduler(
+        store,
+        _Block(),
+        now=lambda: clock["now"],
+        interval=3600,
+        stop_event=stop,
+    )
+    _register(scheduler)
+    scheduler.start()
+    try:
+        assert started.wait(2)
+        began = time.perf_counter()
+        scheduler.stop()
+        elapsed = time.perf_counter() - began
+    finally:
+        stop.set()
+        scheduler.stop()
+        store.close()
+    assert elapsed < 1
+    assert scheduler.running is False
+
+
+def test_retry_backoff_waits_on_the_stop_event() -> None:
+    stop = threading.Event()
+    started = threading.Event()
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "30"})
+
+    def sleep(seconds: float) -> None:
+        started.set()
+        stop.wait(seconds)
+
+    source = GeckoTerminalSource(
+        _client(handler), min_interval=0, sleep=sleep, stop=stop, rng=lambda: 0.0
+    )
+    outcome: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            source.fetch_bars(SOL_MINT, "1m", _T0, _T0 + _STEP)
+        except SourceError as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert started.wait(2)
+        stop.set()
+        worker.join(1)
+    finally:
+        stop.set()
+        worker.join(2)
+        source.close()
+    assert not worker.is_alive()
+    assert calls["n"] < 5
+    assert str(outcome["error"]) == "stopped"
 
 
 def test_live_package_has_no_broker_or_wallet_code() -> None:

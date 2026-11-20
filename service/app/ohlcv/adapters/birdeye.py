@@ -193,6 +193,7 @@ class BirdeyeSource:
         now: Callable[[], int] | None = None,
         rng: Callable[[], float] | None = None,
         payloads: list[bytes] | None = None,
+        stop: threading.Event | None = None,
     ) -> None:
         if isinstance(min_interval, bool) or not isinstance(min_interval, (int, float)):
             raise ValueError("Birdeye pace must be a number of seconds")
@@ -214,6 +215,7 @@ class BirdeyeSource:
         self._sleep = sleep
         self._rng = rng
         self.payloads = payloads
+        self._stop = stop
         self._pace = _Pace(float(min_interval), sleep, monotonic)
         self.ledger = CuLedger(budget, path=ledger_path, now=now)
 
@@ -283,6 +285,8 @@ class BirdeyeSource:
         backoff = max(self._pace.interval, 1.0)
         last_status = 0
         for attempt in range(_ATTEMPTS):
+            if self._stop is not None and self._stop.is_set():
+                raise SourceError("stopped")
             self._take_call()
             self._pace.wait()
             try:
@@ -290,14 +294,14 @@ class BirdeyeSource:
             except httpx.TimeoutException as exc:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("Birdeye request timed out") from None
-                self._sleep(self._retry_sleep(backoff, None, None))
+                self._pause_for_retry(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 del exc
                 continue
             except httpx.TransportError as exc:
                 if isinstance(exc, _NO_RETRY) or attempt == _ATTEMPTS - 1:
                     raise SourceError("Birdeye request failed") from None
-                self._sleep(self._retry_sleep(backoff, None, None))
+                self._pause_for_retry(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.HTTPError:
@@ -308,7 +312,7 @@ class BirdeyeSource:
                     if response.status_code == 429:
                         raise RateLimitExhausted("Birdeye rate limit exhausted")
                     raise SourceError(f"Birdeye returned HTTP {response.status_code}")
-                self._sleep(self._retry_sleep(backoff, response, response.status_code))
+                self._pause_for_retry(self._retry_sleep(backoff, response, response.status_code))
                 backoff = min(backoff * 2, 120.0)
                 continue
             if response.status_code != 200:
@@ -328,6 +332,12 @@ class BirdeyeSource:
         self, backoff: float, response: httpx.Response | None, status: int | None
     ) -> float:
         return retry_delay(backoff, rng=self._rng, response=response, status=status)
+
+    def _pause_for_retry(self, delay: float) -> None:
+        """Sleep, or return early when the live scheduler is stopping."""
+        self._sleep(delay)
+        if self._stop is not None and self._stop.is_set():
+            raise SourceError("stopped")
 
     def begin_run(self) -> contextvars.Token[list[int] | None]:
         """Start a fresh call cap for this ingest. The monthly ledger is not reset."""

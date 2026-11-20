@@ -33,7 +33,7 @@ from typing import Any
 from app.auth import LOCAL_USER_ID
 from app.ir.canonical import canonical_json
 from app.ir.validate import format_issues, validate_ir
-from app.live.feed import LiveFeed, last_closed_open
+from app.live.feed import LiveFeed, bar_is_closed, last_closed_open
 from app.live.series import build_window
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar
 from app.ohlcv.errors import SourceError
@@ -105,6 +105,7 @@ class PaperScheduler:
         owns_store: bool = False,
         owns_feed: bool = False,
         join_timeout: float = 5.0,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self._store = store
         self._feed = feed
@@ -116,7 +117,7 @@ class PaperScheduler:
         self._owns_feed = owns_feed
         self._join_timeout = join_timeout
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._stop = threading.Event() if stop_event is None else stop_event
         self._thread: threading.Thread | None = None
         self._closed = False
 
@@ -138,9 +139,12 @@ class PaperScheduler:
         with self._lock:
             now = int(self._now())
             for strategy in self._load():
+                if self._stop.is_set():
+                    return
                 try:
                     self._tick_one(strategy, now)
-                except Exception:
+                except Exception as exc:
+                    self._record_error(strategy, 0, exc)
                     logger.warning(
                         "live scheduler skipped strategy_id=%s version=%s",
                         strategy.strategy_id,
@@ -153,12 +157,18 @@ class PaperScheduler:
             return
         self._stop.clear()
         self._thread = threading.Thread(
-            target=self._loop, name="live-bar-scheduler", daemon=False
+            target=self._loop, name="live-bar-scheduler", daemon=True
         )
         self._thread.start()
 
     def stop(self) -> None:
-        """Ask the thread to leave and wait for it. A stuck tick is not killed."""
+        """Ask the thread to leave and wait up to ``join_timeout``.
+
+        The thread is a daemon. Backoff sleeps that share ``stop_event``
+        wake up as soon as this is called, and the tick checks the flag
+        between strategies. A tick that ignores the flag still unblocks
+        this call when the join times out.
+        """
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -234,15 +244,24 @@ class PaperScheduler:
             last_handled: int | None = None
         else:
             origin, last_handled, state_json = cursor
+            if _state_blank(state_json):
+                origin, state, last_handled, ready = self._rebuild_memory(
+                    strategy, bars, last_handled, step_seconds, now, asset_ids
+                )
+                if not ready:
+                    return
+            else:
+                state = _load_state(state_json, asset_ids)
             next_time = last_handled + step_seconds
-            state = _load_state(state_json, asset_ids)
         decided: set[int] = set()
         while next_time <= closed_through:
+            if self._stop.is_set():
+                return
             kind = _classify(bars, strategy.assets, next_time, step_seconds, now)
             if kind == "in_progress":
                 break
             if kind == "missing":
-                if now >= next_time + 2 * step_seconds:
+                if _following_closed(next_time, step_seconds, now):
                     self._advance_skip(strategy, origin, next_time, state, "missed", "missing")
                     last_handled = next_time
                     next_time += step_seconds
@@ -272,7 +291,7 @@ class PaperScheduler:
                 last_handled = next_time
                 next_time += step_seconds
                 continue
-            late = now >= next_time + 2 * step_seconds
+            late = _following_closed(next_time, step_seconds, now)
             try:
                 result = step(
                     config_from_document(strategy.document),
@@ -287,7 +306,8 @@ class PaperScheduler:
                     ),
                     BookView(),
                 )
-            except Exception:
+            except Exception as exc:
+                self._record_error(strategy, next_time, exc)
                 logger.warning(
                     "live decision failed strategy_id=%s version=%s open_time=%s",
                     strategy.strategy_id,
@@ -329,6 +349,89 @@ class PaperScheduler:
             next_time += step_seconds
         if last_handled is not None:
             self._scan_behind(strategy, bars, last_handled, decided, step_seconds, now)
+
+    def _rebuild_memory(
+        self,
+        strategy: PaperStrategy,
+        bars: Mapping[str, Mapping[int, Bar]],
+        last_handled: int,
+        step_seconds: int,
+        now: int,
+        asset_ids: Sequence[str],
+    ) -> tuple[int, RunnerState, int, bool]:
+        """Warm up from the closed bars still in the cache.
+
+        Returns ``(origin, state, last_handled, ready)``. ``ready`` is false
+        when nothing closed remains and nothing new has arrived, so the tick
+        does not walk the purged gap or step with empty memory.
+        """
+        real = _real_times(bars, step_seconds, now)
+        past = [open_time for open_time in real if open_time <= last_handled]
+        future = [open_time for open_time in real if open_time > last_handled]
+        state = initial_state(asset_ids)
+        if past:
+            origin = past[0]
+            for open_time in past:
+                if self._stop.is_set():
+                    return origin, state, last_handled, False
+                result = step(
+                    config_from_document(strategy.document),
+                    state,
+                    build_window(
+                        strategy.document,
+                        asset_ids,
+                        _real_map(bars, strategy.assets),
+                        origin,
+                        open_time,
+                        step_seconds,
+                    ),
+                    BookView(),
+                )
+                state = result.state
+            self._store.replace_live_cursor(
+                user_id=self._user_id,
+                strategy_id=strategy.strategy_id,
+                version=strategy.version,
+                origin=origin,
+                last_open_time=last_handled,
+                state_json=_dump_state(state),
+            )
+            return origin, state, last_handled, True
+        if not future:
+            return last_handled, state, last_handled, False
+        origin = future[0]
+        jump = origin - step_seconds
+        if jump < last_handled:
+            jump = last_handled
+        self._store.replace_live_cursor(
+            user_id=self._user_id,
+            strategy_id=strategy.strategy_id,
+            version=strategy.version,
+            origin=origin,
+            last_open_time=jump,
+            state_json="",
+        )
+        return origin, state, jump, True
+
+    def _record_error(self, strategy: PaperStrategy, open_time: int, exc: BaseException) -> None:
+        message = " ".join(str(exc).split())
+        if len(message) > 200:
+            message = message[:200]
+        try:
+            self._store.log_live_error(
+                user_id=self._user_id,
+                strategy_id=strategy.strategy_id,
+                version=strategy.version,
+                open_time=open_time,
+                exc_type=type(exc).__name__,
+                message=message,
+            )
+        except Exception:
+            logger.warning(
+                "live error row was not stored strategy_id=%s version=%s",
+                strategy.strategy_id,
+                strategy.version,
+            )
 
     def _refresh(
         self,
@@ -461,7 +564,28 @@ def _pairs(
 
 
 def _closed_bar(bar: Bar, step_seconds: int, now: int) -> bool:
-    return bar.open_time + step_seconds <= now
+    return bar_is_closed(bar.open_time, step_seconds, now)
+
+
+def _following_closed(open_time: int, step_seconds: int, now: int) -> bool:
+    """True once the bar after ``open_time`` is closed, including the grace."""
+    return bar_is_closed(open_time + step_seconds, step_seconds, now)
+
+
+def _state_blank(text: str) -> bool:
+    return text.strip() in {"", "null", "[]"}
+
+
+def _real_times(
+    bars: Mapping[str, Mapping[int, Bar]], step_seconds: int, now: int
+) -> list[int]:
+    found: set[int] = set()
+    for by_time in bars.values():
+        for open_time, bar in by_time.items():
+            if bar.synthetic or not _closed_bar(bar, step_seconds, now):
+                continue
+            found.add(open_time)
+    return sorted(found)
 
 
 def _classify(
@@ -471,7 +595,7 @@ def _classify(
     step_seconds: int,
     now: int,
 ) -> str:
-    if open_time + step_seconds > now:
+    if not bar_is_closed(open_time, step_seconds, now):
         return "in_progress"
     saw_real = False
     saw_synthetic = False
@@ -632,7 +756,19 @@ def open_scheduler() -> PaperScheduler:
     store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=MAX_CACHE_TTL_SECONDS)
     payloads: list[bytes] = []
     birdeye_payloads: list[bytes] = []
-    primary = GeckoTerminalSource(rng=random.random, payloads=payloads)
-    fallback = BirdeyeSource(rng=random.random, payloads=birdeye_payloads)
+    stop = threading.Event()
+
+    def sleep(seconds: float) -> None:
+        if stop.wait(seconds):
+            raise SourceError("stopped")
+
+    primary = GeckoTerminalSource(
+        rng=random.random, payloads=payloads, sleep=sleep, stop=stop
+    )
+    fallback = BirdeyeSource(
+        rng=random.random, payloads=birdeye_payloads, sleep=sleep, stop=stop
+    )
     feed = LiveFeed(store, primary, fallback, now=lambda: int(time.time()))
-    return PaperScheduler(store, feed, owns_store=True, owns_feed=True)
+    return PaperScheduler(
+        store, feed, owns_store=True, owns_feed=True, stop_event=stop
+    )

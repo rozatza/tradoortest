@@ -4,14 +4,17 @@ GeckoTerminal is the primary source. Birdeye runs only after that source
 fails, and only when it has an API key. With no key the fallback is not
 called and the missing key is not an error by itself.
 
-A bar is closed only when ``open_time + bar_seconds <= now``. The forming
-bar is dropped. Synthetic bars are dropped. Nothing here copies a close
-forward or builds a gap bar. Closed real bars and the raw response bodies
-go into the bar cache, which purges them on the same 24-hour clock.
+A bar is closed only when ``open_time + bar_seconds + CLOSE_GRACE_SECONDS
+<= now``. The grace keeps a clock that is fast by about 40 seconds from
+admitting the forming bar. Synthetic bars are dropped. Nothing here copies
+a close forward or builds a gap bar. Closed real bars and the raw response
+bodies go into the bar cache, which purges them on the same 24-hour clock.
+A bar a strategy has already decided is not overwritten.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Protocol
 
@@ -21,6 +24,13 @@ from app.ohlcv.errors import SourceError
 from app.ohlcv.source import FetchResult
 from app.ohlcv.store import SqliteBarStore
 
+logger = logging.getLogger("app.live")
+
+# A local clock this far ahead of the exchange must not treat a still-forming
+# bar as closed. 60s covers a skew of about 40s with a small margin. The same
+# margin is applied in ``bar_is_closed`` and ``last_closed_open``.
+CLOSE_GRACE_SECONDS = 60
+
 
 class _Source(Protocol):
     name: str
@@ -28,17 +38,31 @@ class _Source(Protocol):
     def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult: ...
 
 
-def bar_is_closed(open_time: int, bar_seconds: int, now: int) -> bool:
-    """True once the bucket has finished. The forming bar is not closed."""
-    return open_time + bar_seconds <= now
+def bar_is_closed(
+    open_time: int,
+    bar_seconds: int,
+    now: int,
+    *,
+    grace: int = CLOSE_GRACE_SECONDS,
+) -> bool:
+    """True once the bucket has finished and the close grace has elapsed.
+
+    ``grace`` is ``CLOSE_GRACE_SECONDS``. A clock that is fast by less than
+    that does not admit the forming bar.
+    """
+    if grace < 0:
+        grace = 0
+    return open_time + bar_seconds + grace <= now
 
 
-def last_closed_open(now: int, bar_seconds: int) -> int | None:
+def last_closed_open(
+    now: int, bar_seconds: int, *, grace: int = CLOSE_GRACE_SECONDS
+) -> int | None:
     """Open time of the newest bar that is already closed, or None."""
-    if bar_seconds < 1 or now < bar_seconds:
+    if bar_seconds < 1 or grace < 0 or now < bar_seconds + grace:
         return None
-    in_progress = now - (now % bar_seconds)
-    closed = in_progress - bar_seconds
+    latest = now - bar_seconds - grace
+    closed = latest - (latest % bar_seconds)
     if closed < 0:
         return None
     return closed
@@ -123,7 +147,17 @@ class LiveFeed:
             if bar.mint == mint and bar.open_time < end
         ]
         if closed:
-            self._store.upsert(closed, user_id=self._user_id)
+            conflicts = self._store.upsert_live(
+                closed, user_id=self._user_id, provider=provider
+            )
+            for bar in conflicts:
+                logger.warning(
+                    "live bar conflict provider=%s mint=%s timeframe=%s open_time=%s",
+                    provider,
+                    bar.mint,
+                    bar.timeframe,
+                    bar.open_time,
+                )
         return closed
 
     def _usable_fallback(self) -> _Source | None:

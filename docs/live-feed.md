@@ -14,13 +14,13 @@ Candles are parsed by the existing adapters. Nothing in this path copies a close
 
 ## Closed bars
 
-A bar is closed only when `open_time + bar_seconds <= now`. The clock is injectable. The forming bar is not stored and is not passed to the runner.
+A bar is closed only when `open_time + bar_seconds + CLOSE_GRACE_SECONDS <= now`. `CLOSE_GRACE_SECONDS` is 60 (`app/live/feed.py`). The clock is injectable. The extra minute means a local clock that is fast by about 40 seconds still does not treat the forming bar as closed. The forming bar is not stored and is not passed to the runner.
 
 A synthetic bar, including a no-trade bar the historical cache may already hold, is not passed to the runner. In the window it is a hole: the series sample is empty and the bar object is absent, so it cannot produce a close or an OCO touch. A missing slot is also not a bar. The scheduler does not invent one.
 
 ## Scheduler
 
-The worker is a thread started from the app lifespan and stopped on shutdown. The tick does not run on the request event loop, so `GET /health` stays fast while a tick is in progress.
+The worker is a daemon thread started from the app lifespan and stopped on shutdown. The tick does not run on the request event loop, so `GET /health` stays fast while a tick is in progress. `stop()` sets a flag the tick checks between strategies. Provider backoff waits on that same flag instead of sleeping out the full delay, so shutdown returns while a retry is waiting. The join itself is capped at 5 seconds.
 
 `LIVE_FEED_ENABLED` turns it on (`1`, `true`, `yes`, `on`). Unset or any other value leaves it off. Tests leave it off. With no registrations the thread still starts when the flag is on, and it does not fetch until a version is registered.
 
@@ -31,7 +31,11 @@ Each tick, for each registered `(strategy id, version)`:
 3. Call `step` for a real closed bar that this version has not already decided.
 4. Persist the decision and the new runner state in the same write as the cursor.
 
-A missing open time is left alone until the following bar is already closed (`now >= open_time + 2 * bar_seconds`). A bar that arrives in that gap is still decided once. Once the following bar has closed and the slot is still empty, the slot is logged as missed and the cursor moves past it without calling `step`. A real bar that shows up after that is logged as late and is not decided. A real bar that is decided after the following bar has already closed is also logged as late, and it is still decided once. A second copy of a decided bar is logged as a duplicate and is not decided again.
+A missing open time is left alone until the following bar is already closed, using the same grace. A bar that arrives in that gap is still decided once. Once the following bar has closed and the slot is still empty, the slot is logged as missed and the cursor moves past it without calling `step`. A real bar that shows up after that is logged as late and is not decided. A real bar that is decided after the following bar has already closed is also logged as late, and it is still decided once. A second copy of a decided bar is logged as a duplicate and is not decided again.
+
+A bar that any registered version has already decided is not overwritten. If a later fetch, including a Birdeye fallback, returns a different candle for that open time, the stored candle stays and the feed logs a warning and a conflict row. The conflict row expires with the cache.
+
+A per-strategy failure is written to `live_errors` as the exception type and a short message. The message does not include the response body. That row expires with the cache. The cursor is not moved past a bar whose `step` raised, so the next tick can try it again.
 
 Two versions do not share a cursor. The same open time is decided once per version.
 
@@ -41,8 +45,8 @@ The adapters keep their pace: about 12 seconds between GeckoTerminal calls, and 
 
 ## Purge
 
-Fetched bars and raw response bodies use the bar cache. The TTL is 86400 seconds, the same 24-hour cap as the rest of the cache, and the same delete on open, read, write, and close. Recorded decisions and the missed/late log expire on that clock too, because a decision carries the bar close. The registration and the cursor do not. They are not a copy of the candles.
+Fetched bars and raw response bodies use the bar cache. The TTL is 86400 seconds, the same 24-hour cap as the rest of the cache, and the same delete on open, read, write, and close. Recorded decisions, the missed/late log, conflict rows, and error rows expire on that clock too, because a decision carries the bar close. Runner memory on the cursor expires with them: `state_json` is cleared, because it holds the previous close and indicator values from `cross_*`. `last_open_time` stays, so those open times are not decided again. The registration stays. It is the strategy IR, not a close.
 
 ## Restart
 
-The cursor is `(user, strategy id, version) -> (grid origin, last open time, runner state)` in `ohlcv.sqlite`. A new scheduler on that file loads the registrations and continues after `last open time`. A bar at or before that open time is not decided again. A bar that was fetched but not yet committed is still in the cache and is decided on the next tick. After the 24-hour purge the candles are gone; the cursor remains, so those open times are not decided again when a later fetch brings them back.
+The cursor is `(user, strategy id, version) -> (grid origin, last open time, runner state)` in `ohlcv.sqlite`. A new scheduler on that file loads the registrations and continues after `last open time`. A bar at or before that open time is not decided again. A bar that was fetched but not yet committed is still in the cache and is decided on the next tick. After the 24-hour purge the candles and the runner memory are gone. The next tick rebuilds memory by calling `step` from the initial state over the closed real bars still in the cache, and the window index starts at the first of those bars so warmup runs again before a later bar can emit a rule. Open times that fell out of the cache are not walked one by one and are not decided.
