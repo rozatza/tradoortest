@@ -1,0 +1,507 @@
+{
+  "synthetic": true,
+  "note": "Hand-built bars for the shared-runner golden corpus. Not market data and not a fetched series.",
+  "patterns": {
+    "empty": [],
+    "single": [
+      {
+        "step": 0,
+        "open": 100,
+        "high": 100,
+        "low": 100,
+        "close": 100,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "flat": [
+      {
+        "step": 0,
+        "open": 25,
+        "high": 25,
+        "low": 25,
+        "close": 25,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 1,
+        "open": 25,
+        "high": 25,
+        "low": 25,
+        "close": 25,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 2,
+        "open": 25,
+        "high": 25,
+        "low": 25,
+        "close": 25,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 3,
+        "open": 25,
+        "high": 25,
+        "low": 25,
+        "close": 25,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "hole": [
+      {
+        "step": 0,
+        "open": 100,
+        "high": 105,
+        "low": 95,
+        "close": 100,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 2,
+        "open": 120,
+        "high": 140,
+        "low": 110,
+        "close": 130,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "gap": [
+      {
+        "step": 0,
+        "open": 100,
+        "high": 108,
+        "low": 92,
+        "close": 100,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 6,
+        "open": 90,
+        "high": 100,
+        "low": 70,
+        "close": 80,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "synthetic": [
+      {
+        "step": 0,
+        "open": 100,
+        "high": 110,
+        "low": 90,
+        "close": 100,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 1,
+        "open": 100,
+        "high": 100,
+        "low": 100,
+        "close": 100,
+        "volume": 0,
+        "synthetic": true
+      },
+      {
+        "step": 2,
+        "open": 95,
+        "high": 96,
+        "low": 88,
+        "close": 92,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "wide": [
+      {
+        "step": 0,
+        "open": 100,
+        "high": 100,
+        "low": 100,
+        "close": 100,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 1,
+        "open": 100,
+        "high": 150,
+        "low": 60,
+        "close": 110,
+        "volume": 1,
+        "synthetic": false
+      }
+    ],
+    "wave": [
+      {
+        "step": 0,
+        "open": 100.0,
+        "high": 101.5,
+        "low": 98.75,
+        "close": 100.0,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 1,
+        "open": 105.0592,
+        "high": 106.7579,
+        "low": 103.8092,
+        "close": 105.2579,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 2,
+        "open": 109.5861,
+        "high": 111.4755,
+        "low": 108.3361,
+        "close": 109.9755,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 3,
+        "open": 113.1075,
+        "high": 115.1721,
+        "low": 111.8575,
+        "close": 113.6721,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 4,
+        "open": 115.2617,
+        "high": 117.4791,
+        "low": 114.0117,
+        "close": 115.9791,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 5,
+        "open": 115.8396,
+        "high": 118.1811,
+        "low": 114.5896,
+        "close": 116.6811,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 6,
+        "open": 114.8075,
+        "high": 117.2395,
+        "low": 113.5575,
+        "close": 115.7395,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 7,
+        "open": 112.3109,
+        "high": 114.7963,
+        "low": 111.0609,
+        "close": 113.2963,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 8,
+        "open": 108.6595,
+        "high": 111.1591,
+        "low": 107.4095,
+        "close": 109.6591,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 9,
+        "open": 104.293,
+        "high": 106.7668,
+        "low": 103.043,
+        "close": 105.2668,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 10,
+        "open": 99.7322,
+        "high": 102.1415,
+        "low": 98.4822,
+        "close": 100.6415,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 11,
+        "open": 95.5223,
+        "high": 97.8308,
+        "low": 94.2723,
+        "close": 96.3308,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 12,
+        "open": 92.1725,
+        "high": 94.348,
+        "low": 90.9225,
+        "close": 92.848,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 13,
+        "open": 90.0993,
+        "high": 92.1148,
+        "low": 88.8493,
+        "close": 90.6148,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 14,
+        "open": 89.5807,
+        "high": 91.4157,
+        "low": 88.3307,
+        "close": 89.9157,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 15,
+        "open": 90.725,
+        "high": 92.3661,
+        "low": 89.475,
+        "close": 90.8661,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 16,
+        "open": 93.4585,
+        "high": 94.9585,
+        "low": 92.1501,
+        "close": 93.4001,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 17,
+        "open": 97.5325,
+        "high": 99.0325,
+        "low": 96.027,
+        "close": 97.277,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 18,
+        "open": 102.5513,
+        "high": 104.0513,
+        "low": 100.8588,
+        "close": 102.1088,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 19,
+        "open": 108.0138,
+        "high": 109.5138,
+        "low": 106.1519,
+        "close": 107.4019,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 20,
+        "open": 113.3691,
+        "high": 114.8691,
+        "low": 111.3623,
+        "close": 112.6123,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 21,
+        "open": 118.0764,
+        "high": 119.5764,
+        "low": 115.9548,
+        "close": 117.2048,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 22,
+        "open": 121.6641,
+        "high": 123.1641,
+        "low": 119.4625,
+        "close": 120.7125,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 23,
+        "open": 123.7813,
+        "high": 125.2813,
+        "low": 121.5376,
+        "close": 122.7876,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 24,
+        "open": 124.2366,
+        "high": 125.7366,
+        "low": 121.9904,
+        "close": 123.2404,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 25,
+        "open": 123.0183,
+        "high": 124.5183,
+        "low": 120.8094,
+        "close": 122.0594,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 26,
+        "open": 120.2968,
+        "high": 121.7968,
+        "low": 118.1633,
+        "close": 119.4133,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 27,
+        "open": 116.4046,
+        "high": 117.9046,
+        "low": 114.3818,
+        "close": 115.6318,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 28,
+        "open": 111.8011,
+        "high": 113.3011,
+        "low": 109.9198,
+        "close": 111.1698,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 29,
+        "open": 107.0215,
+        "high": 108.5215,
+        "low": 105.3069,
+        "close": 106.5569,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 30,
+        "open": 102.6191,
+        "high": 104.1191,
+        "low": 101.0897,
+        "close": 102.3397,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 31,
+        "open": 99.1039,
+        "high": 100.6039,
+        "low": 97.7708,
+        "close": 99.0208,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 32,
+        "open": 96.8876,
+        "high": 98.5041,
+        "low": 95.6376,
+        "close": 97.0041,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 33,
+        "open": 96.2386,
+        "high": 98.0501,
+        "low": 94.9886,
+        "close": 96.5501,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 34,
+        "open": 97.2534,
+        "high": 99.2475,
+        "low": 96.0034,
+        "close": 97.7475,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 35,
+        "open": 99.8459,
+        "high": 102.0029,
+        "low": 98.5959,
+        "close": 100.5029,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 36,
+        "open": 103.7577,
+        "high": 106.0514,
+        "low": 102.5077,
+        "close": 104.5514,
+        "volume": 1,
+        "synthetic": false
+      },
+      {
+        "step": 37,
+        "open": 108.5873,
+        "high": 110.986,
+        "low": 107.3373,
+        "close": 109.486,
+        "volume": 2,
+        "synthetic": false
+      },
+      {
+        "step": 38,
+        "open": 113.834,
+        "high": 116.3019,
+        "low": 112.584,
+        "close": 114.8019,
+        "volume": 3,
+        "synthetic": false
+      },
+      {
+        "step": 39,
+        "open": 118.954,
+        "high": 121.4525,
+        "low": 117.704,
+        "close": 119.9525,
+        "volume": 1,
+        "synthetic": false
+      }
+    ]
+  }
+}
