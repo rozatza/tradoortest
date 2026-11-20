@@ -3,6 +3,9 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { GET as getAnalysis } from "@/app/api/backtests/[jobId]/analysis/route";
+import { GET as getBars } from "@/app/api/backtests/[jobId]/bars/route";
+import { GET as getIndicators } from "@/app/api/backtests/[jobId]/indicators/route";
 import { GET as getJob } from "@/app/api/backtests/[jobId]/route";
 import { GET as getMetricsCsv } from "@/app/api/backtests/[jobId]/exports/metrics.csv/route";
 import { GET as getMetricsJson } from "@/app/api/backtests/[jobId]/exports/metrics.json/route";
@@ -28,6 +31,9 @@ describe("backtest proxy allowlist", () => {
       "/backtests/{job_id}/exports/trades.csv",
       "/backtests/{job_id}/exports/metrics.json",
       "/backtests/{job_id}/exports/metrics.csv",
+      "/backtests/{job_id}/bars",
+      "/backtests/{job_id}/indicators",
+      "/backtests/{job_id}/analysis",
     ]);
     expect(BACKTEST_READS.join("\n")).not.toContain("/tools");
     expect(MAX_PROXY_BODY_BYTES).toBe(1_048_576);
@@ -48,6 +54,11 @@ describe("backtest proxy allowlist", () => {
     expect(backtestPath(JOB_ID, "/backtests/{job_id}/exports/trades.csv")).toBe(
       `/backtests/${JOB_ID}/exports/trades.csv`,
     );
+    expect(backtestPath(JOB_ID, "/backtests/{job_id}/bars")).toBe(`/backtests/${JOB_ID}/bars`);
+    expect(backtestPath(JOB_ID, "/backtests/{job_id}/indicators")).toBe(
+      `/backtests/${JOB_ID}/indicators`,
+    );
+    expect(backtestPath(JOB_ID, "/backtests/{job_id}/analysis")).toBe(`/backtests/${JOB_ID}/analysis`);
     for (const id of ["", "A".repeat(32), "g".repeat(32), "a".repeat(31), "a".repeat(33), "../tools/x", `${JOB_ID}/tools`]) {
       expect(backtestPath(id, "/backtests/{job_id}/results"), id).toBeNull();
     }
@@ -57,7 +68,7 @@ describe("backtest proxy allowlist", () => {
     expect(backtestPath(JOB_ID, "/backtests/{job_id}/exports/../tools/x")).toBeNull();
   });
 
-  it("forwards the six reads unchanged and drops a bad id", async () => {
+  it("forwards the allowlisted reads unchanged and drops a bad id", async () => {
     process.env.AGENT_API_ORIGIN = ORIGIN;
     const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
     vi.stubGlobal(
@@ -83,6 +94,9 @@ describe("backtest proxy allowlist", () => {
       { get: getTradesCsv, path: `/backtests/${JOB_ID}/exports/trades.csv`, accept: "text/csv" },
       { get: getMetricsJson, path: `/backtests/${JOB_ID}/exports/metrics.json`, accept: "application/json" },
       { get: getMetricsCsv, path: `/backtests/${JOB_ID}/exports/metrics.csv`, accept: "text/csv" },
+      { get: getBars, path: `/backtests/${JOB_ID}/bars`, accept: "application/json" },
+      { get: getIndicators, path: `/backtests/${JOB_ID}/indicators`, accept: "application/json" },
+      { get: getAnalysis, path: `/backtests/${JOB_ID}/analysis`, accept: "application/json" },
     ];
     for (const handler of handlers) {
       const response = await handler.get(request, context);

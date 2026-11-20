@@ -508,6 +508,71 @@ h3 {
   }
 }
 
+.chart-block,
+.price-pane,
+.indicator-pane,
+.buckets,
+.bucket,
+.marker-list,
+.attribution,
+.bar-readout,
+.chart-controls {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.price-pane {
+  width: 100%;
+  height: 16rem;
+}
+
+.indicator-pane {
+  width: 100%;
+  height: 8rem;
+}
+
+.chart-controls,
+.marker-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bar-readout,
+.attribution,
+.bucket-name,
+.bucket-count {
+  overflow-wrap: anywhere;
+}
+
+.bar-readout,
+.attribution {
+  margin-top: 0.3rem;
+  color: #3d4638;
+  font-size: 0.82rem;
+}
+
+.buckets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(2.6rem, 1fr));
+  gap: 0.35rem;
+  align-items: end;
+}
+
+.bucket-bar {
+  width: 100%;
+  background: #1f6b3a;
+  border-radius: 0.2rem 0.2rem 0 0;
+}
+
+.chart-block select {
+  font: inherit;
+  max-width: 100%;
+}
+
 @media (max-width: 40rem) {
   main {
     padding: 1rem 0.8rem 0.8rem;

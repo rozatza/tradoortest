@@ -157,7 +157,10 @@ describe("missing fields stay unavailable", () => {
     render(<BacktestResults />);
     await load();
     await screen.findByText("Metrics");
-    expect(document.querySelector(".equity figcaption")!.textContent).toBe("100.00 to 110.00");
+    expect(document.querySelector(".equity figcaption")!.textContent).toBe(
+      "100.00 to 110.00 · 2 of 5 points valid",
+    );
+    expect(document.querySelector(".equity figcaption")!.textContent).not.toContain("0x10");
     expect(document.querySelector("polyline")!.getAttribute("points")).toBe("1,39 99,1");
   });
 

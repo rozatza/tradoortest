@@ -7,6 +7,8 @@ job database.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import math
 import sqlite3
@@ -28,7 +30,7 @@ from app.indicators.errors import IndicatorError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError
 from app.ir.validate import validate_ir
-from app.jobs.export import ExportError, render_export
+from app.jobs.export import TEXT_TRADE_COLUMNS, ExportError, csv_text_cell, render_export
 from app.jobs.queue import JobQueue, QueueBusy
 from app.jobs.routes import _prepare
 from app.jobs.run import _bars, run_backtest_job
@@ -636,8 +638,19 @@ def test_bar_values_do_not_remain_after_success_failure_or_interrupt(tmp_path: P
         results = done_client.get(f"/backtests/{job_id}/results")
         assert results.status_code == 200
         assert Decimal(results.json()["fills"][0]["price"]) == Decimal("100")
-        assert _MARKER.encode() not in _db_bytes(tmp_path / "done.sqlite")
-        assert b"31337.25" not in _db_bytes(tmp_path / "done.sqlite")
+        # The request body is gone and the result JSON does not grow by the
+        # raw high or volume. The chart window keeps those candles until the
+        # TTL. test_chart_bars_leave_the_database_and_the_wal covers that pass.
+        with sqlite3.connect(tmp_path / "done.sqlite") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM job_bodies").fetchone() == (0,)
+            stored = conn.execute("SELECT result_json FROM job_results").fetchone()
+            assert stored is not None
+            assert _MARKER.encode() not in stored[0].encode()
+            assert b"31337.25" not in stored[0].encode()
+            chart = conn.execute("SELECT bars_json FROM job_charts").fetchone()
+            assert chart is not None
+            assert _MARKER in chart[0]
+            assert "31337.25" in chart[0]
     finally:
         done.close()
 
@@ -1079,6 +1092,9 @@ def test_results_include_the_engine_curve_and_exports_match(tmp_path: Path) -> N
         metrics_csv_body = client.get(f"/backtests/{job_id}/exports/metrics.csv")
         metrics_json_body = client.get(f"/backtests/{job_id}/exports/metrics.json")
         assert trades_csv.status_code == 200
+        # Clean engine cells have no formula-leading text, so the CSV bytes
+        # still match. A text cell that starts with = + - @ tab or CR does
+        # not: test_csv_formula_escaping_follows_the_column_schema.
         assert trades_csv.text == trade_log_csv(engine.trades)
         assert trades_csv.headers["content-type"].startswith("text/csv")
         assert trades_csv.headers["cache-control"] == "no-store"
@@ -1130,6 +1146,60 @@ def test_export_copies_stored_strings_and_rejects_a_computed_cell() -> None:
     }
     with pytest.raises(ExportError):
         render_export("metrics.json", broken)
+
+
+def test_csv_formula_escaping_follows_the_column_schema() -> None:
+    """Text columns are neutralised. Numeric columns, including a leading minus, are not.
+
+    JSON exports keep the stored characters. This is the byte-identity break
+    for a hostile text cell. A clean engine CSV is still identical.
+    """
+    trade = {column: "1" for column in TRADE_COLUMNS}
+    trade["asset_id"] = '=HYPERLINK("http://evil")'
+    trade["status"] = "+cmd"
+    trade["trade_id"] = "-cmd"
+    trade["limit_below_low"] = "@sum"
+    trade["overlaps_suspect_outage"] = "\t=1"
+    trade["realized_pnl"] = "-12.34"
+    trade["entry_price"] = "+12.34"
+    trade["qty"] = "-0.5"
+    trade["exit_time"] = None
+    trade["entry_notional"] = "\r=1"
+    values = {column: "0.1000000000" for column in METRIC_COLUMNS}
+    values["net_return"] = "-12.34"
+    values["sharpe"] = "=1+1"
+    result = {
+        "metrics": {"values": values, "undefined": {"sortino": "too_few_returns"}},
+        "trades": [trade],
+    }
+    parsed = list(csv.DictReader(io.StringIO(render_export("trades.csv", result))))
+    assert len(parsed) == 1
+    row = parsed[0]
+    assert row["asset_id"] == csv_text_cell('=HYPERLINK("http://evil")')
+    assert row["asset_id"].startswith("'")
+    assert row["status"] == "'+cmd"
+    assert row["trade_id"] == "'-cmd"
+    assert row["limit_below_low"] == "'@sum"
+    assert row["overlaps_suspect_outage"] == "'\t=1"
+    assert row["realized_pnl"] == "-12.34"
+    assert row["entry_price"] == "+12.34"
+    assert row["qty"] == "-0.5"
+    assert row["exit_time"] == ""
+    # entry_notional is numeric, so a leading CR is kept and not quoted away.
+    assert row["entry_notional"] == "\r=1"
+    for column in TEXT_TRADE_COLUMNS:
+        assert column in TRADE_COLUMNS
+    metrics_row = list(csv.DictReader(io.StringIO(render_export("metrics.csv", result))))[0]
+    assert metrics_row["net_return"] == "-12.34"
+    assert metrics_row["sharpe"] == "=1+1"
+    trades_json = json.loads(render_export("trades.json", result))
+    assert trades_json["trades"][0]["asset_id"] == '=HYPERLINK("http://evil")'
+    assert trades_json["trades"][0]["realized_pnl"] == "-12.34"
+    assert "'" not in trades_json["trades"][0]["realized_pnl"]
+    metrics_json_body = json.loads(render_export("metrics.json", result))
+    assert metrics_json_body["values"]["net_return"] == "-12.34"
+    assert metrics_json_body["values"]["sharpe"] == "=1+1"
+    assert metrics_json_body["undefined"]["sortino"] == "too_few_returns"
 
 
 def test_export_for_another_user_or_a_running_job_is_not_the_result(tmp_path: Path) -> None:

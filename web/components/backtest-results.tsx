@@ -2,6 +2,7 @@
 
 import { useState, type FormEvent } from "react";
 
+import { JobCharts } from "@/components/job-charts";
 import {
   BacktestRequestError,
   DOWNLOADS,
@@ -96,6 +97,7 @@ export function BacktestResults() {
       {loaded?.kind === "ready" ? (
         <ResultView
           key={loaded.jobId}
+          jobId={loaded.jobId}
           result={loaded.result}
           exportError={exportError}
           onDownload={onDownload}
@@ -106,10 +108,12 @@ export function BacktestResults() {
 }
 
 function ResultView({
+  jobId,
   result,
   exportError,
   onDownload,
 }: {
+  jobId: string;
   result: Record<string, unknown>;
   exportError: string | null;
   onDownload: (kind: DownloadKind) => void;
@@ -131,6 +135,7 @@ function ResultView({
         </span>
       </p>
       <EquityChart curve={result.equity_curve} />
+      <JobCharts jobId={jobId} trades={result.trades} />
       <h3>Metrics</h3>
       <Metrics metrics={result.metrics} />
       <h3>Lints</h3>
@@ -165,6 +170,13 @@ function EquityChart({ curve }: { curve: unknown }) {
   const coords = curveCoordinates(drawn);
   const first = markText(points[0]!.equity);
   const last = markText(points[points.length - 1]!.equity);
+  const notes: string[] = [];
+  if (points.length < curve.length) {
+    notes.push(`${points.length} of ${curve.length} points valid`);
+  }
+  if (drawn.length < points.length) {
+    notes.push(`${drawn.length} of ${points.length} points drawn`);
+  }
   return (
     <figure className="equity">
       {coords ? (
@@ -191,7 +203,7 @@ function EquityChart({ curve }: { curve: unknown }) {
         <span title={first}>{first}</span>
         {" to "}
         <span title={last}>{last}</span>
-        {drawn.length < points.length ? ` · ${drawn.length} of ${points.length} points drawn` : null}
+        {notes.length > 0 ? ` · ${notes.join(" · ")}` : null}
       </figcaption>
     </figure>
   );

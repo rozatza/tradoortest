@@ -1,8 +1,14 @@
 """Trade-log and metrics files from a stored backtest result.
 
 The cells are the strings already on the result. Nothing here recomputes a
-ratio, a fill, or an equity mark. The bytes match ``trade_log_csv``,
-``trade_log_json``, ``metrics_csv``, and ``metrics_json`` for the same run.
+ratio, a fill, or an equity mark. JSON exports match ``trade_log_json`` and
+``metrics_json``. CSV exports match ``trade_log_csv`` and ``metrics_csv``
+except for a text-typed cell whose first character is ``=``, ``+``, ``-``,
+``@``, a tab, or a carriage return. That cell is written with a leading
+apostrophe so a spreadsheet does not treat it as a formula. Numeric columns
+are written exactly, including a leading minus on a decimal such as
+``-12.34``. The column kind comes from the trade-log and metrics schemas,
+not from the first character of the cell.
 """
 
 from __future__ import annotations
@@ -26,6 +32,27 @@ EXPORT_NAMES = (
 
 class ExportError(ValueError):
     """The stored result is missing a trade-log or metrics cell."""
+
+
+# Text and boolean words. A number, a timestamp, and a count are not here.
+TEXT_TRADE_COLUMNS = frozenset(
+    {
+        "trade_id",
+        "asset_id",
+        "status",
+        "limit_below_low",
+        "overlaps_suspect_outage",
+    }
+)
+
+_FORMULA_LEAD = frozenset("=+-@\t\r")
+
+
+def csv_text_cell(value: str) -> str:
+    """Neutralise a text cell that a spreadsheet would treat as a formula."""
+    if value[:1] in _FORMULA_LEAD:
+        return "'" + value
+    return value
 
 
 def render_export(name: str, result: Mapping[str, Any]) -> str:
@@ -59,8 +86,17 @@ def _trades_csv(result: Mapping[str, Any]) -> str:
     writer = csv.DictWriter(buffer, fieldnames=TRADE_COLUMNS, lineterminator="\n")
     writer.writeheader()
     for row in _trade_rows(result):
-        writer.writerow({key: "" if value is None else value for key, value in row.items()})
+        writer.writerow({key: _csv_trade_cell(key, value) for key, value in row.items()})
     return buffer.getvalue()
+
+
+def _csv_trade_cell(column: str, value: str | None) -> str:
+    """Write one trade cell. Numeric columns stay exact. Text columns are neutralised."""
+    if value is None:
+        return ""
+    if column in TEXT_TRADE_COLUMNS:
+        return csv_text_cell(value)
+    return value
 
 
 def _trades_json(result: Mapping[str, Any]) -> str:
@@ -69,6 +105,7 @@ def _trades_json(result: Mapping[str, Any]) -> str:
 
 
 def _metrics_csv(result: Mapping[str, Any]) -> str:
+    """Ratio columns are numeric. A leading minus is part of the stored decimal."""
     values = _metric_values(result)
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=METRIC_COLUMNS, lineterminator="\n")

@@ -18,7 +18,7 @@ The request body, OHLCV bars included, is kept only while the job is `queued` or
 
 CoinGecko API Terms section 6 does not allow a persistent store of API data. The terms are at <https://www.coingecko.com/en/api_terms>. The same note is in `docs/ohlcv.md`. A job result carries fill prices, the trade log, and metrics computed from those bars, so it follows the GeckoTerminal cache.
 
-The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result and any leftover body. The same pass deletes a result or a body whose job row is already gone. A worker that finishes after that purge writes nothing: the result is stored only when the job is still `running` in that write. A read that still finds the expired job is HTTP 410 `expired`, and that read deletes it. 410 is best-effort. Another start or read purges the row first, and so does startup, so the client can see HTTP 404 `not_found` without a 410. A later read of an id that was deleted is 404 as well. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
+The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result, its chart window, and any leftover body. The same pass deletes a result, a chart window, or a body whose job row is already gone. A worker that finishes after that purge writes nothing: the result is stored only when the job is still `running` in that write. A read that still finds the expired job is HTTP 410 `expired`, and that read deletes it. 410 is best-effort. Another start or read purges the row first, and so does startup, so the client can see HTTP 404 `not_found` without a 410. A later read of an id that was deleted is 404 as well. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
 
 ROZ-92 did not lengthen this window. OHLCV from every provider, including a Birdeye fallback, also expires within 24 hours. See `docs/ohlcv.md`.
 
@@ -70,12 +70,43 @@ These four reads encode the stored result. They do not run the engine again and 
 
 | Path | Body |
 | --- | --- |
-| `GET /backtests/{job_id}/exports/trades.csv` | `trade_log_csv` of the stored trades |
+| `GET /backtests/{job_id}/exports/trades.csv` | stored trades, CSV, with text cells neutralised |
 | `GET /backtests/{job_id}/exports/trades.json` | `trade_log_json` of the stored trades |
 | `GET /backtests/{job_id}/exports/metrics.csv` | `metrics_csv` of the stored ratios |
 | `GET /backtests/{job_id}/exports/metrics.json` | `metrics_json` of the stored ratios |
 
+JSON exports are the same bytes as `trade_log_json` and `metrics_json` for that stored result. CSV exports are the same bytes as `trade_log_csv` and `metrics_csv` when no text cell needs neutralising.
+
+A text-typed trade cell whose first character is `=`, `+`, `-`, `@`, a tab, or a carriage return is written with a leading apostrophe. The text columns are `trade_id`, `asset_id`, `status`, `limit_below_low`, and `overlaps_suspect_outage`. Every other trade column, and every metrics column, is numeric: the stored characters are copied, so a decimal such as `-12.34` stays `-12.34`. The kind is the column schema. It is not chosen by looking at the first character. A text cell `-12.34` is still neutralised, because that column is text. The JSON exports are not neutralised.
+
 A cell that is not already a string or null is HTTP 422 `invalid_result`. The status codes otherwise match `/results`: 200, 409 `not_ready`, 422 for a failed job, 404, and 410 `expired` when that read is the one that deletes the row. An unknown file name is HTTP 404 `not_found` and does not read the job. `cache-control` is `no-store`.
+
+## Charts
+
+`GET /backtests/{job_id}/bars`, `GET /backtests/{job_id}/indicators`, and `GET /backtests/{job_id}/analysis` are reads for the results screen. They are not tools. `backtest_get` does not return them, and they are not added to the result document.
+
+The request body is still deleted when the job finishes, so the raw series is not kept as that body. Re-reading the OHLCV cache would be a different series: a job runs on the bars the caller sent, including synthetic bars, and those bars are not an OHLCV cache key. The worker keeps a window in `job_charts` (`bars_json` and `indicators_json`), separate from `result_json`. The window is at most 2000 grid slots. It is the earliest slice that covers the most trade-log `entry_time` and `exit_time` values, or the last 2000 slots when no trade time sits on the grid. A grid that is already shorter is stored whole. Present candles in that slice are the bars. Missing slots are not filled with a price.
+
+`bars_json` and `indicators_json` are deleted with the job, on the same 24 hour pass, including a chart row whose job is already gone. The purge checkpoints the WAL, and `secure_delete` is on, so the candle text does not stay in the database file or the WAL after that pass.
+
+Indicator points are the lists from `app.indicators`, called on the same grid the engine uses (a missing slot is NaN). The chart route does not recompute them in the browser. A non-finite indicator value is JSON `null`. `valid` counts the finite points in the window. `shown` is the window length. `total` is the full grid length for a series, and the full present-candle count for an asset. `rejected` on an asset is a present candle in the window that was not encoded.
+
+These reads do not parse `result_json` in Python. Bars and indicators are the chart columns. Analysis asks SQLite for `json_extract(result_json, '$.trades')` and parses that array only. The equity curve stays in the result row.
+
+A succeeded job with no chart row is HTTP 200 with `available: false`. A job that is queued or running is HTTP 409 `not_ready`. A failed job is HTTP 422. An unknown job is HTTP 404. A job past the retention window is HTTP 410 `expired` when that read deletes it. `cache-control` is `no-store`.
+
+## Time of day and weekday
+
+`GET /backtests/{job_id}/analysis` counts trade-log rows. The clock is `entry_time`, a unix second, read as UTC.
+
+| Field | Meaning |
+| --- | --- |
+| `hour_utc` | Hour of that UTC instant, 0–23 |
+| `weekday_utc` | Monday 0 through Sunday 6 (`datetime` weekday of that UTC instant) |
+| `weekday` | The English name of `weekday_utc` |
+| `count` | How many counted rows fall in the bucket |
+
+A row with a missing `entry_time`, or an `entry_time` that is not a non-negative whole second, is not counted. `trades_used` is the counted rows. `trades_total` is the length of the trade log. Hours and weekdays with no counted row are left out. There is no zero bucket and no 24-hour or 7-day filler. When `trades_used` is 0, `available` is false and the body has no `hours` list and no `weekdays` list. The counts are not returns.
 
 No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404. A job past the retention window is HTTP 410 `expired` when that read is the one that deletes it. 410 is best-effort: if a start, another read, or startup already purged the row, the response is 404.
 

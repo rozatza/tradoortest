@@ -108,6 +108,9 @@ export const BACKTEST_READS = [
   "/backtests/{job_id}/exports/trades.csv",
   "/backtests/{job_id}/exports/metrics.json",
   "/backtests/{job_id}/exports/metrics.csv",
+  "/backtests/{job_id}/bars",
+  "/backtests/{job_id}/indicators",
+  "/backtests/{job_id}/analysis",
 ] as const;
 
 export type BacktestRead = (typeof BACKTEST_READS)[number];
