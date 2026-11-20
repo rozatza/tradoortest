@@ -154,6 +154,7 @@ p {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.7rem;
 }
@@ -421,6 +422,7 @@ h3 {
 .metrics dt {
   color: #5c6656;
   font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .metrics dd {

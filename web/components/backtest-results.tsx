@@ -17,6 +17,7 @@ import {
   isJobId,
   isRecord,
   loadBacktest,
+  markText,
   pointsForCurve,
   rawText,
   tradePage,
@@ -162,8 +163,8 @@ function EquityChart({ curve }: { curve: unknown }) {
   }
   const drawn = pointsForCurve(points, EQUITY_DRAW_CAP);
   const coords = curveCoordinates(drawn);
-  const first = points[0]!.equity;
-  const last = points[points.length - 1]!.equity;
+  const first = markText(points[0]!.equity);
+  const last = markText(points[points.length - 1]!.equity);
   return (
     <figure className="equity">
       {coords ? (

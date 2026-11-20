@@ -54,4 +54,17 @@ describe("narrow layout", () => {
     expect(narrowResults).not.toContain("overflow: auto");
     expect(narrow).toContain("flex-direction: column");
   });
+
+  it("wraps the action row so download buttons stay inside a narrow page", () => {
+    const css = readFileSync(path.resolve(import.meta.dirname, "../app/globals.css"), "utf8");
+    const start = css.indexOf(".actions {");
+    const end = css.indexOf("button {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = css.slice(start, end);
+    expect(block).toContain("display: flex");
+    expect(block).toContain("flex-wrap: wrap");
+    const labels = css.slice(css.indexOf(".metrics dt {"), css.indexOf(".metrics dd {"));
+    expect(labels).toContain("overflow-wrap: anywhere");
+  });
 });

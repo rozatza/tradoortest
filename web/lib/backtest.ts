@@ -82,8 +82,8 @@ export type DownloadKind = (typeof DOWNLOADS)[number]["kind"];
 
 export type EquityPoint = {
   open_time: number;
-  equity: string;
-  cash: string;
+  equity: string | number;
+  cash: string | number;
 };
 
 export type RawText = {
@@ -136,6 +136,31 @@ export function rawText(value: unknown): RawText {
   return { shown: UNAVAILABLE };
 }
 
+/**
+ * Decimal text the job runner stores with ``format(Decimal, "f")``.
+ * Optional minus, no exponent, and no leading zeros on the integer part.
+ */
+const DECIMAL_MARK = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
+
+/** A finite number, or the exact decimal text the backend stores. */
+export function isStoredMark(value: unknown): value is string | number {
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  return typeof value === "string" && DECIMAL_MARK.test(value);
+}
+
+/** The mark's own text. A string is unchanged. A number uses `String`, and `-0` stays "-0". */
+export function markText(value: string | number): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Object.is(value, -0)) {
+    return "-0";
+  }
+  return String(value);
+}
+
 export function isEquityPoint(value: unknown): value is EquityPoint {
   if (!isRecord(value)) {
     return false;
@@ -143,9 +168,8 @@ export function isEquityPoint(value: unknown): value is EquityPoint {
   return (
     typeof value.open_time === "number" &&
     Number.isFinite(value.open_time) &&
-    typeof value.equity === "string" &&
-    value.equity !== "" &&
-    typeof value.cash === "string"
+    isStoredMark(value.equity) &&
+    isStoredMark(value.cash)
   );
 }
 
@@ -175,10 +199,10 @@ export function pointsForCurve(points: readonly EquityPoint[], cap: number): Equ
     let high = start;
     for (let index = start + 1; index < end; index += 1) {
       const equity = points[index]!.equity;
-      if (compareDecimal(equity, points[low]!.equity) < 0) {
+      if (compareMark(equity, points[low]!.equity) < 0) {
         low = index;
       }
-      if (compareDecimal(equity, points[high]!.equity) > 0) {
+      if (compareMark(equity, points[high]!.equity) > 0) {
         high = index;
       }
     }
@@ -195,13 +219,16 @@ export function pointsForCurve(points: readonly EquityPoint[], cap: number): Equ
   return chosen;
 }
 
-/** SVG coordinates for points that already passed the draw cap. Null when a string is not a finite mark. */
+/** SVG coordinates for points that already passed the draw cap. Null when a mark is not finite. */
 export function curveCoordinates(points: readonly EquityPoint[]): string | null {
   if (points.length === 0) {
     return null;
   }
   const ys: number[] = [];
   for (const point of points) {
+    if (!isStoredMark(point.equity)) {
+      return null;
+    }
     const value = Number(point.equity);
     if (!Number.isFinite(value)) {
       return null;
@@ -377,6 +404,21 @@ function saveBytes(bytes: ArrayBuffer, filename: string): void {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+function compareMark(left: string | number, right: string | number): number {
+  if (typeof left === "string" && typeof right === "string") {
+    return compareDecimal(left, right);
+  }
+  const leftNumber = typeof left === "number" ? left : Number(left);
+  const rightNumber = typeof right === "number" ? right : Number(right);
+  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+    if (leftNumber === rightNumber) {
+      return 0;
+    }
+    return leftNumber < rightNumber ? -1 : 1;
+  }
+  return compareDecimal(markText(left), markText(right));
 }
 
 function compareDecimal(left: string, right: string): number {
