@@ -11,7 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from app.agent.loop import TurnLimits, accept_proposal, run_turn
+from app.agent.errors import AgentError
+from app.agent.loop import TurnLimits, accept_proposal, reject_proposal, run_turn
 from app.agent.providers import (
     ChatMessage,
     OpenAICompatibleProvider,
@@ -25,6 +26,7 @@ from app.agent.providers import (
 from app.agent.store import AgentStore
 from app.auth import LOCAL_USER_ID, CurrentUser
 from app.dsl.format import format_strategy
+from app.ir.canonical import ir_hash
 from app.ir.validate import REPO_ROOT
 from app.jobs.queue import JobQueue
 from app.ohlcv.adapters.any_mint import AnyMintSource
@@ -32,6 +34,7 @@ from app.ohlcv.routes import OhlcvRuntime
 from app.ohlcv.store import SqliteBarStore
 from app.strategies.compile import compile_body
 from app.strategies.store import StrategyStore
+from app.tools.dispatch import Dispatcher
 from app.tools.runtime import ToolRuntime
 from test_backtest import _START, _strategy
 from test_ohlcv_any_mint import MINT, POOLS
@@ -601,5 +604,301 @@ def test_agent_sqlite_omits_bars_results_and_pool_snapshots(tmp_path: Path) -> N
         assert "bars_omitted" in agent_text
         assert "result_omitted" in agent_text
         assert "provider_data_omitted" in agent_text
+    finally:
+        world.close()
+
+
+def _pending(world: _World, dsl: str = _DSL) -> tuple[str, str]:
+    wrote = world.strategies.create(
+        LOCAL_USER_ID,
+        compile_body(json.dumps({"dsl": dsl}).encode("utf-8")),
+    )
+    strategy_id = wrote[0].strategy_id
+    result = world.turn(
+        StubProvider(
+            [
+                _tool(
+                    "update_strategy",
+                    {
+                        "strategy_id": strategy_id,
+                        "dsl": dsl.replace("warmup_bars: 26", "warmup_bars: 40", 1),
+                        "mode": "apply",
+                        "confirm": True,
+                    },
+                    "edit",
+                ),
+                _reply("proposed"),
+            ]
+        )
+    )
+    assert result["proposals"]
+    return strategy_id, result["proposals"][0]["proposal_id"]
+
+
+def _force_applying(store: AgentStore, proposal_id: str) -> None:
+    with sqlite3.connect(store.path) as conn:
+        updated = conn.execute(
+            "UPDATE agent_proposals SET status = 'applying' WHERE proposal_id = ?",
+            (proposal_id,),
+        )
+        assert updated.rowcount == 1
+        conn.commit()
+
+
+def _message_blob(request: ProviderRequest) -> str:
+    return json.dumps(
+        [
+            {
+                "content": message.content,
+                "calls": [call.arguments for call in message.tool_calls],
+            }
+            for message in request.messages
+        ]
+    )
+
+
+def test_applying_reconciles_after_a_settle_failure_and_a_dead_claim(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    try:
+        strategy_id, proposal_id = _pending(world)
+        original = world.agent.settle_proposal
+        armed = {"fail": True}
+
+        def flaky(*args: object, **kwargs: object) -> object:
+            if armed["fail"] and kwargs.get("status") == "accepted":
+                raise sqlite3.OperationalError("injected")
+            return original(*args, **kwargs)
+
+        world.agent.settle_proposal = flaky  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            accept_proposal(
+                store=world.agent,
+                runtime=world.runtime,
+                user=_USER,
+                proposal_id=proposal_id,
+            )
+        stuck = world.agent.get_proposal(LOCAL_USER_ID, proposal_id)
+        assert stuck is not None and stuck.status == "applying"
+        assert _versions(world.strategies, strategy_id) == 2
+        armed["fail"] = False
+        recovered = accept_proposal(
+            store=world.agent,
+            runtime=world.runtime,
+            user=_USER,
+            proposal_id=proposal_id,
+        )
+        assert recovered["proposal"]["status"] == "accepted"
+        assert recovered["strategy"]["version"] == 2
+        assert recovered["strategy"]["ir_hash"] == stuck.to_ir_hash
+        assert _versions(world.strategies, strategy_id) == 2
+        with pytest.raises(AgentError) as decided:
+            reject_proposal(
+                store=world.agent,
+                runtime=world.runtime,
+                user=_USER,
+                proposal_id=proposal_id,
+            )
+        assert decided.value.status == 409
+        assert decided.value.code == "proposal_already_decided"
+        still = world.agent.get_proposal(LOCAL_USER_ID, proposal_id)
+        assert still is not None and still.status == "accepted"
+
+        other_id, other_proposal = _pending(world)
+        _force_applying(world.agent, other_proposal)
+        assert world.agent.get_proposal(LOCAL_USER_ID, other_proposal).status == "applying"  # type: ignore[union-attr]
+        assert _versions(world.strategies, other_id) == 1
+        rejected = reject_proposal(
+            store=world.agent,
+            runtime=world.runtime,
+            user=_USER,
+            proposal_id=other_proposal,
+        )
+        assert rejected["proposal"]["status"] == "rejected"
+        assert _versions(world.strategies, other_id) == 1
+
+        third_id, third_proposal = _pending(world)
+        _force_applying(world.agent, third_proposal)
+        accepted = accept_proposal(
+            store=world.agent,
+            runtime=world.runtime,
+            user=_USER,
+            proposal_id=third_proposal,
+        )
+        assert accepted["strategy"]["version"] == 2
+        assert _versions(world.strategies, third_id) == 2
+        row = world.agent.get_proposal(LOCAL_USER_ID, third_proposal)
+        assert row is not None and row.status == "accepted"
+    finally:
+        world.close()
+
+
+def test_accept_fails_closed_when_the_applied_hash_differs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(tmp_path)
+    try:
+        strategy_id, proposal_id = _pending(world)
+        proposal = world.agent.get_proposal(LOCAL_USER_ID, proposal_id)
+        assert proposal is not None
+        real = Dispatcher.invoke
+
+        def tamper(self: Dispatcher, name: str, arguments: object, user: object) -> dict[str, Any]:
+            envelope = real(self, name, arguments, user)
+            if name == "update_strategy" and envelope.get("ok") is True:
+                data = dict(envelope["data"])
+                data["ir_hash"] = "0" * 64
+                return {**envelope, "data": data}
+            return envelope
+
+        monkeypatch.setattr(Dispatcher, "invoke", tamper)
+        with pytest.raises(AgentError) as caught:
+            accept_proposal(
+                store=world.agent,
+                runtime=world.runtime,
+                user=_USER,
+                proposal_id=proposal_id,
+            )
+        assert caught.value.code == "internal_error"
+        assert caught.value.status == 500
+        assert caught.value.message == "applied strategy does not match the proposal"
+        saved = world.agent.get_proposal(LOCAL_USER_ID, proposal_id)
+        assert saved is not None
+        assert saved.status != "accepted"
+        assert saved.applied_ir_hash != "0" * 64
+        assert saved.to_ir_hash == proposal.to_ir_hash
+        assert _versions(world.strategies, strategy_id) == 2
+    finally:
+        world.close()
+
+
+def test_backtest_dispatches_the_version_pinned_at_the_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(tmp_path)
+    try:
+        wrote = world.strategies.create(
+            LOCAL_USER_ID,
+            compile_body(json.dumps({"dsl": _DSL}).encode("utf-8")),
+        )
+        strategy_id = wrote[0].strategy_id
+        current = wrote[1]
+        world.agent.record_validation(LOCAL_USER_ID, world.session_id, current.ir_hash)
+        bars = {
+            "sol": [
+                {"open_time": _START, "close": 100},
+                {"open_time": _START + 60, "close": 110},
+            ]
+        }
+        real = Dispatcher.invoke
+        raced = {"done": False}
+
+        def invoke(self: Dispatcher, name: str, arguments: object, user: object) -> dict[str, Any]:
+            if name == "backtest_start" and not raced["done"]:
+                raced["done"] = True
+                assert isinstance(arguments, dict)
+                assert arguments.get("strategy_id") == strategy_id
+                assert arguments.get("version") == 1
+                compiled = compile_body(json.dumps({"dsl": _changed()}).encode("utf-8"))
+                world.strategies.add_version(
+                    LOCAL_USER_ID,
+                    strategy_id,
+                    compiled,
+                    expected_version=1,
+                    expected_ir_hash=current.ir_hash,
+                )
+            return real(self, name, arguments, user)
+
+        monkeypatch.setattr(Dispatcher, "invoke", invoke)
+        captured: dict[str, Any] = {}
+        original_start = world.jobs.start
+
+        def start(*args: object, **kwargs: object) -> object:
+            body = kwargs.get("body")
+            if isinstance(body, dict):
+                captured["ir"] = body.get("ir")
+            return original_start(*args, **kwargs)
+
+        monkeypatch.setattr(world.jobs, "start", start)
+        result = world.turn(
+            StubProvider(
+                [
+                    _tool(
+                        "backtest_start",
+                        {"strategy_id": strategy_id, "bars": bars, "request_key": "pinned"},
+                        "c1",
+                    ),
+                    _reply(),
+                ]
+            )
+        )
+        assert result["status"] == "completed", result
+        assert raced["done"] is True
+        assert _versions(world.strategies, strategy_id) == 2
+        assert _jobs(world.jobs_path) == 1
+        assert isinstance(captured.get("ir"), dict)
+        assert ir_hash(captured["ir"]) == current.ir_hash
+        assert "validation_required" not in json.dumps(result["events"])
+    finally:
+        world.close()
+
+
+def test_model_context_omits_bars_and_backtest_results(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    try:
+        ir = _strategy()
+        bars = {
+            "sol": [
+                {
+                    "open_time": _START,
+                    "open": _PRICE,
+                    "high": _PRICE,
+                    "low": _PRICE,
+                    "close": _PRICE,
+                    "volume": _VOLUME,
+                },
+                {"open_time": _START + 60, "close": _PRICE, "volume": _VOLUME},
+            ]
+        }
+        state = {"n": 0, "job_id": "", "checked_args": False, "checked_result": False}
+
+        def script(request: ProviderRequest) -> ProviderResponse:
+            state["n"] += 1
+            if state["n"] == 1:
+                return _tool("validate", {"ir": ir}, "v1")
+            if state["n"] == 2:
+                return _tool(
+                    "backtest_start",
+                    {"ir": ir, "bars": bars, "request_key": "context"},
+                    "b1",
+                )
+            if state["n"] == 3:
+                blob = _message_blob(request)
+                assert str(_PRICE) not in blob
+                assert str(_VOLUME) not in blob
+                assert "open_time" not in blob
+                assert "bars_omitted" in blob
+                state["checked_args"] = True
+                state["job_id"] = json.loads(request.messages[-1].content)["data"]["job_id"]
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    job = world.jobs.get(LOCAL_USER_ID, state["job_id"])
+                    if job.status in {"succeeded", "failed"}:
+                        break
+                    time.sleep(0.01)
+                assert world.jobs.get(LOCAL_USER_ID, state["job_id"]).status == "succeeded"
+                return _tool("backtest_get", {"job_id": state["job_id"]}, "g1")
+            blob = _message_blob(request)
+            assert "final_equity" not in blob
+            assert str(_PRICE) not in blob
+            assert "result_omitted" in blob
+            state["checked_result"] = True
+            return _reply("Done.")
+
+        result = world.turn(StubProvider([script]), "context")
+        assert result["status"] == "completed", result
+        assert state["checked_args"] is True
+        assert state["checked_result"] is True
     finally:
         world.close()

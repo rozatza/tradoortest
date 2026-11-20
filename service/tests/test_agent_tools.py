@@ -476,3 +476,24 @@ def test_exported_schemas_reject_a_trailing_newline_without_python_anchor() -> N
     with pytest.raises(ToolError) as exc:
         validate_schema(props, {"abc\n": 1})
     assert exc.value.code == "validation_error"
+
+
+def _patterned_strings(node: object, found: list[dict[str, Any]]) -> None:
+    if isinstance(node, dict):
+        if node.get("type") == "string" and isinstance(node.get("pattern"), str):
+            found.append(node)
+        for value in node.values():
+            _patterned_strings(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _patterned_strings(item, found)
+
+
+def test_exported_schemas_publish_the_newline_rejection() -> None:
+    nodes: list[dict[str, Any]] = []
+    for spec in export_specs():
+        _patterned_strings(spec["input_schema"], nodes)
+        _patterned_strings(spec["output_schema"], nodes)
+    assert nodes
+    for node in nodes:
+        assert node.get("not") == {"pattern": "\\n"}

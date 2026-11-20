@@ -265,7 +265,9 @@ async def stream_message(session_id: str, request: Request, user: CurrentUserDep
             )
             loop.call_soon_threadsafe(queue.put_nowait, _DONE)
         except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
+            for event in _worker_failure_events(opened, user, ident, exc):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+            loop.call_soon_threadsafe(queue.put_nowait, _DONE)
 
     thread = threading.Thread(target=worker, name="agent-turn", daemon=True)
     thread.start()
@@ -276,13 +278,12 @@ async def stream_message(session_id: str, request: Request, user: CurrentUserDep
                 item = await queue.get()
                 if item is _DONE:
                     break
-                if isinstance(item, Exception):
-                    yield _sse_failure(item, ident)
-                    break
                 if isinstance(item, dict):
                     yield _sse(item)
         finally:
-            thread.join(timeout=5)
+            # Join off the event loop. A disconnect cancels this task; a
+            # synchronous join here blocked /health for the timeout.
+            await asyncio.shield(run_in_threadpool(thread.join, 5))
 
     return StreamingResponse(
         generate(),
@@ -516,7 +517,7 @@ def _reject(
     proposal_id: str,
     runtime: ToolRuntime,
 ) -> tuple[int, dict[str, Any]]:
-    return 200, reject_proposal(store=store, user=user, proposal_id=proposal_id)
+    return 200, reject_proposal(store=store, runtime=runtime, user=user, proposal_id=proposal_id)
 
 
 def _prepare(
@@ -584,7 +585,10 @@ def _ident(raw: str, name: str) -> str | JSONResponse:
 
 
 async def _read_body(request: Request, *, allow_empty: bool) -> bytes | JSONResponse:
-    limit = body_limit()
+    try:
+        limit = body_limit()
+    except AgentError as exc:
+        return error_response(exc.status, exc.code, exc.message, exc.path)
     declared = request.headers.getlist("content-length")
     if len(declared) > 1:
         return error_response(400, "invalid_request", "content length is invalid", None)
@@ -770,29 +774,64 @@ def _reject_non_finite(_text: str) -> float:
     raise ValueError("non-finite number")
 
 
+def _worker_failure_events(
+    store: AgentStore,
+    user: CurrentUser,
+    session_id: str,
+    exc: Exception,
+) -> list[dict[str, Any]]:
+    """Persist the worker failure at the next sequence, then close the turn."""
+    code, message = _public_error(exc)
+    payload = {"code": code, "message": message, "path": None}
+    try:
+        existing = store.list_events(user.user_id, session_id, after_seq=None) or []
+        turn_id = existing[-1]["turn_id"] if existing else None
+        error_event = store.append_event(
+            user.user_id,
+            session_id,
+            turn_id=turn_id,
+            event_type="error",
+            payload=payload,
+        )
+        complete = store.append_event(
+            user.user_id,
+            session_id,
+            turn_id=turn_id,
+            event_type="turn_complete",
+            payload={"status": "error", "turn_id": turn_id, "error": payload},
+        )
+        return [error_event, complete]
+    except Exception:
+        return [
+            _unpersisted_event(session_id, "error", payload),
+            _unpersisted_event(
+                session_id,
+                "turn_complete",
+                {"status": "error", "turn_id": None, "error": payload},
+            ),
+        ]
+
+
+def _public_error(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, AgentError):
+        return exc.code, exc.message
+    if isinstance(exc, (StoreUnavailable, sqlite3.Error, OSError)):
+        return "service_unavailable", _UNAVAILABLE
+    return "internal_error", _INTERNAL
+
+
+def _unpersisted_event(session_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "seq": 0,
+        "event_id": event_type,
+        "session_id": session_id,
+        "turn_id": None,
+        "type": event_type,
+        "created_at": "1970-01-01T00:00:00Z",
+        "payload": payload,
+    }
+
+
 def _sse(event: Mapping[str, Any]) -> str:
     data = json.dumps(event, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     return f"id: {event['seq']}\nevent: {event['type']}\ndata: {data}\n\n"
-
-
-def _sse_failure(exc: Exception, session_id: str) -> str:
-    if isinstance(exc, AgentError):
-        code = exc.code
-        message = exc.message
-    elif isinstance(exc, (StoreUnavailable, sqlite3.Error, OSError)):
-        code = "service_unavailable"
-        message = _UNAVAILABLE
-    else:
-        code = "internal_error"
-        message = _INTERNAL
-    return _sse(
-        {
-            "seq": 0,
-            "event_id": "error",
-            "session_id": session_id,
-            "turn_id": None,
-            "type": "error",
-            "created_at": "1970-01-01T00:00:00Z",
-            "payload": {"code": code, "message": message, "path": None},
-        }
-    )

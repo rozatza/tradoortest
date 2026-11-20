@@ -580,6 +580,166 @@ def test_locked_corrupt_and_assertion_failures_stay_structured(
     application.state.agent_store.close()
 
 
+def test_bad_body_limit_is_a_structured_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_MAX_BODY_BYTES", "nope")
+    application = create_app(llm_provider=StubProvider([_reply()]))
+    client = TestClient(application, raise_server_exceptions=False)
+    response = client.post("/agent/sessions", json={"title": "cap"})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert response.json()["error"]["message"] == "the agent is not configured"
+    assert "Internal Server Error" not in response.text
+    _no_leak(response.text)
+    assert "nope" not in response.text
+
+
+def test_stream_persists_a_worker_error(tmp_path: Path) -> None:
+    class Boom:
+        name = "stub"
+
+        def complete(self, _request: ProviderRequest) -> ProviderResponse:
+            raise AssertionError("secret /tmp/agent.sqlite redacted-test-token-value")
+
+    store = AgentStore(tmp_path / "agent.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
+    application = create_app(agent_store=store, llm_provider=Boom())
+    client = TestClient(application, raise_server_exceptions=False)
+    try:
+        session_id = client.post("/agent/sessions", json={}).json()["session_id"]
+        response = client.post(
+            f"/agent/sessions/{session_id}/messages/stream",
+            json={"content": "boom"},
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = []
+        for block in (part for part in response.text.split("\n\n") if part.strip()):
+            lines = block.split("\n")
+            payload = json.loads(lines[2].removeprefix("data: "))
+            assert lines[0] == f"id: {payload['seq']}"
+            events.append(payload)
+        assert [event["type"] for event in events] == ["user_message", "error", "turn_complete"]
+        assert [event["seq"] for event in events] == [1, 2, 3]
+        assert events[1]["payload"]["code"] == "internal_error"
+        assert events[2]["payload"]["status"] == "error"
+        assert events[2]["payload"]["error"]["code"] == "internal_error"
+        _no_leak(response.text)
+        assert "redacted-test-token-value" not in response.text
+        replay = client.get(f"/agent/sessions/{session_id}/events")
+        assert [event["seq"] for event in replay.json()["events"]] == [1, 2, 3]
+        assert [event["type"] for event in replay.json()["events"]] == [
+            "user_message",
+            "error",
+            "turn_complete",
+        ]
+    finally:
+        store.close()
+
+
+def test_disconnect_during_a_slow_turn_keeps_health_fast(tmp_path: Path) -> None:
+    """Cancel the stream the way a server does when the client drops it.
+
+    A synchronous ``thread.join`` in the generator runs on the event loop.
+    ``/health`` has to answer while that cleanup is in progress.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(_request: ProviderRequest) -> ProviderResponse:
+        entered.set()
+        release.wait(8)
+        return _reply("Done.")
+
+    bundle = _Bundle(tmp_path, StubProvider([blocked]))
+    try:
+        session_id = bundle.session().json()["session_id"]
+        path = f"/agent/sessions/{session_id}/messages/stream"
+
+        async def probe() -> float:
+            first_body = asyncio.Event()
+
+            async def receive() -> dict[str, Any]:
+                return {
+                    "type": "http.request",
+                    "body": b'{"content":"wait"}',
+                    "more_body": False,
+                }
+
+            async def send(message: dict[str, Any]) -> None:
+                if message["type"] == "http.response.body" and message.get("body"):
+                    first_body.set()
+
+            scope = _scope("POST", path, [(b"content-type", b"application/json")])
+            app_task = asyncio.create_task(bundle.app(scope, receive, send))
+            await asyncio.wait_for(first_body.wait(), timeout=3)
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set()
+            app_task.cancel()
+            started = time.monotonic()
+            health_task = asyncio.create_task(_asgi_call(bundle.app, "GET", "/health"))
+            done, _pending = await asyncio.wait({health_task}, timeout=0.2)
+            elapsed = time.monotonic() - started
+            release.set()
+            if health_task not in done:
+                health_task.cancel()
+            else:
+                status, raw = health_task.result()
+                assert status == 200
+                assert json.loads(raw) == {"status": "ok"}
+            try:
+                await asyncio.wait_for(app_task, timeout=2)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+            return elapsed
+
+        assert asyncio.run(probe()) < 0.2
+    finally:
+        release.set()
+        bundle.close()
+
+
+def _scope(
+    method: str,
+    path: str,
+    headers: list[tuple[bytes, bytes]],
+) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": headers,
+        "client": ("127.0.0.1", 123),
+        "server": ("test", 80),
+        "root_path": "",
+    }
+
+
+async def _asgi_call(app: Any, method: str, path: str) -> tuple[int, bytes]:
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(_scope(method, path, []), receive, send)
+    status = next(item["status"] for item in sent if item["type"] == "http.response.start")
+    raw = b"".join(item.get("body", b"") for item in sent if item["type"] == "http.response.body")
+    return status, raw
+
+
 def _asgi(
     app: Any,
     path: str,

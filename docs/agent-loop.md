@@ -51,19 +51,21 @@ A preview with `changed: false` stores no proposal. Apply of that same candidate
 
 A preview with `changed: true` stores a pending proposal: ids, the predecessor version and hash, the diffs, and the canonical candidate DSL. The tool result tells the model that storage was not modified.
 
-`POST /agent/proposals/{id}/accept` is the only write. It claims the row from `pending` to `applying` inside `BEGIN IMMEDIATE`, then calls `update_strategy` with `mode: "apply"`, `confirm: true`, and the predecessor version and hash. A second accept finds the row already decided and returns HTTP 409 `proposal_already_decided` without another write. A stale predecessor is HTTP 409 `version_conflict`; the proposal becomes `conflict` and cannot be accepted or rejected again. `POST /agent/proposals/{id}/reject` marks `rejected` and does not touch the strategy file.
+`POST /agent/proposals/{id}/accept` is the only write. It claims the row from `pending` to `applying` inside `BEGIN IMMEDIATE`, then calls `update_strategy` with `mode: "apply"`, `confirm: true`, and the predecessor version and hash. The applied `ir_hash` must equal the proposal's `to_ir_hash`. A mismatch is HTTP 500 `internal_error` ("applied strategy does not match the proposal") and the row is not marked `accepted`. A second accept of a decided row returns HTTP 409 `proposal_already_decided` without another write. A stale predecessor is HTTP 409 `version_conflict`; the proposal becomes `conflict` and cannot be accepted or rejected again. `POST /agent/proposals/{id}/reject` marks `rejected` and does not touch the strategy file.
+
+A row left in `applying` is reconciled at the start of the next accept or reject for that proposal. If version `to_version` is stored and its `ir_hash` is `to_ir_hash`, the row becomes `accepted` and accept returns that result without writing again. If that version is missing, the row returns to `pending` and the decision continues. If the version is stored with a different hash, the row becomes `conflict`.
 
 Apply also refuses a predecessor that is not the row just read, before it builds a diff or calls `add_version`. The diff's `from_version` is that row.
 
 ## Guardrail 2: validate before backtest
 
-`backtest_start` resolves the canonical `ir_hash` first. A saved strategy is read for the current user. Inline DSL or IR is compiled and not stored. The hash must already have a passing `validate` (`ok: true` and `data.valid: true`) in this session. Otherwise the dispatcher is not called, no job is queued, and the tool result is `validation_required`: "validate must pass for this exact strategy before running a backtest". A later edit has a new hash and needs its own validate.
+`backtest_start` resolves the canonical `ir_hash` first. A saved strategy is read for the current user. When `version` is omitted, the version read for that hash is copied into the arguments (`strategy_id` and `version`) and that pinned version is what the dispatcher runs. A version saved after the check is not the one that starts. Inline DSL or IR is compiled and not stored. The hash must already have a passing `validate` (`ok: true` and `data.valid: true`) in this session. Otherwise the dispatcher is not called, no job is queued, and the tool result is `validation_required`: "validate must pass for this exact strategy before running a backtest". A later edit has a new hash and needs its own validate.
 
 ## Persistence and the 24 hour boundary
 
 `data/agent.sqlite` is gitignored. One connection, an `RLock`, and `BEGIN IMMEDIATE` protect writes. `PRAGMA foreign_keys`, `secure_delete`, `journal_mode=WAL`, and `busy_timeout` are set. Tables are `agent_sessions`, `agent_messages`, `agent_events`, `agent_proposals`, and `agent_validated_hashes`. Every row has `user_id`. There is no users table and no sharing.
 
-`service/app/agent/sanitize.py` runs before tool arguments, tool results, and event payloads are written:
+`service/app/agent/sanitize.py` runs before tool arguments, tool results, and event payloads are written. The same sanitizer runs on the messages kept in the model context, so bars and backtest results are not sent back to the provider:
 
 - `backtest_start` arguments keep `strategy_id`, `version`, `request_key`, `bar_count`, `symbols`, and `bars_omitted`. The bars stay in the job body.
 - `backtest_get` results keep `job_id`, `status`, `ready`, `created_at`, `expires_at`, `error`, and `result_omitted`. The result stays in the job store until its 24 hour TTL.
@@ -88,7 +90,7 @@ Every agent route uses `CurrentUserDep`. A user other than `local-user` is HTTP 
 | `POST` | `/agent/proposals/{proposal_id}/accept` | Apply a pending proposal. |
 | `POST` | `/agent/proposals/{proposal_id}/reject` | Reject a pending proposal. |
 
-SQLite, the model call, and tool execution run outside the asyncio event loop. `GET /health` stays `{"status": "ok"}` while a turn is blocked. A declared `Content-Length` or a chunked body over the cap is HTTP 413 and the unread tail is not consumed. `NaN`, `Infinity`, and NUL are HTTP 422. An unexpected exception, including `AssertionError`, is HTTP 500 `internal_error` with the message "the request could not be completed". The body does not include a traceback, a path, or a secret.
+SQLite, the model call, and tool execution run outside the asyncio event loop. `GET /health` stays `{"status": "ok"}` while a turn is blocked, including after a client disconnects mid-turn. The stream worker is a daemon thread. Its join runs in a thread pool, not on the event loop. A declared `Content-Length` or a chunked body over the cap is HTTP 413 and the unread tail is not consumed. An invalid `AGENT_MAX_BODY_BYTES` is HTTP 503 `service_unavailable` with the configured-agent message, not an uncaught 500. `NaN`, `Infinity`, and NUL are HTTP 422. An unexpected exception, including `AssertionError`, is HTTP 500 `internal_error` with the message "the request could not be completed". The body does not include a traceback, a path, or a secret. On the stream, that failure is stored as the next `error` event and a following `turn_complete` when the database can take the write.
 
 An event object has this key order: `seq`, `event_id`, `session_id`, `turn_id`, `type`, `created_at`, `payload`. `seq` starts at 1 and increases inside the session. Types are `user_message`, `tool_start`, `tool_complete`, `proposal_created`, `proposal_decided`, `assistant_message`, `error`, and `turn_complete`.
 

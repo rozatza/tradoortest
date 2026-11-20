@@ -8,6 +8,7 @@ that has not been validated.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from app.agent.providers import ChatMessage, LLMProvider, ProviderRequest, ToolC
 from app.agent.sanitize import sanitize_tool_payload
 from app.agent.store import AgentStore, MessageRecord, ProposalRecord
 from app.auth import CurrentUser
+from app.strategies.errors import StrategyNotFound, VersionNotFound
 from app.tools.dispatch import Dispatcher
 from app.tools.errors import http_status, safe_text
 from app.tools.registry import export_specs
@@ -43,7 +45,10 @@ _UNCHANGED = "strategy is unchanged"
 _CONFLICT = "strategy version conflict"
 _DECIDED = "proposal is already decided"
 _MISSING_PROPOSAL = "proposal was not found"
+_MISMATCH = "applied strategy does not match the proposal"
 _INTERNAL = "the request could not be completed"
+_proposal_locks: dict[str, threading.Lock] = {}
+_proposal_locks_guard = threading.Lock()
 
 OnEvent = Callable[[dict[str, Any]], None]
 
@@ -220,6 +225,26 @@ def accept_proposal(
     proposal_id: str,
 ) -> dict[str, Any]:
     """Apply a pending proposal once. A second accept does not write again."""
+    with _proposal_lock(proposal_id):
+        return _accept_locked(store=store, runtime=runtime, user=user, proposal_id=proposal_id)
+
+
+def _accept_locked(
+    *,
+    store: AgentStore,
+    runtime: ToolRuntime,
+    user: CurrentUser,
+    proposal_id: str,
+) -> dict[str, Any]:
+    current = store.get_proposal(user.user_id, proposal_id)
+    if current is None:
+        raise AgentError("not_found", _MISSING_PROPOSAL, status=404)
+    if current.status == "applying":
+        current, event = _reconcile_applying(store, runtime, user, current)
+        if current.status == "accepted":
+            return _accepted_body(current, event)
+    if current.status != "pending":
+        raise AgentError("proposal_already_decided", _DECIDED, status=409)
     claimed = store.settle_proposal(
         user.user_id,
         proposal_id,
@@ -257,6 +282,7 @@ def accept_proposal(
         raise AgentError("internal_error", _INTERNAL, status=500)
     version = int(data["version"])
     ir_hash = str(data["ir_hash"])
+    _assert_applied_hash(proposal, ir_hash)
     settled = store.settle_proposal(
         user.user_id,
         proposal.proposal_id,
@@ -292,13 +318,29 @@ def accept_proposal(
 def reject_proposal(
     *,
     store: AgentStore,
+    runtime: ToolRuntime,
     user: CurrentUser,
     proposal_id: str,
 ) -> dict[str, Any]:
     """Mark a pending proposal rejected. The strategy store is not touched."""
+    with _proposal_lock(proposal_id):
+        return _reject_locked(store=store, runtime=runtime, user=user, proposal_id=proposal_id)
+
+
+def _reject_locked(
+    *,
+    store: AgentStore,
+    runtime: ToolRuntime,
+    user: CurrentUser,
+    proposal_id: str,
+) -> dict[str, Any]:
     current = store.get_proposal(user.user_id, proposal_id)
     if current is None:
         raise AgentError("not_found", _MISSING_PROPOSAL, status=404)
+    if current.status == "applying":
+        current, _event = _reconcile_applying(store, runtime, user, current)
+    if current.status != "pending":
+        raise AgentError("proposal_already_decided", _DECIDED, status=409)
     settled = store.settle_proposal(
         user.user_id,
         proposal_id,
@@ -333,15 +375,16 @@ def _remember_assistant(
     text: str,
     calls: tuple[ToolCall, ...],
 ) -> None:
+    safe_calls = tuple(_sanitized_call(call) for call in calls)
     store.add_message(
         user.user_id,
         session_id,
         turn_id=turn_id,
         role="assistant",
         content=text,
-        tool_calls=[_stored_call(call) for call in calls],
+        tool_calls=[_stored_call(call) for call in safe_calls],
     )
-    context.append(ChatMessage(role="assistant", content=text, tool_calls=calls))
+    context.append(ChatMessage(role="assistant", content=text, tool_calls=safe_calls))
 
 
 def _execute_call(
@@ -416,7 +459,7 @@ def _execute_call(
     context.append(
         ChatMessage(
             role="tool",
-            content=_model_json(envelope),
+            content=_model_json(call.name, envelope),
             tool_call_id=call_id,
             tool_name=call.name,
         )
@@ -429,6 +472,16 @@ def _stored_tool_content(tool: str, envelope: dict[str, Any]) -> str:
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
+    )
+
+
+def _sanitized_call(call: ToolCall) -> ToolCall:
+    parsed, ok = _parse_arguments(call.arguments)
+    arguments = parsed if ok and isinstance(parsed, dict) else {}
+    return ToolCall(
+        call.call_id,
+        call.name,
+        sanitize_tool_payload(call.name, "arguments", arguments),
     )
 
 
@@ -571,9 +624,10 @@ def _parse_arguments(raw: object) -> tuple[object, bool]:
     return None, False
 
 
-def _model_json(payload: object) -> str:
+def _model_json(tool: str, payload: object) -> str:
+    safe = sanitize_tool_payload(tool, "result", payload) if isinstance(payload, dict) else payload
     try:
-        text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        text = json.dumps(safe, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
         return "{}"
     if len(text) <= MAX_TOOL_RESULT_CHARS:
@@ -582,6 +636,117 @@ def _model_json(payload: object) -> str:
         {"truncated": True, "preview": text[:MAX_TOOL_RESULT_CHARS]},
         ensure_ascii=False,
     )
+
+
+def _proposal_lock(proposal_id: str) -> threading.Lock:
+    with _proposal_locks_guard:
+        lock = _proposal_locks.get(proposal_id)
+        if lock is None:
+            lock = threading.Lock()
+            _proposal_locks[proposal_id] = lock
+        return lock
+
+
+def _reconcile_applying(
+    store: AgentStore,
+    runtime: ToolRuntime,
+    user: CurrentUser,
+    proposal: ProposalRecord,
+) -> tuple[ProposalRecord, dict[str, Any] | None]:
+    """Finish a proposal left in ``applying`` by a crashed accept.
+
+    A saved target version whose hash is the proposal hash is accepted.
+    A missing target version goes back to pending. A different hash is
+    ``conflict`` and is not accepted.
+    """
+    loaded = _stored_target(runtime, user, proposal)
+    if loaded is not None and loaded[1] == proposal.to_ir_hash:
+        version, ir_hash = loaded
+        settled = store.settle_proposal(
+            user.user_id,
+            proposal.proposal_id,
+            expect="applying",
+            status="accepted",
+            decided_at=store.now(),
+            applied_version=version,
+            applied_ir_hash=ir_hash,
+            event_type="proposal_decided",
+            event_payload={
+                "proposal_id": proposal.proposal_id,
+                "decision": "accepted",
+                "status": "accepted",
+                "strategy_id": proposal.strategy_id,
+                "applied_version": version,
+                "applied_ir_hash": ir_hash,
+            },
+            turn_id=proposal.turn_id,
+        )
+    elif loaded is None:
+        settled = store.settle_proposal(
+            user.user_id,
+            proposal.proposal_id,
+            expect="applying",
+            status="pending",
+            decided_at=None,
+            applied_version=None,
+            applied_ir_hash=None,
+            event_type=None,
+            event_payload=None,
+            turn_id=proposal.turn_id,
+        )
+    else:
+        settled = store.settle_proposal(
+            user.user_id,
+            proposal.proposal_id,
+            expect="applying",
+            status="conflict",
+            decided_at=store.now(),
+            applied_version=None,
+            applied_ir_hash=None,
+            event_type="proposal_decided",
+            event_payload={
+                "proposal_id": proposal.proposal_id,
+                "decision": "conflict",
+                "status": "conflict",
+                "strategy_id": proposal.strategy_id,
+            },
+            turn_id=proposal.turn_id,
+        )
+    if settled is None:
+        raise AgentError("not_found", _MISSING_PROPOSAL, status=404)
+    return settled.proposal, settled.event
+
+
+def _stored_target(
+    runtime: ToolRuntime,
+    user: CurrentUser,
+    proposal: ProposalRecord,
+) -> tuple[int, str] | None:
+    try:
+        loaded = runtime.strategies().get_version(
+            user.user_id, proposal.strategy_id, proposal.to_version
+        )
+    except (StrategyNotFound, VersionNotFound):
+        return None
+    return loaded.version, loaded.ir_hash
+
+
+def _accepted_body(proposal: ProposalRecord, event: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "proposal": proposal.detail(),
+        "strategy": {
+            "strategy_id": proposal.strategy_id,
+            "version": proposal.applied_version,
+            "ir_hash": proposal.applied_ir_hash,
+        },
+        "event": event,
+    }
+
+
+def _assert_applied_hash(proposal: ProposalRecord, ir_hash: str) -> None:
+    """Refuse to record an accept when the write is not the candidate hash."""
+    if ir_hash != proposal.to_ir_hash:
+        raise AgentError("internal_error", _MISMATCH, status=500)
 
 
 def _release_claim(store: AgentStore, user: CurrentUser, proposal: ProposalRecord) -> None:

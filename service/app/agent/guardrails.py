@@ -1,7 +1,8 @@
 """Hard guards around the ROZ-76 dispatcher.
 
 An agent edit is always a preview. A backtest starts only after ``validate``
-has passed for the same canonical ``ir_hash`` in this session.
+has passed for the same canonical ``ir_hash`` in this session. The version
+resolved for that check is the version dispatched.
 """
 
 from __future__ import annotations
@@ -38,12 +39,14 @@ def run_tool(
     """Run one tool call. A proposal is returned only when one was stored."""
     if name == "update_strategy":
         return _update(arguments, user, session_id, turn_id, dispatcher, store)
+    call_arguments = arguments
     if name == "backtest_start":
-        blocked = _backtest_block(arguments, user, session_id, dispatcher.runtime, store)
+        pinned, blocked = _backtest_block(arguments, user, session_id, dispatcher.runtime, store)
         if blocked is not None:
             return blocked, None
+        call_arguments = pinned
     envelope = dispatcher.invoke(
-        name, arguments if isinstance(arguments, dict) else arguments, user
+        name, call_arguments if isinstance(call_arguments, dict) else call_arguments, user
     )
     if name == "validate":
         _remember_validation(envelope, user, session_id, store)
@@ -163,13 +166,18 @@ def _backtest_block(
     session_id: str,
     runtime: ToolRuntime,
     store: AgentStore,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return pinned arguments, or an error envelope.
+
+    A saved strategy is pinned to the id and version read for the hash check.
+    A later version cannot be the one that is dispatched.
+    """
     spec = BY_NAME["backtest_start"]
     try:
         payload = require_object(arguments)
         validate_schema(spec.input_schema, payload)
     except ToolError as exc:
-        return error_envelope(
+        return None, error_envelope(
             "backtest_start",
             exc.code,
             exc.message,
@@ -177,36 +185,51 @@ def _backtest_block(
             retryable=exc.retryable,
             details=exc.details if isinstance(exc.details, dict | list) else None,
         )
-    ir_hash, blocked = _target_hash(payload, user, runtime)
+    ir_hash, pinned, blocked = _target_pin(payload, user, runtime)
     if blocked is not None:
-        return blocked
-    if ir_hash is None or not store.has_validation(user.user_id, session_id, ir_hash):
-        return _failed("backtest_start", "validation_required", _VALIDATE_FIRST)
-    return None
+        return None, blocked
+    if (
+        ir_hash is None
+        or pinned is None
+        or not store.has_validation(user.user_id, session_id, ir_hash)
+    ):
+        return None, _failed("backtest_start", "validation_required", _VALIDATE_FIRST)
+    return pinned, None
 
 
-def _target_hash(
+def _target_pin(
     payload: Mapping[str, Any],
     user: CurrentUser,
     runtime: ToolRuntime,
-) -> tuple[str | None, dict[str, Any] | None]:
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
     if "strategy_id" in payload:
         strategies = runtime.strategies()
         record = strategies.find(user.user_id, str(payload["strategy_id"]))
         if record is None:
-            return None, _failed("backtest_start", "not_found", "strategy was not found")
+            return None, None, _failed("backtest_start", "not_found", "strategy was not found")
         if record.archived_at is not None:
-            return None, _failed("backtest_start", "strategy_archived", "strategy is archived")
+            return (
+                None,
+                None,
+                _failed("backtest_start", "strategy_archived", "strategy is archived"),
+            )
         number = payload.get("version", record.latest_version)
         try:
             loaded = strategies.get_version(user.user_id, record.strategy_id, int(number))
         except (StrategyNotFound, VersionNotFound):
-            return None, _failed("backtest_start", "not_found", "strategy version was not found")
-        return loaded.ir_hash, None
+            return (
+                None,
+                None,
+                _failed("backtest_start", "not_found", "strategy version was not found"),
+            )
+        pinned = dict(payload)
+        pinned["strategy_id"] = record.strategy_id
+        pinned["version"] = loaded.version
+        return loaded.ir_hash, pinned, None
     compiled = _compile_candidate(payload)
     if compiled is None:
-        return None, _failed("backtest_start", "validation_required", _VALIDATE_FIRST)
-    return compiled.ir_hash, None
+        return None, None, _failed("backtest_start", "validation_required", _VALIDATE_FIRST)
+    return compiled.ir_hash, dict(payload), None
 
 
 def _remember_validation(
