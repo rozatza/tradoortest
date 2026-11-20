@@ -1,4 +1,4 @@
-"""FastAPI app. Health, backtest jobs, and saved strategies."""
+"""FastAPI app. Health, backtest jobs, saved strategies, and agent tools."""
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,6 +8,7 @@ from app.jobs.routes import error_response, router
 from app.ohlcv.routes import router as ohlcv_router
 from app.strategies.routes import router as strategies_router
 from app.strategies.store import StrategyStore
+from app.tools.routes import router as tools_router
 
 
 def create_app(
@@ -23,6 +24,7 @@ def create_app(
     application.include_router(router)
     application.include_router(ohlcv_router)
     application.include_router(strategies_router)
+    application.include_router(tools_router)
 
     @application.exception_handler(RecursionError)
     def recursion_too_deep(_request: Request, _exc: RecursionError) -> JSONResponse:

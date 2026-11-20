@@ -114,6 +114,8 @@ The body cap is checked on the declared `Content-Length` and again while reading
 
 SQLite work and parsing run in a thread pool. The connection uses `PRAGMA foreign_keys=ON`, `PRAGMA secure_delete=ON`, and `PRAGMA busy_timeout`. Writes take a process `RLock` and `BEGIN IMMEDIATE`. The next version is `MAX(version) + 1` in that transaction. `(strategy_id, version)` is the primary key, so a version number is not reused. `BEFORE UPDATE` and `BEFORE DELETE` triggers on `strategy_versions` abort with `strategy_versions rows are immutable`.
 
+`StrategyStore.add_version` also accepts optional `expected_version` and `expected_ir_hash`. When either is set, the comparison runs inside the same `BEGIN IMMEDIATE` transaction as the insert. A mismatch raises `VersionConflict` and writes nothing. `PUT /strategies/{strategy_id}` does not pass those arguments, so the HTTP save still appends the next version. The agent `update_strategy` tool is the caller that sets them. See `docs/agent-tools.md`.
+
 ## Environment
 
 Commented placeholders live in `.env.example`. None of them have a value.
