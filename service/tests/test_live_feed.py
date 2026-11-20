@@ -23,7 +23,12 @@ from app.live.feed import (
     closed_real_bars,
     last_closed_open,
 )
-from app.live.scheduler import PaperScheduler, register_paper_strategy
+from app.live.scheduler import (
+    PaperScheduler,
+    PaperStrategy,
+    _bars_needed,
+    register_paper_strategy,
+)
 from app.live.series import build_window
 from app.main import app, create_app
 from app.ohlcv.adapters.birdeye import BirdeyeSource
@@ -478,8 +483,13 @@ def test_in_progress_and_synthetic_bars_do_not_reach_the_runner(
     assert any(bar.synthetic and bar.open_time == _T0 + _STEP for bar in stored)
     assert forming.open_time not in {bar.open_time for bar in stored}
     assert [open_time for open_time, _payload in decisions] == [_T0]
-    assert len(seen) == 1
-    window, view = seen[0]
+    # Warmup 0 replays the previous slot too, so a cross has a prior close.
+    # That slot is a hole. The synthetic bar and the forming bar are not stepped.
+    assert len(seen) == 2
+    previous, current = seen
+    assert previous[0].open_time == _T0 - _STEP
+    assert previous[0].bars["sol"] is None
+    window, view = current
     assert window.open_time == _T0
     assert window.bars["sol"] is not None
     assert window.bars["sol"].synthetic is False
@@ -536,7 +546,9 @@ def test_a_bar_is_not_evaluated_twice(tmp_path: Path, monkeypatch: pytest.Monkey
     try:
         scheduler.tick()
         scheduler.tick()
-        assert calls["n"] == 1
+        # Two steps on the first tick: the previous hole and the one real bar.
+        # The second tick has nothing new, so it does not decide the bar again.
+        assert calls["n"] == 2
         assert [open_time for open_time, _payload in _decisions(store)] == [_T0]
         kinds = {
             kind
@@ -564,15 +576,15 @@ def test_restart_does_not_double_fire(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr("app.live.scheduler.step", spy)
     try:
         first.tick()
-        assert calls["n"] == 1
+        assert calls["n"] == 2
         second = PaperScheduler(store, _Quiet(), now=lambda: clock["now"], interval=3600)
         second.tick()
-        assert calls["n"] == 1
+        assert calls["n"] == 2
         assert [open_time for open_time, _payload in _decisions(store)] == [_T0]
         clock["now"] = _T0 + 2 * _STEP + CLOSE_GRACE_SECONDS
         store.upsert([_bar(_T0 + _STEP)], user_id=LOCAL_USER_ID)
         second.tick()
-        assert calls["n"] == 2
+        assert calls["n"] == 4
         assert [open_time for open_time, _payload in _decisions(store)] == [_T0, _T0 + _STEP]
     finally:
         store.close()
@@ -640,7 +652,7 @@ def test_versions_do_not_share_a_cursor(tmp_path: Path, monkeypatch: pytest.Monk
     try:
         scheduler.tick()
         scheduler.tick()
-        assert calls["n"] == 2
+        assert calls["n"] == 4
         assert [open_time for open_time, _payload in _decisions(store, 1)] == [_T0]
         assert [open_time for open_time, _payload in _decisions(store, 2)] == [_T0]
     finally:
@@ -1364,6 +1376,266 @@ def test_a_failed_refetch_is_not_ready_and_decides_nothing(tmp_path: Path) -> No
         assert stored == []
         assert cursor is None
         assert _cursor_price_floats(root / "ohlcv.sqlite") == []
+
+
+def _needed(document: dict) -> int:
+    strategy = PaperStrategy(
+        "sol-paper",
+        1,
+        document,
+        str(document["engine"]["bar_size"]),
+        int(document["engine"]["warmup_bars"]),
+        (("sol", SOL_MINT),),
+    )
+    return _bars_needed(strategy)
+
+
+def _above(bar_size: str, spec: dict, left: dict, right: dict) -> dict:
+    document = _paper(bar_size)
+    document["derived_series"] = [spec]
+    document["signals"] = [{"id": "go", "expr": {"op": "gt", "left": left, "right": right}}]
+    return document
+
+
+def test_warmup_zero_continuous_cross_matches_the_full_history(tmp_path: Path) -> None:
+    """A legal warmup of 0 still sees the previous close, so a cross can fire."""
+    step = 3600
+    closes = [10.0, 10.1, 10.2, 10.25, 10.4, 10.5, 10.2, 10.0, 10.5]
+    document = _lit_cross("1h", 10.3)
+    assert document["engine"]["warmup_bars"] == 0
+    assert _needed(document) == 2
+    bars = [
+        _bar(_ORIGIN + index * step, timeframe="1h", close=close)
+        for index, close in enumerate(closes)
+    ]
+    expected = _walk_decisions(document, bars, step)
+    expected_fired = [
+        open_time
+        for open_time, decision in expected.items()
+        if any(rule.close is not None for rule in decision.rules)
+    ]
+    clock = {"now": _ORIGIN + step + CLOSE_GRACE_SECONDS}
+    store = _store(tmp_path, clock)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    register_paper_strategy(scheduler, "sol-paper", 1, document)
+    live_fired: list[int] = []
+    try:
+        for bar in bars:
+            clock["now"] = bar.open_time + step + CLOSE_GRACE_SECONDS
+            store.upsert([bar], user_id=LOCAL_USER_ID)
+            scheduler.tick()
+            for open_time, payload in _decisions(store):
+                if open_time != bar.open_time:
+                    continue
+                assert _payload_signature(payload) == _decision_signature(expected[open_time])
+                if _rule_fired(payload):
+                    live_fired.append(open_time)
+    finally:
+        store.close()
+    assert live_fired == expected_fired
+    assert len(live_fired) == 2
+
+
+def test_recursive_indicators_match_the_full_history_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slid convergence window decides the same as a walk from the first bar."""
+    step = 3600
+    close_ref = {"op": "ref", "name": "close"}
+    cases = (
+        (
+            "ema",
+            {
+                "id": "ema_slow",
+                "kind": "indicator",
+                "indicator": "ema",
+                "source": "close",
+                "params": {"period": 20},
+            },
+            close_ref,
+            {"op": "ref", "name": "ema_slow"},
+            20,
+        ),
+        (
+            "rsi",
+            {
+                "id": "rsi_slow",
+                "kind": "indicator",
+                "indicator": "rsi",
+                "source": "close",
+                "params": {"period": 14},
+            },
+            {"op": "ref", "name": "rsi_slow"},
+            {"op": "lit", "value": 50},
+            14,
+        ),
+        (
+            "atr",
+            {
+                "id": "atr_slow",
+                "kind": "indicator",
+                "indicator": "atr",
+                "source": "close",
+                "params": {"period": 14},
+            },
+            {"op": "ref", "name": "atr_slow"},
+            {"op": "lit", "value": 0.55},
+            14,
+        ),
+        (
+            "macd",
+            {
+                "id": "macd_hist",
+                "kind": "indicator",
+                "indicator": "macd",
+                "source": "close",
+                "output": "histogram",
+                "params": {"fast": 12, "slow": 26, "signal": 9},
+            },
+            {"op": "ref", "name": "macd_hist"},
+            {"op": "lit", "value": 0},
+            26,
+        ),
+        (
+            "stochastic",
+            {
+                "id": "stoch_d",
+                "kind": "indicator",
+                "indicator": "stochastic",
+                "source": "close",
+                "output": "d",
+                "params": {"k_period": 14, "d_period": 3},
+            },
+            {"op": "ref", "name": "stoch_d"},
+            {"op": "lit", "value": 50},
+            14,
+        ),
+    )
+    for name, spec, left, right, period in cases:
+        document = _above("1h", spec, left, right)
+        needed = _needed(document)
+        if spec["indicator"] in {"ema", "macd"}:
+            assert needed >= document["engine"]["warmup_bars"] + 10 * period
+        else:
+            assert needed > period + 1
+        total = needed + 8
+        bars = [
+            _bar(_ORIGIN + index * step, timeframe="1h", close=_wave(index))
+            for index in range(total)
+        ]
+        clock = {"now": _ORIGIN + step + CLOSE_GRACE_SECONDS}
+        root = tmp_path / name
+        root.mkdir()
+        store = _store(root, clock, ttl=MAX_CACHE_TTL_SECONDS)
+        feed = _History(store, bars, clock)
+        scheduler = _scheduler(store, feed, clock)
+        register_paper_strategy(scheduler, "sol-paper", 1, document)
+        captured: dict[str, float] = {}
+        series_id = spec["id"]
+        last_open = bars[-1].open_time
+
+        def spy(
+            config,
+            state,
+            window,
+            view,
+            *,
+            _last=last_open,
+            _series=series_id,
+            _captured=captured,
+        ):
+            if window.open_time == _last:
+                _captured["value"] = window.series["sol"][_series][window.t]
+            return real_step(config, state, window, view)
+
+        monkeypatch.setattr("app.live.scheduler.step", spy)
+        expected = _walk_decisions(document, bars, step)
+        by_time = {bar.open_time: bar for bar in bars}
+        full = build_window(
+            document, ("sol",), {"sol": by_time}, bars[0].open_time, last_open, step
+        )
+        seen: set[int] = set()
+        try:
+            for index in range(total):
+                clock["now"] = _ORIGIN + index * step + step + CLOSE_GRACE_SECONDS
+                scheduler.tick()
+                assert _cursor_price_floats(root / "ohlcv.sqlite") == []
+                for open_time, payload in _decisions(store):
+                    if open_time in seen:
+                        continue
+                    assert _payload_signature(payload) == _decision_signature(
+                        expected[open_time]
+                    )
+                    seen.add(open_time)
+            assert seen == {bar.open_time for bar in bars}
+            full_value = full.series["sol"][series_id][full.t]
+            assert abs(captured["value"] - full_value) < 1e-6
+            # A window longer than the 24h cache has to be fetched again.
+            if (needed - 1) * step > MAX_CACHE_TTL_SECONDS:
+                wide = [
+                    end - start
+                    for now, start, end in feed.calls
+                    if now >= _ORIGIN + 24 * 3600 + step
+                ]
+                assert wide
+                assert max(wide) >= (needed - 1) * step
+        finally:
+            monkeypatch.setattr("app.live.scheduler.step", real_step)
+            store.close()
+
+
+def test_a_failed_recursive_refetch_is_not_ready(tmp_path: Path) -> None:
+    document = _above(
+        "1h",
+        {
+            "id": "ema_slow",
+            "kind": "indicator",
+            "indicator": "ema",
+            "source": "close",
+            "params": {"period": 20},
+        },
+        {"op": "ref", "name": "close"},
+        {"op": "ref", "name": "ema_slow"},
+    )
+    needed = _needed(document)
+    step = 3600
+    last = _ORIGIN + 30 * step
+    clock = {"now": last + step + CLOSE_GRACE_SECONDS}
+    store = _store(tmp_path, clock)
+    asked: dict[str, int] = {}
+
+    class _Raise:
+        calls = 0
+
+        def fetch(self, mint: str, timeframe: str, start: int, end: int) -> list[Bar]:
+            self.calls += 1
+            asked["start"] = start
+            asked["end"] = end
+            raise SourceError("gecko down")
+
+        def close(self) -> None:
+            return None
+
+    feed = _Raise()
+    scheduler = _scheduler(store, feed, clock)
+    register_paper_strategy(scheduler, "sol-paper", 1, document)
+    try:
+        scheduler.tick()
+        errors = store.live_errors(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        log = store.live_bar_log(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        cursor = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        decided = _decisions(store)
+    finally:
+        store.close()
+    assert needed >= 10 * 20
+    assert asked["end"] - asked["start"] >= (needed - 1) * step
+    assert decided == []
+    assert feed.calls == 1
+    assert errors
+    assert errors[0][1] == "SourceError"
+    assert any(kind == "not_ready" for _open, kind, _detail in log)
+    assert cursor is None
+    assert _cursor_price_floats(tmp_path / "ohlcv.sqlite") == []
 
 
 def test_live_package_has_no_broker_or_wallet_code() -> None:

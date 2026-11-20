@@ -3,8 +3,10 @@
 The thread is not the request event loop. ``GET /health`` does not wait for
 a tick. Each tick asks the feed for bars the lookback does not already
 hold, then rebuilds runner memory by calling ``step`` from the initial
-state over that lookback, holes included. The cursor stores the grid origin
-and the last open time. It does not store a price.
+state over that lookback, holes included. Warmup 0 still keeps the bar
+before the decision, and a recursive indicator keeps a convergence window
+long enough that the dropped tail does not change the decision. The cursor
+stores the grid origin and the last open time. It does not store a price.
 
 A new scheduler on the same file continues after the last open time, so a
 restart does not repeat a bar and does not skip one that was committed.
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -659,8 +662,46 @@ def _positive_int(value: object) -> int:
     return value
 
 
-def _series_lookback(spec: Mapping[str, Any]) -> int:
-    """Samples an indicator needs before its previous bar can be finite."""
+def _decay_steps(kept: float) -> int:
+    """Steps that leave a seed weighing about ``e^-20``.
+
+    ``kept`` is the fraction of the previous value the smoother carries
+    forward. ``kept ** steps ≈ e^-20``.
+    """
+    if kept <= 0.0 or kept >= 1.0:
+        return 0
+    return math.ceil(20.0 / -math.log(kept))
+
+
+def _ema_window(period: int, warmup: int) -> int:
+    """Bars so an EMA tail dropped before the window weighs about ``e^-20``.
+
+    An EMA keeps ``(period - 1) / (period + 1)`` of its previous value.
+    The window is also at least ``warmup + 10 * period``. The extra bar
+    after the decay is the bar before the decision, so that bar is
+    converged and not only the decision bar.
+    """
+    if period < 1:
+        return 0
+    steps = 0 if period <= 1 else _decay_steps((period - 1) / (period + 1))
+    return max(warmup + 10 * period, period + steps + 1)
+
+
+def _wilder_window(period: int) -> int:
+    """Bars so a Wilder tail (RSI, ATR) dropped before the window is about ``e^-20``.
+
+    The smoother keeps ``(period - 1) / period``. The first value sits
+    ``period`` bars into the run, and the bar before the decision has to
+    be that many steps past the seed.
+    """
+    if period < 1:
+        return 0
+    steps = 0 if period <= 1 else _decay_steps((period - 1) / period)
+    return period + steps + 2
+
+
+def _indicator_window(spec: Mapping[str, Any], warmup: int) -> int:
+    """Replay length for one derived series, counted through the decision bar."""
     params = spec.get("params")
     if not isinstance(params, dict):
         params = {}
@@ -671,24 +712,41 @@ def _series_lookback(spec: Mapping[str, Any]) -> int:
     signal = _positive_int(params.get("signal"))
     k_period = _positive_int(params.get("k_period"))
     d_period = _positive_int(params.get("d_period"))
-    if kind == "macd":
-        return slow + signal
-    if kind == "stochastic":
-        return k_period + d_period
+    if kind == "ema":
+        return _ema_window(period, warmup)
     if kind in {"rsi", "atr"}:
-        return period + 1
-    return max(period, fast, slow, signal, k_period, d_period)
+        return _wilder_window(period)
+    if kind == "macd":
+        # The line is an EMA pair and the signal is an EMA of that line.
+        # The longest period sets both the e^-20 tail and the 10× floor.
+        return _ema_window(max(fast, slow, signal), warmup)
+    if kind == "stochastic":
+        # %D is an SMA of unsmoothed %K, so the window is the rolling length.
+        if k_period < 1 or d_period < 1:
+            return 0
+        return k_period + d_period
+    if kind in {"sma", "bollinger"}:
+        return period + 1 if period >= 1 else 0
+    span = max(period, fast, slow, signal, k_period, d_period)
+    return span + 1 if span >= 1 else 0
 
 
 def _bars_needed(strategy: PaperStrategy) -> int:
-    """Closed bars required to warm the strategy and one previous bar."""
-    span = strategy.warmup_bars
+    """Closed bars in one replay, including the bar before the decision.
+
+    ``warmup_bars`` 0 still keeps that previous bar, so a cross can fire.
+    Each indicator on the IR extends the window: rolling indicators by
+    their period, recursive ones by a convergence window from their own
+    smoothing constant.
+    """
+    warmup = strategy.warmup_bars
+    needed = max(warmup, 1) + 1
     series = strategy.document.get("derived_series")
     if isinstance(series, list):
         for spec in series:
             if isinstance(spec, dict):
-                span = max(span, _series_lookback(spec))
-    return span + 1
+                needed = max(needed, _indicator_window(spec, warmup))
+    return needed
 
 
 def _lookback_origin(open_time: int, step_seconds: int, needed: int) -> int:
