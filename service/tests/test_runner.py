@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import importlib.util
 import json
-import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import fields
@@ -239,11 +239,15 @@ def _cases() -> list[tuple[str, dict, dict[str, list[Bar]]]]:
     return cases
 
 
+# sha256 of service/app/backtest/engine.py at e56685c. A CI checkout is shallow,
+# so the test locks the bytes instead of calling git show.
+_FROZEN_ENGINE_SHA256 = "4bc6fcc2fce84df4dbb0844e10e4e86e82d30e4d895112d4a8482205d2264798"
+
+
 def test_frozen_engine_is_the_base_sha() -> None:
-    committed = subprocess.check_output(
-        ["git", "-C", str(_REPO), "show", f"{_SHA}:service/app/backtest/engine.py"]
-    )
-    assert _LEGACY_PATH.read_bytes() == committed
+    """The frozen file is ``engine.py`` at ``_SHA``. A shallow CI checkout has no parent."""
+    digest = hashlib.sha256(_LEGACY_PATH.read_bytes()).hexdigest()
+    assert digest == _FROZEN_ENGINE_SHA256, _SHA
 
 
 def test_every_backtest_fixture_file_is_in_the_catalog() -> None:
