@@ -334,4 +334,43 @@ describe("author chat", () => {
     expect(screen.getByRole("status", { name: "validate stopped" }).textContent).toContain("Stopped");
     expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
   });
+
+  it("stops Working when the stream errors after a tool step", async () => {
+    install((url) => {
+      if (url === "/api/agent/sessions") {
+        return jsonResponse({ session_id: SESSION_ID });
+      }
+      const encoder = new TextEncoder();
+      let sent = false;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(
+              encoder.encode(
+                frames([
+                  agentEvent(1, "user_message", { role: "user", content: "cut" }),
+                  agentEvent(2, "tool_start", { tool: "validate", call_id: "c1", arguments: {} }),
+                ]),
+              ),
+            );
+            return;
+          }
+          controller.error(new TypeError("network error"));
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    render(<Chat />);
+    await send("cut");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("http_error");
+    expect(alert.textContent).toContain("network error");
+    expect(screen.queryByText("Working…")).toBeNull();
+    expect(screen.getByRole("status", { name: "validate stopped" }).textContent).toContain("Stopped");
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });

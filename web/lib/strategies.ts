@@ -140,6 +140,22 @@ export async function validateStrategy(
   if (!response.ok) {
     return readFailure(response);
   }
+  const text = await response.text();
+  if (text.trim() !== "") {
+    try {
+      JSON.parse(text);
+    } catch {
+      return {
+        ok: false,
+        status: response.status,
+        code: "invalid_response",
+        message: "the author API returned an invalid response",
+        diagnostics: [],
+        currentVersion: null,
+        currentIrHash: null,
+      };
+    }
+  }
   return { ok: true };
 }
 
@@ -162,7 +178,21 @@ export async function saveStrategy(
   if (!response.ok) {
     return readFailure(response);
   }
-  const file = readDetail(await response.json());
+  let parsed: unknown;
+  try {
+    parsed = await response.json();
+  } catch {
+    return {
+      ok: false,
+      status: response.status,
+      code: "invalid_response",
+      message: "the author API returned an invalid response",
+      diagnostics: [],
+      currentVersion: null,
+      currentIrHash: null,
+    };
+  }
+  const file = readDetail(parsed);
   if (!file) {
     return invalidResponse(response.status);
   }

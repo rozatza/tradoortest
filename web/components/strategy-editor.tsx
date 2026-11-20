@@ -90,7 +90,7 @@ export function StrategyEditor({
         return;
       }
       if (!loaded.ok) {
-        setLoadError(`${loaded.code}: ${loaded.message}`);
+        setLoadError(failureLine(loaded));
         return;
       }
       setFile(loaded.file);
@@ -110,7 +110,11 @@ export function StrategyEditor({
             createdAt: "",
           },
         ]);
-        setLoadError(`${history.code}: ${history.message}`);
+        setLoadError(failureLine(history));
+      }
+    } catch (error) {
+      if (generation.current === token) {
+        setLoadError(thrownLine(error));
       }
     } finally {
       if (generation.current === token) {
@@ -131,7 +135,7 @@ export function StrategyEditor({
         return;
       }
       if (!loaded.ok) {
-        setLoadError(`${loaded.code}: ${loaded.message}`);
+        setLoadError(failureLine(loaded));
         return;
       }
       setFile({ ...file, viewedVersion: loaded.version, dsl: loaded.dsl });
@@ -140,6 +144,10 @@ export function StrategyEditor({
       setConflict(null);
       setNote(null);
       setPendingVersion(null);
+    } catch (error) {
+      if (generation.current === token) {
+        setLoadError(thrownLine(error));
+      }
     } finally {
       if (generation.current === token) {
         setPending(false);
@@ -149,13 +157,19 @@ export function StrategyEditor({
 
   async function onShowSaved() {
     setPending(true);
-    const listed = await listStrategies();
-    setPending(false);
-    if (!listed.ok) {
-      setLoadError(`${listed.code}: ${listed.message}`);
-      return;
+    setLoadError(null);
+    try {
+      const listed = await listStrategies();
+      if (!listed.ok) {
+        setLoadError(failureLine(listed));
+        return;
+      }
+      setStrategies(listed.strategies);
+    } catch (error) {
+      setLoadError(thrownLine(error));
+    } finally {
+      setPending(false);
     }
-    setStrategies(listed.strategies);
   }
 
   function onVersionPick(version: number) {
@@ -176,15 +190,19 @@ export function StrategyEditor({
     lock.current = true;
     setPending(true);
     setConflict(null);
+    setLoadError(null);
     try {
       const checked = await validateStrategy(file.strategyId, draft);
       if (!checked.ok) {
-        setDiagnostics(checked.diagnostics);
-        setNote(null);
+        showChecked(checked);
         return;
       }
       setDiagnostics([]);
       setNote("Valid. Nothing was saved.");
+    } catch (error) {
+      setDiagnostics([]);
+      setNote(null);
+      setLoadError(thrownLine(error));
     } finally {
       lock.current = false;
       setPending(false);
@@ -202,11 +220,11 @@ export function StrategyEditor({
     lock.current = true;
     setPending(true);
     setConflict(null);
+    setLoadError(null);
     try {
       const checked = await validateStrategy(id, text);
       if (!checked.ok) {
-        setDiagnostics(checked.diagnostics);
-        setNote(null);
+        showChecked(checked);
         return;
       }
       setDiagnostics([]);
@@ -219,8 +237,7 @@ export function StrategyEditor({
           setNote(null);
           return;
         }
-        setDiagnostics(saved.diagnostics);
-        setNote(null);
+        showChecked(saved);
         return;
       }
       setFile(saved.file);
@@ -229,10 +246,25 @@ export function StrategyEditor({
       setNote(`Saved version ${saved.file.viewedVersion}.`);
       setPendingVersion(null);
       setStaleNote(false);
+    } catch (error) {
+      setDiagnostics([]);
+      setNote(null);
+      setLoadError(thrownLine(error));
     } finally {
       lock.current = false;
       setPending(false);
     }
+  }
+
+  function showChecked(failure: { code: string; message: string; diagnostics: Diagnostic[] }) {
+    if (failure.diagnostics.length > 0) {
+      setDiagnostics(failure.diagnostics);
+      setLoadError(null);
+    } else {
+      setDiagnostics([]);
+      setLoadError(failureLine(failure));
+    }
+    setNote(null);
   }
 
   function keepEditing() {
@@ -410,6 +442,17 @@ export function StrategyEditor({
       ) : null}
     </section>
   );
+}
+
+function failureLine(failure: { code: string; message: string }): string {
+  return `${failure.code}: ${failure.message}`;
+}
+
+function thrownLine(error: unknown): string {
+  if (error instanceof Error && error.message !== "") {
+    return `http_error: ${error.message}`;
+  }
+  return "http_error: the request could not be completed";
 }
 
 function mergeVersion(current: VersionSummary[], saved: LoadedFile): VersionSummary[] {

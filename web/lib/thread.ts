@@ -144,6 +144,10 @@ export function buildThread(events: AgentEvent[]): ThreadRow[] {
       }
       continue;
     }
+    if (event.type === "stream_aborted") {
+      incompleteAfter.push(event.seq);
+      continue;
+    }
     if (event.type === "stream_incomplete") {
       incompleteAfter.push(event.seq);
       const error = errorFromPayload(

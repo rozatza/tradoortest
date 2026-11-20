@@ -128,4 +128,25 @@ describe("buildThread", () => {
       "ended before the turn finished",
     );
   });
+
+  it("stops every in-progress tool step when the stream aborts", () => {
+    const rows = buildThread([
+      agentEvent(1, "tool_start", { tool: "validate", call_id: "c1", arguments: {} }),
+      agentEvent(2, "tool_complete", {
+        tool: "read_strategy",
+        call_id: "c0",
+        ok: true,
+        output: { ok: true },
+      }),
+      agentEvent(3, "tool_start", { tool: "write_strategy", call_id: "c2", arguments: {} }),
+      agentEvent(4, "stream_aborted", {}),
+    ]);
+    const tools = rows.filter((row) => row.type === "tool");
+    expect(tools.map((row) => (row.type === "tool" ? `${row.tool.tool}:${row.tool.state}` : ""))).toEqual([
+      "validate:stopped",
+      "read_strategy:done",
+      "write_strategy:stopped",
+    ]);
+    expect(rows.some((row) => row.type === "error")).toBe(false);
+  });
 });

@@ -335,13 +335,47 @@ button:focus-visible {
 }
 
 @media (max-width: 60rem) {
+  html,
+  body {
+    height: auto;
+    min-height: 100%;
+  }
+
+  main {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+
+  /* Stack the panes and let the page scroll. A fixed workspace with
+     overflow clips the composer under the editor at 800x600 and 375x667. */
   .workspace {
-    grid-template-columns: 1fr;
-    overflow: auto;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-height: auto;
+    overflow: visible;
+  }
+
+  .chat {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
   }
 
   .thread {
-    min-height: 16rem;
+    flex: none;
+    min-height: 8rem;
+    max-height: 12rem;
+  }
+
+  .composer {
+    position: relative;
+    z-index: 1;
+  }
+
+  .editor {
+    overflow: visible;
   }
 }
 

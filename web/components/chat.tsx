@@ -61,6 +61,7 @@ export function Chat() {
       setDraft((current) => (current === content ? "" : current));
     } catch (error) {
       pushNotice(error, content);
+      pushAborted();
     } finally {
       setBusy(false);
     }
@@ -131,6 +132,21 @@ export function Chat() {
       ...existing,
       { id: `notice-${noticeCount.current}`, afterSeq, code, message, quote },
     ]);
+  }
+
+  function pushAborted() {
+    const seq = seqRef.current + 1;
+    seqRef.current = seq;
+    const agentEvent: AgentEvent = {
+      seq,
+      event_id: `local-aborted-${seq}`,
+      session_id: sessionId.current ?? "",
+      turn_id: null,
+      type: "stream_aborted",
+      created_at: "",
+      payload: {},
+    };
+    setEvents((current) => insertEvent(current, agentEvent));
   }
 
   function pushIncomplete() {
