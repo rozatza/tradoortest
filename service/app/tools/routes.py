@@ -1,9 +1,11 @@
 """HTTP surface for the tool catalog and one tool call.
 
 ``GET /tools`` lists descriptors. ``POST /tools/{tool_name}`` runs that tool
-for the current user. A bad body, a huge body, or an unknown name uses the
-``{error}`` envelope. A tool result uses the ``ok`` envelope, including a
-failed tool call. Spoofed owner headers and query parameters are ignored.
+for the current user. The dispatcher is synchronous, so it runs in a worker
+thread and cannot stall ``GET /health``. A bad body, a huge body, or an
+unknown name uses the ``{error}`` envelope. A tool result uses the ``ok``
+envelope, including a failed tool call. Spoofed owner headers and query
+parameters are ignored.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import LOCAL_USER_ID, CurrentUserDep
 from app.jobs.routes import _queue as open_job_queue
@@ -66,7 +69,12 @@ async def invoke_tool(tool_name: str, request: Request, user: CurrentUserDep) ->
     parsed = _parse(raw)
     if isinstance(parsed, JSONResponse):
         return parsed
-    envelope = Dispatcher(_runtime(request)).invoke(tool_name, parsed, user)
+    envelope = await run_in_threadpool(
+        Dispatcher(_runtime(request)).invoke,
+        tool_name,
+        parsed,
+        user,
+    )
     if envelope["ok"]:
         return JSONResponse(status_code=200, content=envelope)
     if envelope["error"]["code"] == "unknown_tool":

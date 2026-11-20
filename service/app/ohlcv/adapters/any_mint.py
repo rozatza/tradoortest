@@ -150,6 +150,17 @@ class AnyMintSource:
             budget = self._budget
         budget.take()
 
+    def pool_provider(self) -> str:
+        """Name of the source that chooses the pool.
+
+        Candle fallback does not change this. Callers that store the row
+        should use it instead of assuming a provider string.
+        """
+        name = getattr(self._gt, "name", None)
+        if isinstance(name, str) and name != "" and len(name) <= 32 and "\x00" not in name:
+            return name
+        return "geckoterminal"
+
     def pool_for(self, mint: str) -> ChosenPool | None:
         found = self._recall(self._chosen, mint)
         if isinstance(found, ChosenPool):

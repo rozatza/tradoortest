@@ -8,9 +8,11 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,6 +27,7 @@ from app.main import create_app
 from app.strategies.compile import compile_body
 from app.strategies.store import StrategyStore
 from app.tools.dispatch import Dispatcher
+from app.tools.registry import BY_NAME
 from app.tools.routes import MAX_BODY_BYTES
 from app.tools.runtime import ToolRuntime
 from test_backtest import _START, _strategy
@@ -754,6 +757,84 @@ def test_locked_corrupt_and_unexpected_failures_do_not_leak_or_poison(
     assert opened.status_code == 200, opened.text
     assert isinstance(application.state.strategies, StrategyStore)
     application.state.strategies.close()
+
+
+_ASSERTION = "secret /tmp/strategies.sqlite redacted-test-token-value"
+
+
+def _assert_internal(body: Mapping[str, Any], raw: str) -> None:
+    assert body["ok"] is False
+    assert body["tool"] == "validate"
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["message"] == "the tool could not finish"
+    assert "AssertionError" not in raw
+    assert "Internal Server Error" not in raw
+    for token in ("secret", "/tmp/", "strategies.sqlite", "redacted-test-token-value"):
+        assert token not in raw
+
+
+def _boom(*_args: object, **_kwargs: object) -> dict[str, Any]:
+    raise AssertionError(_ASSERTION)
+
+
+def test_assertion_error_stays_inside_the_tool_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    spec = BY_NAME["validate"]
+    monkeypatch.setitem(BY_NAME, "validate", replace(spec, handler=_boom))
+    dispatcher = Dispatcher(ToolRuntime())
+    failed = dispatcher.invoke("validate", {"dsl": "x"}, _USER)
+    _assert_internal(failed, json.dumps(failed))
+    application = create_app()
+    client = TestClient(application, raise_server_exceptions=False)
+    response = client.post("/tools/validate", json={"dsl": "x"})
+    assert response.status_code == 500
+    _assert_internal(response.json(), response.text)
+
+
+def test_health_stays_responsive_while_a_tool_call_blocks(tmp_path: Path) -> None:
+    store = StrategyStore(tmp_path / "strategies.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
+    application = create_app(strategies=store)
+    entered = threading.Event()
+    release = threading.Event()
+    original = store.create
+
+    def slow(user_id: str, compiled: Any) -> Any:
+        entered.set()
+        release.wait(3)
+        return original(user_id, compiled)
+
+    store.create = slow  # type: ignore[method-assign]
+
+    async def probe() -> None:
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            started = time.monotonic()
+            write = asyncio.create_task(client.post("/tools/write_strategy", json={"dsl": _DSL}))
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            saw = time.monotonic()
+            health_started = time.monotonic()
+            health = await client.get("/health")
+            health_done = time.monotonic()
+            release.set()
+            saved = await write
+        assert entered.is_set()
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok"}
+        assert saved.status_code == 200
+        assert saw - started < 1
+        assert health_done - health_started < 0.3
+
+    try:
+        asyncio.run(probe())
+    finally:
+        release.set()
+        store.close()
 
 
 def test_non_local_user_is_forbidden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -93,6 +93,7 @@ def _resolve_pool(runtime: ToolRuntime, user: CurrentUser, mint: str) -> dict[st
             "the asset source is unavailable",
             retryable=True,
         )
+    provider = _provider_name(source)
     ohlcv.store.save_pool(
         user_id=user.user_id,
         mint=mint,
@@ -104,9 +105,19 @@ def _resolve_pool(runtime: ToolRuntime, user: CurrentUser, mint: str) -> dict[st
         liquidity_usd=chosen.liquidity_usd,
         resolved_at=chosen.resolved_at,
         pool_created_at=chosen.pool_created_at,
-        provider="geckoterminal",
+        provider=provider,
     )
-    return _from_pool(mint, chosen, provider="geckoterminal", cached=False)
+    return _from_pool(mint, chosen, provider=provider, cached=False)
+
+
+def _provider_name(source: object) -> str:
+    """Provider that resolved the pool, or the GeckoTerminal default."""
+    method = getattr(source, "pool_provider", None)
+    if callable(method):
+        found = method()
+        if isinstance(found, str) and found != "" and len(found) <= 32 and "\x00" not in found:
+            return found
+    return "geckoterminal"
 
 
 def _from_row(mint: str, row: Mapping[str, object], *, cached: bool) -> dict[str, Any]:

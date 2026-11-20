@@ -383,7 +383,7 @@ def test_search_asset_maps_pool_source_failures(tmp_path: Path) -> None:
         return httpx.Response(200, json=PUMP)
 
     def boom(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"secret": "sk-live-should-not-leak"})
+        return httpx.Response(500, json={"secret": "redacted-test-token-value"})
 
     def limited(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": []})
@@ -410,6 +410,6 @@ def test_search_asset_maps_pool_source_failures(tmp_path: Path) -> None:
             source.close()
         assert failed["ok"] is False
         assert failed["error"]["code"] == code
-        _no_leak(failed, "sk-live")
+        _no_leak(failed, "redacted-test-token-value")
         if code in {"service_unavailable", "rate_limited"}:
             assert failed["error"]["retryable"] is True

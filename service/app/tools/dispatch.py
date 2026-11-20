@@ -122,8 +122,6 @@ def _details(value: object) -> dict[str, Any] | list[Any] | None:
 
 
 def _map(exc: BaseException) -> ToolError:
-    if isinstance(exc, AssertionError):
-        raise exc
     if isinstance(exc, Rejected):
         return ToolError(
             exc.code or "validation_error",

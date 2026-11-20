@@ -65,7 +65,8 @@ A strategy or job owned by any other id is `not_found`. The response does not in
 | `expired` | 410 | no | The backtest result is past the 24 hour TTL. |
 | `payload_too_large` | 413 | no | The body, or one string, is over the cap. |
 | `validation_error` | 422 | no | The arguments or the strategy document are not valid. |
-| `invalid_mint`, `unknown_symbol`, `no_pool`, `no_dex_pool_yet` | 422 | no | Asset resolution failed for that reason. |
+| `invalid_mint`, `no_pool`, `no_dex_pool_yet` | 422 | no | Asset resolution failed for that reason. |
+| `unknown_symbol` | 422 | no | `add_chart` or `add_indicator` named a symbol that is not a major. |
 | `confirmation_required` | 422 | no | `update_strategy` apply without `confirm: true`. |
 | `expr_too_deep`, `invalid_string`, `non_finite_number` | 422 | no | The JSON value itself is not acceptable. |
 | `rate_limited`, `limit_reached` | 429 | yes | The asset source cap, or the backtest rate or concurrency cap. |
@@ -98,7 +99,7 @@ Preview returns `mutated: false`, `from_version`, `to_version` (`from_version + 
 
 `backtest_start` accepts a saved `strategy_id` (optional `version`) or inline `dsl` or `ir`, plus `bars` and an optional `request_key`. The body is prepared by `app.jobs.routes._prepare` and started on `JobQueue`. A missing `request_key` is a new id. The same key and body returns the original job. A different body for that key is `conflict`. `backtest_status` and `backtest_get` read that job for the current user. `started_at` and `finished_at` are null because the queue does not store them. `created_at` and `expires_at` come from the row and the 24 hour result TTL. A finished job's bars are not kept. Results live only in the job result row until that TTL. The backtest engine is unchanged.
 
-`add_chart` checks a symbol, mint, or asset against the major registry or `require_mint`, and checks `timeframe` against `BAR_SIZES`. It returns a `directive_type` of `chart` and `directive_version` `"1.0"`. It stores nothing.
+`add_chart` checks a symbol, mint, or asset against the major registry or `require_mint`, and checks `timeframe` against `BAR_SIZES`. A symbol that is not a major is `unknown_symbol`. That code comes from the chart and indicator directive helpers, not from `search_asset`. It returns a `directive_type` of `chart` and `directive_version` `"1.0"`. It stores nothing.
 
 `add_indicator` accepts `sma`, `ema`, `atr`, `rsi`, `macd`, `bollinger`, and `stochastic`. Parameters match `INDICATOR_PARAMS` and the Phase 1 bounds: periods are integers from 1 to 500, RSI period starts at 2, and Bollinger `stddev` is in `(0, 10]`. A bool is rejected. MACD does not require `fast` to be less than `slow`, which is the Phase 1 rule. The default pane is `overlay` for `sma`, `ema`, and `bollinger`, and `separate` for the rest. An explicit pane is allowed. Warmup comes from the indicator library. The directive id is sha256 of the canonical JSON, so the same arguments always return the same id. Nothing is stored.
 
