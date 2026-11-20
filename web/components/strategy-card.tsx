@@ -1,6 +1,12 @@
 import type { StrategyView } from "@/lib/types";
 
-export function StrategyCard({ strategy }: { strategy: StrategyView }) {
+export function StrategyCard({
+  strategy,
+  onOpen,
+}: {
+  strategy: StrategyView;
+  onOpen: (strategyId: string) => void;
+}) {
   const title = strategy.action === "written" ? "Strategy written" : "Strategy updated";
   return (
     <section className="card strategy" aria-label={title}>
@@ -24,6 +30,11 @@ export function StrategyCard({ strategy }: { strategy: StrategyView }) {
           </div>
         ) : null}
       </dl>
+      <div className="actions">
+        <button type="button" onClick={() => onOpen(strategy.strategyId)}>
+          Open
+        </button>
+      </div>
     </section>
   );
 }

@@ -313,4 +313,25 @@ describe("author chat", () => {
     });
     expect(screen.getByText("accepted")).toBeTruthy();
   });
+
+  it("shows an error and stops Working when the stream ends without turn_complete", async () => {
+    install((url) => {
+      if (url === "/api/agent/sessions") {
+        return jsonResponse({ session_id: SESSION_ID });
+      }
+      return sseResponse([
+        frames([
+          agentEvent(1, "user_message", { role: "user", content: "cut" }),
+          agentEvent(2, "tool_start", { tool: "validate", call_id: "c1", arguments: {} }),
+        ]),
+      ]);
+    });
+    render(<Chat />);
+    await send("cut");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("stream_incomplete: the response ended before the turn finished");
+    expect(screen.queryByText("Working…")).toBeNull();
+    expect(screen.getByRole("status", { name: "validate stopped" }).textContent).toContain("Stopped");
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+  });
 });

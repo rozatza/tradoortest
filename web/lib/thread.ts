@@ -43,6 +43,7 @@ export function buildThread(events: AgentEvent[]): ThreadRow[] {
   const proposals = new Map<string, ProposalView>();
   const rows: ThreadRow[] = [];
   const errors: ErrorView[] = [];
+  const incompleteAfter: number[] = [];
 
   for (const event of events) {
     const payload = event.payload ?? {};
@@ -143,6 +144,24 @@ export function buildThread(events: AgentEvent[]): ThreadRow[] {
       }
       continue;
     }
+    if (event.type === "stream_incomplete") {
+      incompleteAfter.push(event.seq);
+      const error = errorFromPayload(
+        {
+          code: stringField(payload, "code") ?? "stream_incomplete",
+          message:
+            stringField(payload, "message") ?? "the response ended before the turn finished",
+        },
+        event.seq,
+      );
+      rows.push({
+        key: `error:${event.seq}:${event.event_id}`,
+        seq: event.seq,
+        type: "error",
+        error,
+      });
+      continue;
+    }
     if (event.type === "error") {
       const error = errorFromPayload(payload, event.seq);
       errors.push(error);
@@ -169,6 +188,16 @@ export function buildThread(events: AgentEvent[]): ThreadRow[] {
             error,
           });
         }
+      }
+    }
+  }
+  if (incompleteAfter.length > 0) {
+    for (const step of steps.values()) {
+      if (step.state !== "working") {
+        continue;
+      }
+      if (incompleteAfter.some((seq) => seq > step.seq)) {
+        step.state = "stopped";
       }
     }
   }

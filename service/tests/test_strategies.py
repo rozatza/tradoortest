@@ -833,6 +833,7 @@ def test_other_current_user_is_forbidden(tmp_path: Path) -> None:
             ("GET", f"/strategies/{strategy_id}/versions"),
             ("GET", f"/strategies/{strategy_id}/versions/1"),
             ("GET", f"/strategies/{strategy_id}/diff?from=1&to=1"),
+            ("POST", f"/strategies/{strategy_id}/validate"),
         ]
         for method, path in paths:
             response = client.request(method, path, json={"dsl": dsl})
@@ -1116,6 +1117,7 @@ def test_second_user_is_hidden_on_every_route(tmp_path: Path) -> None:
             ("GET", f"/strategies/{bob}/versions", None),
             ("GET", f"/strategies/{bob}/versions/1", None),
             ("GET", f"/strategies/{bob}/diff?from=1&to=1", None),
+            ("POST", f"/strategies/{bob}/validate", {"dsl": dsl}),
         ]
         for method, path, payload in calls:
             response = client.request(method, path, json=payload)
@@ -1279,3 +1281,148 @@ def _expect_cap(status: int, raw: bytes, limited: bool) -> None:
         return
     assert status == 422
     assert body["error"]["code"] == "invalid_json"
+
+
+def test_validate_reports_positions_and_does_not_write(tmp_path: Path) -> None:
+    dsl, _document = _ema()
+    with _client(tmp_path / "strategies.sqlite") as (client, store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        assert created.status_code == 201, created.text
+        strategy_id = created.json()["strategy_id"]
+        before = _rows(store.path, "SELECT version, dsl, ir_hash FROM strategy_versions")
+
+        checked = client.post(f"/strategies/{strategy_id}/validate", json={"dsl": dsl})
+        assert checked.status_code == 200, checked.text
+        body = checked.json()
+        assert body["valid"] is True
+        assert body["strategy_id"] == strategy_id
+        assert body["name"] == created.json()["name"]
+        assert body["ir_hash"] == created.json()["version"]["ir_hash"]
+        assert "dsl" not in body
+        assert "ir" not in body
+
+        syntax = client.post(
+            f"/strategies/{strategy_id}/validate",
+            json={"dsl": "not a strategy\n"},
+        )
+        error = _error(syntax, 422, "syntax")
+        diagnostic = error["diagnostics"][0]
+        assert diagnostic["line"] == 1
+        assert isinstance(diagnostic["column"], int)
+        assert diagnostic["column"] >= 1
+        assert "message" in diagnostic
+        assert _rows(store.path, "SELECT version, dsl, ir_hash FROM strategy_versions") == before
+
+        client.delete(f"/strategies/{strategy_id}")
+        archived = client.post(f"/strategies/{strategy_id}/validate", json={"dsl": dsl})
+        _error(archived, 404, "not_found")
+        assert _rows(store.path, "SELECT version, dsl, ir_hash FROM strategy_versions") == before
+
+
+def test_stale_save_conflicts_and_does_not_overwrite(tmp_path: Path) -> None:
+    dsl, _document = _ema()
+    edited = _warmup(dsl, 30)
+    with _client(tmp_path / "strategies.sqlite") as (client, store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        assert created.status_code == 201, created.text
+        strategy_id = created.json()["strategy_id"]
+        head_hash = created.json()["version"]["ir_hash"]
+        assert created.json()["latest_version"] == 1
+
+        missing_hash = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": edited, "expected_version": 1},
+        )
+        _error(missing_hash, 422, "invalid_request")
+        bad_hash = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": edited, "expected_version": 1, "expected_ir_hash": "AB" * 32},
+        )
+        _error(bad_hash, 422, "invalid_request")
+        assert _rows(store.path, "SELECT COUNT(*) FROM strategy_versions") == [(1,)]
+
+        saved = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": edited, "expected_version": 1, "expected_ir_hash": head_hash},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["latest_version"] == 2
+        next_hash = saved.json()["version"]["ir_hash"]
+        assert next_hash != head_hash
+
+        stale = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": _warmup(dsl, 40), "expected_version": 1, "expected_ir_hash": head_hash},
+        )
+        error = _error(stale, 409, "version_conflict")
+        assert error["current_version"] == 2
+        assert error["current_ir_hash"] == next_hash
+        assert error["path"] == "$.expected_version"
+        wrong_hash = client.put(
+            f"/strategies/{strategy_id}",
+            json={"dsl": _warmup(dsl, 40), "expected_version": 2, "expected_ir_hash": head_hash},
+        )
+        _error(wrong_hash, 409, "version_conflict")
+        assert _rows(store.path, "SELECT version FROM strategy_versions ORDER BY version") == [
+            (1,),
+            (2,),
+        ]
+        assert client.get(f"/strategies/{strategy_id}").json()["version"]["ir_hash"] == next_hash
+
+        legacy = client.put(f"/strategies/{strategy_id}", json={"dsl": _warmup(dsl, 40)})
+        assert legacy.status_code == 200, legacy.text
+        assert legacy.json()["latest_version"] == 3
+
+
+def test_validate_stays_off_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dsl, _document = _ema()
+    entered = threading.Event()
+    release = threading.Event()
+    original = routes.compile_body
+    calls = {"n": 0}
+
+    def blocking(raw: bytes) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(raw)
+        entered.set()
+        assert release.wait(3)
+        return original(raw)
+
+    monkeypatch.setattr(routes, "compile_body", blocking)
+    with _client(tmp_path / "strategies.sqlite") as (client, _store, _app):
+        created = client.post("/strategies", json={"dsl": dsl})
+        strategy_id = created.json()["strategy_id"]
+        holder: dict[str, Any] = {}
+
+        def post() -> None:
+            holder["response"] = client.post(
+                f"/strategies/{strategy_id}/validate",
+                json={"dsl": dsl},
+            )
+
+        worker = threading.Thread(target=post)
+        worker.start()
+        assert entered.wait(2)
+        health: dict[str, Any] = {}
+
+        def get_health() -> None:
+            started = time.perf_counter()
+            health["response"] = client.get("/health")
+            health["elapsed"] = time.perf_counter() - started
+
+        try:
+            checker = threading.Thread(target=get_health)
+            checker.start()
+            checker.join(0.3)
+            blocked = checker.is_alive()
+            release.set()
+            checker.join(2)
+            worker.join(2)
+        finally:
+            release.set()
+        assert blocked is False
+        assert health["response"].status_code == 200
+        assert health["response"].json() == {"status": "ok"}
+        assert health["elapsed"] < 0.3
+        assert holder["response"].status_code == 200

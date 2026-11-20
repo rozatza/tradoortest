@@ -218,10 +218,11 @@ class StrategyStore:
         """Append the next version. Version 1 is never updated.
 
         ``expected_version`` and ``expected_ir_hash`` are optional. ``None``
-        skips that check, which is what the HTTP save route does. When either
-        is set, the comparison runs inside this write transaction after the
-        row is locked. A mismatch raises ``VersionConflict`` and writes
-        nothing, so two overlapping saves cannot both pass a stale version.
+        skips that check. The HTTP save passes them when the body includes
+        the pair, and omits them otherwise. When either is set, the comparison
+        runs inside this write transaction after the row is locked. A mismatch
+        raises ``VersionConflict`` and writes nothing, so two overlapping
+        saves cannot both pass a stale version.
         """
         _check_expected(expected_version, expected_ir_hash)
         with self._immediate():

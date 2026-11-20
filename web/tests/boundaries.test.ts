@@ -13,6 +13,7 @@ const FORBIDDEN = [
   "privateKey",
   "signTransaction",
   "createWallet",
+  "/tools/",
 ];
 
 function sourceFiles(dir: string): string[] {

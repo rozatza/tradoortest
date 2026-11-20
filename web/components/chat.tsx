@@ -2,10 +2,11 @@
 
 import { useMemo, useRef, useState, type FormEvent } from "react";
 
+import { StrategyEditor } from "@/components/strategy-editor";
 import { Thread } from "@/components/thread";
 import { ApiError, createSession, decideProposal, streamMessage } from "@/lib/client";
-import { buildThread, insertEvent } from "@/lib/thread";
-import type { AgentEvent, DecisionState, StrategyFields, ThreadNotice } from "@/lib/types";
+import { applyDecisions, buildThread, insertEvent } from "@/lib/thread";
+import type { AgentEvent, DecisionState, ProposalView, StrategyFields, ThreadNotice } from "@/lib/types";
 
 export function Chat() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -13,10 +14,25 @@ export function Chat() {
   const [decisions, setDecisions] = useState<Record<string, DecisionState>>({});
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [strategyId, setStrategyId] = useState<string | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
   const sessionId = useRef<string | null>(null);
   const seqRef = useRef(0);
   const noticeCount = useRef(0);
   const rows = useMemo(() => buildThread(events), [events]);
+  const openProposals = useMemo(() => {
+    if (strategyId === null) {
+      return [];
+    }
+    const decided = applyDecisions(rows, decisions);
+    const found: ProposalView[] = [];
+    for (const row of decided) {
+      if (row.type === "proposal" && row.proposal.strategyId === strategyId) {
+        found.push(row.proposal);
+      }
+    }
+    return found;
+  }, [rows, decisions, strategyId]);
 
   function remember(agentEvent: AgentEvent) {
     seqRef.current = Math.max(seqRef.current, agentEvent.seq);
@@ -30,9 +46,18 @@ export function Chat() {
       return;
     }
     setBusy(true);
+    let completed = false;
     try {
       const id = await ensureSession();
-      await streamMessage(id, content, remember);
+      await streamMessage(id, content, (agentEvent) => {
+        if (agentEvent.type === "turn_complete") {
+          completed = true;
+        }
+        remember(agentEvent);
+      });
+      if (!completed) {
+        pushIncomplete();
+      }
       setDraft((current) => (current === content ? "" : current));
     } catch (error) {
       pushNotice(error, content);
@@ -78,6 +103,9 @@ export function Chat() {
         ...current,
         [proposalId]: { status },
       }));
+      if (decision === "accept") {
+        setRefreshToken((current) => current + 1);
+      }
     } catch (error) {
       setDecisions((current) => ({
         ...current,
@@ -103,6 +131,24 @@ export function Chat() {
       ...existing,
       { id: `notice-${noticeCount.current}`, afterSeq, code, message, quote },
     ]);
+  }
+
+  function pushIncomplete() {
+    const seq = seqRef.current + 1;
+    seqRef.current = seq;
+    const agentEvent: AgentEvent = {
+      seq,
+      event_id: `local-incomplete-${seq}`,
+      session_id: sessionId.current ?? "",
+      turn_id: null,
+      type: "stream_incomplete",
+      created_at: "",
+      payload: {
+        code: "stream_incomplete",
+        message: "the response ended before the turn finished",
+      },
+    };
+    setEvents((current) => insertEvent(current, agentEvent));
   }
 
   function pushStrategy(strategy: StrategyFields) {
@@ -137,30 +183,42 @@ export function Chat() {
   }
 
   return (
-    <section className="chat" aria-label="Author chat">
-      <Thread
-        rows={rows}
-        notices={notices}
-        decisions={decisions}
+    <div className="workspace">
+      <section className="chat" aria-label="Author chat">
+        <Thread
+          rows={rows}
+          notices={notices}
+          decisions={decisions}
+          busy={busy}
+          onAccept={onAccept}
+          onReject={onReject}
+          onOpenStrategy={setStrategyId}
+        />
+        <form className="composer" onSubmit={onSubmit}>
+          <label htmlFor="message">Message</label>
+          <textarea
+            id="message"
+            name="message"
+            rows={3}
+            value={draft}
+            disabled={busy}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button type="submit" disabled={busy || draft.trim() === ""}>
+            {busy ? "Sending…" : "Send"}
+          </button>
+        </form>
+      </section>
+      <StrategyEditor
+        strategyId={strategyId}
+        refreshToken={refreshToken}
+        proposals={openProposals}
         busy={busy}
         onAccept={onAccept}
         onReject={onReject}
+        onSelectStrategy={setStrategyId}
       />
-      <form className="composer" onSubmit={onSubmit}>
-        <label htmlFor="message">Message</label>
-        <textarea
-          id="message"
-          name="message"
-          rows={3}
-          value={draft}
-          disabled={busy}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-        <button type="submit" disabled={busy || draft.trim() === ""}>
-          {busy ? "Sending…" : "Send"}
-        </button>
-      </form>
-    </section>
+    </div>
   );
 }
 

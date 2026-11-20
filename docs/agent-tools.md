@@ -88,7 +88,7 @@ Preview returns `mutated: false`, `from_version`, `to_version` (`from_version + 
 
 When the candidate DSL and IR are both identical to that predecessor, apply returns `no_changes` and does not append a version.
 
-`PUT /strategies/{strategy_id}` does not send `expected_version` or `expected_ir_hash`, and it does not use the `no_changes` guard. Omitting both keeps that route appending the next version, which is the ROZ-75 behavior. The author loop's accept path is separate and is described in `docs/agent-loop.md`.
+`PUT /strategies/{strategy_id}` does not use the `no_changes` guard. Omitting `expected_version` and `expected_ir_hash` keeps that route appending the next version, which is the ROZ-75 behavior. Sending both makes the same in-transaction check the tool uses, and a mismatch is HTTP 409 `version_conflict` with the caller's current version and hash. The author loop's accept path is separate and is described in `docs/agent-loop.md`.
 
 ## Tools
 

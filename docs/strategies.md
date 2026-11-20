@@ -20,6 +20,7 @@ Importing the app and `GET /health` do not create the database. The first strate
 | `GET /strategies/{strategy_id}/versions` | Version summaries, lowest number first. |
 | `GET /strategies/{strategy_id}/versions/{version}` | One version, including DSL and IR. |
 | `GET /strategies/{strategy_id}/diff?from=1&to=2` | DSL unified diff, structural IR diff, and both hashes. |
+| `POST /strategies/{strategy_id}/validate` | Compile the body and write nothing. HTTP 200 `{valid, strategy_id, name, ir_hash}` when it passes. |
 
 `strategy_id` is 32 lowercase hex characters generated for the row. It is not `strategy.id` from the IR. The IR id is `ir_strategy_id` and can change on a later version. The URL id does not change.
 
@@ -36,7 +37,9 @@ Importing the app and `GET /health` do not create the database. The first strate
 | `user_id` | Ignored. |
 | `bars` | Ignored. Not written. |
 
-Any other field is ignored. `null` for `dsl` or `ir` counts as omitted.
+Any other field is ignored, except the concurrency pair below. `null` for `dsl` or `ir` counts as omitted.
+
+`PUT` may also send `expected_version` and `expected_ir_hash` together. `expected_version` is a whole number from 1 to 1000000. `expected_ir_hash` is 64 lowercase hex characters. Sending only one of them is HTTP 422 `invalid_request` and writes nothing. Sending neither keeps the previous append behavior. `POST /strategies/{strategy_id}/validate` ignores the pair.
 
 Validation uses the Phase 1 parser and `validate_ir`. There is no second grammar. An invalid document is HTTP 422 with `{error: {code, message, path, diagnostics}}`. `diagnostics` is at most 20 items of `{code, message, path}` and, for a DSL error, `line` and `column`. Messages are single-line and at most 200 characters. Nothing is inserted.
 
@@ -96,7 +99,8 @@ A path this router does not define, and a method it does not allow, are FastAPI'
 | --- | --- | --- |
 | 400 | `invalid_request` | `Content-Length` is not a decimal integer. |
 | 403 | `forbidden` | The current user is not `local-user`. |
-| 404 | `not_found` | Unknown id, archived strategy, or missing version. |
+| 404 | `not_found` | Unknown id, archived strategy, another owner's row, or missing version. |
+| 409 | `version_conflict` | `expected_version` or `expected_ir_hash` is not the latest row. Nothing was written. The error adds `current_version` and `current_ir_hash`. |
 | 413 | `payload_too_large` | The declared size or the streamed body is over the cap. |
 | 422 | `invalid_json` | The body is not a UTF-8 JSON object. UTF-16, a NUL byte, `NaN`, `Infinity`, and `1e400` are this code. |
 | 422 | `invalid_string` | A lone surrogate, or a NUL inside a string. |
@@ -114,7 +118,9 @@ The body cap is checked on the declared `Content-Length` and again while reading
 
 SQLite work and parsing run in a thread pool. The connection uses `PRAGMA foreign_keys=ON`, `PRAGMA secure_delete=ON`, and `PRAGMA busy_timeout`. Writes take a process `RLock` and `BEGIN IMMEDIATE`. The next version is `MAX(version) + 1` in that transaction. `(strategy_id, version)` is the primary key, so a version number is not reused. `BEFORE UPDATE` and `BEFORE DELETE` triggers on `strategy_versions` abort with `strategy_versions rows are immutable`.
 
-`StrategyStore.add_version` also accepts optional `expected_version` and `expected_ir_hash`. When either is set, the comparison runs inside the same `BEGIN IMMEDIATE` transaction as the insert. A mismatch raises `VersionConflict` and writes nothing. `PUT /strategies/{strategy_id}` does not pass those arguments, so the HTTP save still appends the next version. The agent `update_strategy` tool is the caller that sets them. See `docs/agent-tools.md`.
+`StrategyStore.add_version` also accepts optional `expected_version` and `expected_ir_hash`. When either is set, the comparison runs inside the same `BEGIN IMMEDIATE` transaction as the insert. A mismatch raises `VersionConflict` and writes nothing. `PUT /strategies/{strategy_id}` passes the pair when the body includes both fields, and passes neither when they are omitted, so an older client still appends the next version. The editor always sends both and does not retry a 409. The agent `update_strategy` tool is the other caller that sets them. See `docs/agent-tools.md`.
+
+`POST /strategies/{strategy_id}/validate` reads the active row for the current user, then runs the same compiler. A passing document returns `valid: true` and the candidate `ir_hash`. It does not insert a version and it does not change `updated_at`. An invalid document is the same HTTP 422 as a save, including `line` and `column` on a DSL diagnostic. An archived strategy, an unknown id, and another owner's id are HTTP 404.
 
 ## Environment
 
@@ -123,7 +129,7 @@ Commented placeholders live in `.env.example`. None of them have a value.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `STRATEGIES_DB_PATH` | `data/strategies.sqlite` | SQLite file. A relative path is from the process working directory. |
-| `STRATEGIES_MAX_BODY_BYTES` | `65536` | Body cap. Integer from 1 to 1048576. Read on each `POST` and `PUT`. |
+| `STRATEGIES_MAX_BODY_BYTES` | `65536` | Body cap. Integer from 1 to 1048576. Read on each `POST` and `PUT`, including validate. |
 | `STRATEGIES_BUSY_TIMEOUT_MS` | `5000` | Busy timeout. Integer from 0 to 60000. Read when the file is opened. |
 
 An out-of-range value is HTTP 503 `store_unavailable`. It is not stored on `app.state`. The next request reads the environment again.
