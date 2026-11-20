@@ -2,6 +2,7 @@
 
 import { useMemo, useRef, useState, type FormEvent } from "react";
 
+import { BacktestResults } from "@/components/backtest-results";
 import { StrategyEditor } from "@/components/strategy-editor";
 import { Thread } from "@/components/thread";
 import { ApiError, createSession, decideProposal, streamMessage } from "@/lib/client";
@@ -234,6 +235,7 @@ export function Chat() {
         onReject={onReject}
         onSelectStrategy={setStrategyId}
       />
+      <BacktestResults />
     </div>
   );
 }

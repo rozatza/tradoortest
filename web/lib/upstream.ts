@@ -93,8 +93,50 @@ export async function forwardStream(path: string, request: Request): Promise<Res
   return forward(path, request, "text/event-stream", "POST");
 }
 
-export async function forwardGet(path: string): Promise<Response> {
-  return sendUpstream(path, "GET", "application/json", null);
+export async function forwardGet(path: string, accept = "application/json"): Promise<Response> {
+  return sendUpstream(path, "GET", accept, null);
+}
+
+/**
+ * Exact backtest reads the browser may trigger. Anything else, including
+ * the agent tool surface and a query string, is not a path this proxy builds.
+ */
+export const BACKTEST_READS = [
+  "/backtests/{job_id}",
+  "/backtests/{job_id}/results",
+  "/backtests/{job_id}/exports/trades.json",
+  "/backtests/{job_id}/exports/trades.csv",
+  "/backtests/{job_id}/exports/metrics.json",
+  "/backtests/{job_id}/exports/metrics.csv",
+] as const;
+
+export type BacktestRead = (typeof BACKTEST_READS)[number];
+
+const BACKTEST_READ_SET: ReadonlySet<string> = new Set(BACKTEST_READS);
+
+export function backtestPath(jobId: string, route: string): string | null {
+  if (!isAgentId(jobId) || !BACKTEST_READ_SET.has(route)) {
+    return null;
+  }
+  const suffix = route.slice("/backtests/{job_id}".length);
+  if (suffix.includes("?") || suffix.includes("#") || suffix.includes("\\") || suffix.includes("//")) {
+    return null;
+  }
+  return `/backtests/${jobId}${suffix}`;
+}
+
+/** GET one allowlisted backtest path. The job id uses the same 32-hex check as other ids. */
+export async function backtestGet(
+  context: { params: Promise<{ jobId: string }> },
+  route: BacktestRead,
+  accept = "application/json",
+): Promise<Response> {
+  const { jobId } = await context.params;
+  const path = backtestPath(jobId, route);
+  if (path === null) {
+    return jsonError(422, "invalid_id", "job_id is invalid");
+  }
+  return forwardGet(path, accept);
 }
 
 const IR_HASH = /^[0-9a-f]{64}$/;

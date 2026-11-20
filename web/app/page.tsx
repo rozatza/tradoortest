@@ -6,7 +6,9 @@ export default function HomePage() {
       <header>
         <p className="eyebrow">Internal tool</p>
         <h1>tradoortest</h1>
-        <p className="lede">Author chat and strategy file for one local user. This screen does not trade.</p>
+        <p className="lede">
+          Author chat, strategy file, and backtest results for one local user. This screen does not trade.
+        </p>
       </header>
       <Chat />
     </main>

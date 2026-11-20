@@ -259,6 +259,18 @@ def _count() -> dict[str, Any]:
     return {"type": "integer", "minimum": 0}
 
 
+def _equity_point() -> dict[str, Any]:
+    """One cent mark from the engine curve. ``maxItems`` matches ``MAX_GRID_BARS``."""
+    return _closed(
+        {
+            "open_time": {"type": "integer"},
+            "equity": _string(200),
+            "cash": _string(200),
+        },
+        ["open_time", "equity", "cash"],
+    )
+
+
 def _result() -> dict[str, Any]:
     metrics = {
         "values": _metric_values(),
@@ -289,12 +301,26 @@ def _result() -> dict[str, Any]:
             "schema": {"const": "tradoortest.backtest_result.v1"},
             "final_equity": _string(200),
             "final_cash": _string(200),
+            "equity_curve": {
+                "type": "array",
+                "maxItems": 200_000,
+                "items": _equity_point(),
+            },
             "lints": {"type": "array", "items": _string(500)},
             "metrics": _closed(metrics, list(metrics)),
             "trades": {"type": "array", "items": _trade()},
             "fills": {"type": "array", "items": _fill()},
         },
-        ["schema", "final_equity", "final_cash", "lints", "metrics", "trades", "fills"],
+        [
+            "schema",
+            "final_equity",
+            "final_cash",
+            "equity_curve",
+            "lints",
+            "metrics",
+            "trades",
+            "fills",
+        ],
     )
 
 
