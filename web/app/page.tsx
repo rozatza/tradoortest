@@ -1,12 +1,14 @@
+import { Chat } from "@/components/chat";
+
 export default function HomePage() {
   return (
     <main>
-      <p className="eyebrow">Internal tool</p>
-      <h1>tradoortest</h1>
-      <p>
-        Strategy workspace placeholder. Solana spot, long-only, one user. This
-        screen does not trade.
-      </p>
+      <header>
+        <p className="eyebrow">Internal tool</p>
+        <h1>tradoortest</h1>
+        <p className="lede">Author chat for one local user. This screen does not trade.</p>
+      </header>
+      <Chat />
     </main>
   );
 }

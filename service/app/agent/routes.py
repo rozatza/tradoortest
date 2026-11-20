@@ -3,6 +3,10 @@
 Sync SQLite, model calls, and tool execution run off the event loop.
 ``GET /health`` does not open the agent database. Spoofed owner headers
 and query parameters are ignored. A non-local user is HTTP 403.
+
+A non-AgentError after the sync message route has stored ``user_message``
+is written as ``error`` and ``turn_complete`` before the 500 is returned.
+A lone surrogate in a title or message is HTTP 422, not 500.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from app.agent.loop import TurnLimits, accept_proposal, reject_proposal, run_tur
 from app.agent.providers import LLMProvider, provider_for
 from app.agent.store import AgentStore
 from app.auth import LOCAL_USER_ID, CurrentUser, CurrentUserDep
+from app.ir.depth import lone_surrogate_at
 from app.jobs.routes import _queue as open_job_queue
 from app.jobs.routes import error_response
 from app.ohlcv.routes import _runtime as open_ohlcv_runtime
@@ -455,18 +460,26 @@ def _message(
     runtime: ToolRuntime,
 ) -> tuple[int, dict[str, Any]]:
     session, provider, provider_name, model = _prepare(store, user, session_id, injected)
-    body = run_turn(
-        store=store,
-        runtime=runtime,
-        provider=provider,
-        user=user,
-        session_id=session.session_id,
-        content=content,
-        tier=session.tier,
-        provider_name=provider_name,
-        model=model,
-        limits=limits,
-    )
+    try:
+        body = run_turn(
+            store=store,
+            runtime=runtime,
+            provider=provider,
+            user=user,
+            session_id=session.session_id,
+            content=content,
+            tier=session.tier,
+            provider_name=provider_name,
+            model=model,
+            limits=limits,
+        )
+    except AgentError:
+        raise
+    except Exception as exc:
+        # The turn already wrote user_message on this worker thread.
+        # Close it here so the 500 from _guard does not leave that event open.
+        _close_dangling_turn(store, user, session.session_id, exc)
+        raise
     return 200, body
 
 
@@ -635,6 +648,7 @@ def _session_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
         title = payload["title"]
         if not isinstance(title, str) or not 1 <= len(title) <= 200 or "\x00" in title:
             raise _Rejected("validation_error", "title is not valid", "$.title")
+        _reject_lone_surrogate(title, "$.title")
         fields["title"] = title
     if "tier" in payload:
         tier = payload["tier"]
@@ -656,6 +670,7 @@ def _message_fields(payload: Mapping[str, Any]) -> tuple[str, TurnLimits]:
         raise _Rejected("validation_error", "content is not valid", "$.content")
     if len(content) > MAX_MESSAGE_CHARS:
         raise _Rejected("validation_error", "content is too long", "$.content")
+    _reject_lone_surrogate(content, "$.content")
     max_steps = _optional_int(
         payload.get("max_steps"),
         present="max_steps" in payload,
@@ -772,6 +787,58 @@ def _parse_float(text: str) -> float:
 
 def _reject_non_finite(_text: str) -> float:
     raise ValueError("non-finite number")
+
+
+def _reject_lone_surrogate(text: str, path: str) -> None:
+    index = lone_surrogate_at(text)
+    if index is None:
+        return
+    raise _Rejected(
+        "invalid_string",
+        f"lone surrogate at string index {index} is not valid text",
+        path,
+    )
+
+
+def _close_dangling_turn(
+    store: AgentStore,
+    user: CurrentUser,
+    session_id: str,
+    exc: Exception,
+) -> None:
+    """Persist ``error`` and ``turn_complete`` when ``user_message`` has no closer.
+
+    Runs on the message worker thread. A failure to write is swallowed so the
+    caller can still return the structured 500.
+    """
+    try:
+        existing = store.list_events(user.user_id, session_id, after_seq=None) or []
+        if not existing:
+            return
+        turn_id = existing[-1].get("turn_id")
+        turn = [event for event in existing if event.get("turn_id") == turn_id]
+        if not any(event["type"] == "user_message" for event in turn):
+            return
+        if any(event["type"] == "turn_complete" for event in turn):
+            return
+        code, message = _public_error(exc)
+        payload = {"code": code, "message": message, "path": None}
+        store.append_event(
+            user.user_id,
+            session_id,
+            turn_id=turn_id if isinstance(turn_id, str) else None,
+            event_type="error",
+            payload=payload,
+        )
+        store.append_event(
+            user.user_id,
+            session_id,
+            turn_id=turn_id if isinstance(turn_id, str) else None,
+            event_type="turn_complete",
+            payload={"status": "error", "turn_id": turn_id, "error": payload},
+        )
+    except Exception:
+        return
 
 
 def _worker_failure_events(
