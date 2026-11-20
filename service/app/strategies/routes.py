@@ -1,7 +1,12 @@
 """CRUD and versioned saves for one user's strategies.
 
 ``PUT /strategies/{strategy_id}`` appends an immutable version. It does not
-edit version 1. ``DELETE`` archives. An archived strategy is 404 on every
+edit version 1. When the body includes both ``expected_version`` and
+``expected_ir_hash``, a stale pair is HTTP 409 and writes nothing. Omitting
+both still appends. A request whose ``x-tradoor-client`` header is ``web``
+must include that pair. The header is the Next proxy's mark, not an auth
+check. ``POST /strategies/{strategy_id}/validate`` compiles and
+does not write. ``DELETE`` archives. An archived strategy is 404 on every
 route except ``GET /strategies?include_archived=true``.
 
 Sync SQLite and the Phase 1 parser run in a thread pool. The store is
@@ -11,6 +16,7 @@ file is ready.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -26,7 +32,13 @@ from starlette.datastructures import QueryParams
 
 from app.auth import LOCAL_USER_ID, CurrentUser, CurrentUserDep
 from app.strategies.compile import compile_body
-from app.strategies.errors import Rejected, StoreUnavailable, StrategyNotFound, VersionNotFound
+from app.strategies.errors import (
+    Rejected,
+    StoreUnavailable,
+    StrategyNotFound,
+    VersionConflict,
+    VersionNotFound,
+)
 from app.strategies.store import (
     StrategyPage,
     StrategyRecord,
@@ -54,6 +66,7 @@ _INTERNAL = "the request could not be completed"
 
 _NUMBER = re.compile(r"^[0-9]+$")
 _STRATEGY_ID = re.compile(r"^[0-9a-f]{32}$")
+_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 # Serializes the first open. A failed open does not write app.state.
 _init_lock = threading.Lock()
@@ -75,11 +88,18 @@ def error_response(
     message: str,
     path: str | None,
     diagnostics: list[dict[str, object]] | None = None,
+    *,
+    current_version: int | None = None,
+    current_ir_hash: str | None = None,
 ) -> JSONResponse:
     """JSON ``{error}`` envelope. ``message`` is a fixed sentence."""
     error: dict[str, object] = {"code": code, "message": message, "path": path}
     if diagnostics:
         error["diagnostics"] = diagnostics
+    if current_version is not None:
+        error["current_version"] = current_version
+    if current_ir_hash is not None:
+        error["current_ir_hash"] = current_ir_hash
     return JSONResponse(status_code=status, content={"error": error})
 
 
@@ -194,7 +214,31 @@ async def save_version(
     raw = await _read_body(request)
     if isinstance(raw, JSONResponse):
         return raw
-    result = await _call(ready, _save, user.user_id, ident, raw)
+    web_client = request.headers.get("x-tradoor-client") == "web"
+    result = await _call(ready, _save, user.user_id, ident, raw, web_client)
+    if isinstance(result, JSONResponse):
+        return result
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.post("/strategies/{strategy_id}/validate")
+async def validate_strategy(
+    strategy_id: str,
+    request: Request,
+    user: CurrentUserDep,
+) -> JSONResponse:
+    """Compile a candidate and write nothing."""
+    ready = await _ready(request, user)
+    if isinstance(ready, JSONResponse):
+        return ready
+    try:
+        ident = _strategy_id(strategy_id)
+    except QueryRejected as exc:
+        return error_response(422, exc.code, exc.message, exc.path)
+    raw = await _read_body(request)
+    if isinstance(raw, JSONResponse):
+        return raw
+    result = await _call(ready, _validate, user.user_id, ident, raw)
     if isinstance(result, JSONResponse):
         return result
     return JSONResponse(status_code=200, content=result)
@@ -324,6 +368,15 @@ async def _call(store: StrategyStore, fn: Callable[..., Any], *args: Any) -> Any
         return error_response(404, "not_found", _NOT_FOUND, None)
     except VersionNotFound:
         return error_response(404, "not_found", _VERSION_NOT_FOUND, None)
+    except VersionConflict as exc:
+        return error_response(
+            409,
+            "version_conflict",
+            "strategy version conflict",
+            "$.expected_version",
+            current_version=exc.version,
+            current_ir_hash=exc.ir_hash,
+        )
     except Rejected as exc:
         return error_response(422, exc.code, exc.message, exc.path, exc.diagnostics)
     except RecursionError:
@@ -342,10 +395,91 @@ def _create(store: StrategyStore, user_id: str, raw: bytes) -> dict[str, Any]:
     return _detail(record, version)
 
 
-def _save(store: StrategyStore, user_id: str, strategy_id: str, raw: bytes) -> dict[str, Any]:
+def _save(
+    store: StrategyStore,
+    user_id: str,
+    strategy_id: str,
+    raw: bytes,
+    web_client: bool = False,
+) -> dict[str, Any]:
     compiled = compile_body(raw)
-    record, version = store.add_version(user_id, strategy_id, compiled)
+    expected_version, expected_ir_hash = _concurrency(raw, require_pair=web_client)
+    record, version = store.add_version(
+        user_id,
+        strategy_id,
+        compiled,
+        expected_version,
+        expected_ir_hash,
+    )
     return _detail(record, version)
+
+
+def _validate(
+    store: StrategyStore,
+    user_id: str,
+    strategy_id: str,
+    raw: bytes,
+) -> dict[str, Any]:
+    """Confirm the owner, then compile. Neither step writes a version."""
+    store.get(user_id, strategy_id)
+    compiled = compile_body(raw)
+    return {
+        "valid": True,
+        "strategy_id": strategy_id,
+        "name": compiled.name,
+        "ir_hash": compiled.ir_hash,
+    }
+
+
+def _concurrency(raw: bytes, *, require_pair: bool = False) -> tuple[int | None, str | None]:
+    """Return the version guard, or ``(None, None)`` for a legacy append.
+
+    The body has already passed ``compile_body``. A malformed pair is
+    rejected here, before ``add_version``, so nothing is written. The Next
+    proxy sets ``require_pair`` via ``x-tradoor-client: web``.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise Rejected("invalid_json", "request body is not JSON", None) from None
+    if not isinstance(payload, dict):
+        raise Rejected("invalid_json", "request body must be a JSON object", None)
+    version_set = "expected_version" in payload and payload["expected_version"] is not None
+    hash_set = "expected_ir_hash" in payload and payload["expected_ir_hash"] is not None
+    if not version_set and not hash_set:
+        if require_pair:
+            raise Rejected(
+                "invalid_request",
+                "expected_version and expected_ir_hash must be sent together",
+                "$",
+            )
+        return None, None
+    if version_set != hash_set:
+        raise Rejected(
+            "invalid_request",
+            "expected_version and expected_ir_hash must be sent together",
+            "$",
+        )
+    version = payload["expected_version"]
+    digest = payload["expected_ir_hash"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version < 1
+        or version > _MAX_VERSION
+    ):
+        raise Rejected(
+            "invalid_request",
+            "expected_version must be a whole number from 1 to 1000000",
+            "$.expected_version",
+        )
+    if not isinstance(digest, str) or _HASH.fullmatch(digest) is None:
+        raise Rejected(
+            "invalid_request",
+            "expected_ir_hash must be 64 lowercase hex characters",
+            "$.expected_ir_hash",
+        )
+    return version, digest
 
 
 def _get(store: StrategyStore, user_id: str, strategy_id: str) -> dict[str, Any]:

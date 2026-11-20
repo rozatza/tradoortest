@@ -19,7 +19,7 @@ body {
 }
 
 main {
-  max-width: 46rem;
+  max-width: 76rem;
   height: 100%;
   margin: 0 auto;
   padding: 1.25rem 1.25rem 1rem;
@@ -244,6 +244,139 @@ textarea:focus,
 button:focus-visible {
   outline: 2px solid #1f6b3a;
   outline-offset: 2px;
+}
+
+.workspace {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(18rem, 0.95fr);
+  gap: 0.9rem;
+}
+
+.editor {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  border: 1px solid #d5ddd0;
+  border-radius: 0.6rem;
+  background: #fff;
+  padding: 0.85rem 0.95rem;
+}
+
+.editor label,
+.editor select {
+  font: inherit;
+}
+
+.editor select {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid #c5cfc0;
+  border-radius: 0.4rem;
+  background: #fff;
+}
+
+.dsl-view {
+  list-style: none;
+  margin: 0;
+  padding: 0.35rem 0;
+  max-height: 14rem;
+  overflow: auto;
+  background: #f7f8f5;
+  border-radius: 0.35rem;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.dsl-view li {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(0, 1fr);
+  gap: 0.45rem;
+  padding: 0 0.45rem;
+}
+
+.dsl-view .line-no {
+  color: #5c6656;
+  text-align: right;
+}
+
+.dsl-view li.line-error {
+  background: #f8ecea;
+}
+
+.dsl-view code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics {
+  margin: 0;
+  color: #6d241c;
+}
+
+.diagnostics ul {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.note,
+.status-line {
+  color: #3d4638;
+}
+
+.stopped {
+  color: #8a2e24;
+  font-weight: 600;
+}
+
+@media (max-width: 60rem) {
+  html,
+  body {
+    height: auto;
+    min-height: 100%;
+  }
+
+  main {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+
+  /* Stack the panes and let the page scroll. A fixed workspace with
+     overflow clips the composer under the editor at 800x600 and 375x667. */
+  .workspace {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-height: auto;
+    overflow: visible;
+  }
+
+  .chat {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+  }
+
+  .thread {
+    flex: none;
+    min-height: 8rem;
+    max-height: 12rem;
+  }
+
+  .composer {
+    position: relative;
+    z-index: 1;
+  }
+
+  .editor {
+    overflow: visible;
+  }
 }
 
 @media (max-width: 40rem) {

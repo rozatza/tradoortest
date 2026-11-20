@@ -12,6 +12,7 @@ export function Thread({
   busy,
   onAccept,
   onReject,
+  onOpenStrategy,
 }: {
   rows: ThreadRow[];
   notices: ThreadNotice[];
@@ -19,6 +20,7 @@ export function Thread({
   busy: boolean;
   onAccept: (proposalId: string) => void;
   onReject: (proposalId: string) => void;
+  onOpenStrategy: (strategyId: string) => void;
 }) {
   const items = withNotices(applyDecisions(rows, decisions), notices);
   if (items.length === 0) {
@@ -39,7 +41,16 @@ export function Thread({
             </p>
           );
         }
-        return <ThreadRowView key={item.row.key} row={item.row} busy={busy} onAccept={onAccept} onReject={onReject} />;
+        return (
+          <ThreadRowView
+            key={item.row.key}
+            row={item.row}
+            busy={busy}
+            onAccept={onAccept}
+            onReject={onReject}
+            onOpenStrategy={onOpenStrategy}
+          />
+        );
       })}
     </div>
   );
@@ -50,11 +61,13 @@ function ThreadRowView({
   busy,
   onAccept,
   onReject,
+  onOpenStrategy,
 }: {
   row: ThreadRow;
   busy: boolean;
   onAccept: (proposalId: string) => void;
   onReject: (proposalId: string) => void;
+  onOpenStrategy: (strategyId: string) => void;
 }) {
   if (row.type === "text") {
     const label = row.text.role === "user" ? "You" : "Assistant";
@@ -79,7 +92,7 @@ function ThreadRowView({
     );
   }
   if (row.type === "strategy") {
-    return <StrategyCard strategy={row.strategy} />;
+    return <StrategyCard strategy={row.strategy} onOpen={onOpenStrategy} />;
   }
   return <ErrorNote error={row.error} />;
 }

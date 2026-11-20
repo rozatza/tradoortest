@@ -12,7 +12,7 @@ export type ToolStepView = {
   seq: number;
   callId: string;
   tool: string;
-  state: "working" | "done";
+  state: "working" | "done" | "stopped";
   ok: boolean | null;
   errorMessage: string | null;
 };

@@ -106,4 +106,47 @@ describe("buildThread", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]?.type === "error" ? errors[0].error.code : null).toBe("internal_error");
   });
+
+  it("stops only the tool steps that the stream abandoned", () => {
+    const rows = buildThread([
+      agentEvent(1, "user_message", { role: "user", content: "hi" }),
+      agentEvent(2, "tool_start", { tool: "validate", call_id: "c1", arguments: {} }),
+      agentEvent(3, "stream_incomplete", {
+        code: "stream_incomplete",
+        message: "the response ended before the turn finished",
+      }),
+      agentEvent(4, "tool_start", { tool: "write_strategy", call_id: "c2", arguments: {} }),
+    ]);
+    const tools = rows.filter((row) => row.type === "tool");
+    expect(tools.map((row) => (row.type === "tool" ? row.tool.state : ""))).toEqual([
+      "stopped",
+      "working",
+    ]);
+    const error = rows.find((row) => row.type === "error");
+    expect(error?.type === "error" ? error.error.code : null).toBe("stream_incomplete");
+    expect(error?.type === "error" ? error.error.message : null).toContain(
+      "ended before the turn finished",
+    );
+  });
+
+  it("stops every in-progress tool step when the stream aborts", () => {
+    const rows = buildThread([
+      agentEvent(1, "tool_start", { tool: "validate", call_id: "c1", arguments: {} }),
+      agentEvent(2, "tool_complete", {
+        tool: "read_strategy",
+        call_id: "c0",
+        ok: true,
+        output: { ok: true },
+      }),
+      agentEvent(3, "tool_start", { tool: "write_strategy", call_id: "c2", arguments: {} }),
+      agentEvent(4, "stream_aborted", {}),
+    ]);
+    const tools = rows.filter((row) => row.type === "tool");
+    expect(tools.map((row) => (row.type === "tool" ? `${row.tool.tool}:${row.tool.state}` : ""))).toEqual([
+      "validate:stopped",
+      "read_strategy:done",
+      "write_strategy:stopped",
+    ]);
+    expect(rows.some((row) => row.type === "error")).toBe(false);
+  });
 });

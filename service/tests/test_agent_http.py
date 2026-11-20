@@ -830,6 +830,46 @@ def test_lone_surrogate_in_title_or_message_is_422(tmp_path: Path) -> None:
         bundle.close()
 
 
+def test_lone_surrogate_object_key_is_422_on_every_agent_route(tmp_path: Path) -> None:
+    """A surrogate key must not become a bare 500, at the top or nested."""
+    bundle = _Bundle(tmp_path)
+    headers = {"content-type": "application/json"}
+    bodies = (
+        (b'{"\\ud800":1}', "$"),
+        (b'{"level":{"inner":{"\\ud800":1}}}', "$.level.inner"),
+        (b'{"level":[{"inner":{"\\ud800":1}}]}', "$.level[0].inner"),
+    )
+    try:
+        created = bundle.session()
+        assert created.status_code == 201, created.text
+        session_id = created.json()["session_id"]
+        proposal_id = "ab" * 16
+        paths = (
+            "/agent/sessions",
+            f"/agent/sessions/{session_id}/messages",
+            f"/agent/sessions/{session_id}/messages/stream",
+            f"/agent/proposals/{proposal_id}/accept",
+            f"/agent/proposals/{proposal_id}/reject",
+        )
+        for path in paths:
+            for raw, expected_path in bodies:
+                response = bundle.client.post(path, content=raw, headers=headers)
+                assert response.status_code == 422, (path, response.status_code, response.text)
+                assert "Internal Server Error" not in response.text
+                body = response.json()
+                assert set(body) == {"error"}
+                error = body["error"]
+                assert error["code"] == "invalid_string"
+                assert error["path"] == expected_path
+                assert "surrogate" in error["message"]
+                response.text.encode("utf-8")
+                json.dumps(body).encode("utf-8")
+                _no_leak(response.text)
+                assert "\\ud800" not in json.dumps(body)
+    finally:
+        bundle.close()
+
+
 def _scope(
     method: str,
     path: str,

@@ -6,7 +6,9 @@ and query parameters are ignored. A non-local user is HTTP 403.
 
 A non-AgentError after the sync message route has stored ``user_message``
 is written as ``error`` and ``turn_complete`` before the 500 is returned.
-A lone surrogate in a title or message is HTTP 422, not 500.
+A lone surrogate in a title, a message, or any JSON object key is HTTP 422,
+including a key nested under another value. The error path never contains
+that key, so the response stays encodable.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from app.agent.loop import TurnLimits, accept_proposal, reject_proposal, run_tur
 from app.agent.providers import LLMProvider, provider_for
 from app.agent.store import AgentStore
 from app.auth import LOCAL_USER_ID, CurrentUser, CurrentUserDep
-from app.ir.depth import lone_surrogate_at
+from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.jobs.routes import _queue as open_job_queue
 from app.jobs.routes import error_response
 from app.ohlcv.routes import _runtime as open_ohlcv_runtime
@@ -116,7 +118,7 @@ async def create_session(request: Request, user: CurrentUserDep) -> JSONResponse
     try:
         fields = _session_fields(parsed)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -135,7 +137,7 @@ async def list_sessions(request: Request, user: CurrentUserDep) -> JSONResponse:
     try:
         limit, offset = _page(request.query_params)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -169,7 +171,7 @@ async def list_events(session_id: str, request: Request, user: CurrentUserDep) -
     try:
         after_seq = _after_seq(request.query_params)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -194,7 +196,7 @@ async def post_message(session_id: str, request: Request, user: CurrentUserDep) 
     try:
         content, limits = _message_fields(parsed)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -229,7 +231,7 @@ async def stream_message(session_id: str, request: Request, user: CurrentUserDep
     try:
         content, limits = _message_fields(parsed)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -306,7 +308,7 @@ async def list_proposals(request: Request, user: CurrentUserDep) -> JSONResponse
         limit, offset = _page(request.query_params)
         session_id, status = _proposal_filters(request.query_params)
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -370,7 +372,7 @@ async def _decide(
     try:
         _exact_fields(parsed, frozenset())
     except _Rejected as exc:
-        return error_response(422, exc.code, exc.message, exc.path)
+        return _client_error(exc)
     opened = await _open(request)
     if isinstance(opened, JSONResponse):
         return opened
@@ -638,6 +640,10 @@ def _object(raw: bytes, *, allow_empty: bool) -> Mapping[str, Any] | JSONRespons
         return error_response(422, "invalid_json", _INVALID_JSON, None)
     if isinstance(payload, bool) or not isinstance(payload, dict):
         return error_response(422, "invalid_json", _INVALID_OBJECT, None)
+    try:
+        check_json_value(payload)
+    except JsonShapeError as exc:
+        return error_response(422, exc.code, _plain(exc.message), _plain_path(exc.path))
     return payload
 
 
@@ -698,6 +704,15 @@ def _optional_int(value: object, *, present: bool, default: int, high: int, path
 
 def _exact_fields(payload: Mapping[str, Any], allowed: frozenset[str]) -> None:
     for key in payload:
+        # A surrogate key must not be interpolated into the JSON path.
+        # Starlette encodes responses with ensure_ascii=False, and a lone
+        # surrogate in that path becomes an uncaught 500.
+        if not isinstance(key, str) or lone_surrogate_at(key) is not None:
+            raise _Rejected(
+                "invalid_string",
+                "lone surrogate in an object key is not valid text",
+                "$",
+            )
         if key not in allowed:
             raise _Rejected("validation_error", "unknown field", f"$.{key}")
 
@@ -798,6 +813,22 @@ def _reject_lone_surrogate(text: str, path: str) -> None:
         f"lone surrogate at string index {index} is not valid text",
         path,
     )
+
+
+def _client_error(exc: _Rejected) -> JSONResponse:
+    return error_response(422, exc.code, _plain(exc.message), _plain_path(exc.path))
+
+
+def _plain(text: str) -> str:
+    if lone_surrogate_at(text) is None:
+        return text
+    return "lone surrogate is not valid text"
+
+
+def _plain_path(path: str | None) -> str | None:
+    if path is None or lone_surrogate_at(path) is None:
+        return path
+    return "$"
 
 
 def _close_dangling_turn(
