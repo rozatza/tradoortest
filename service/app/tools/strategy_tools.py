@@ -2,8 +2,11 @@
 
 ``validate`` reports strategy problems as ``valid: false``. ``write_strategy``
 and ``update_strategy`` report those same problems as a tool error and do
-not write. Preview never calls ``add_version``. Apply does, and only with
-``confirm`` and ``expected_version``.
+not write. Preview never calls ``add_version``. Apply does only when
+``confirm`` is true, ``expected_version`` matches the row just read, and the
+candidate is not identical to that row. An identical apply is ``no_changes``
+and does not append a version. ``PUT /strategies/{id}`` does not use this
+guard.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from app.auth import CurrentUser
 from app.ir.constants import IR_VERSION
 from app.strategies.compile import CompiledStrategy, compile_body
 from app.strategies.diff import dsl_unified_diff, ir_structural_diff
-from app.strategies.errors import Rejected
+from app.strategies.errors import Rejected, VersionConflict
 from app.strategies.store import StrategyRecord, VersionRecord
 from app.tools.errors import ToolError, safe_text
 from app.tools.runtime import ToolRuntime
@@ -46,6 +49,8 @@ def update_strategy(
         raise ToolError("strategy_archived", "strategy is archived")
     current = store.get_version(user.user_id, record.strategy_id, record.latest_version)
     mode = str(arguments.get("mode", "preview"))
+    if mode == "apply":
+        _require_current_predecessor(arguments, current)
     dsl_diff = dsl_unified_diff(current.dsl, compiled.dsl, current.version, current.version + 1)
     ir_diff = ir_structural_diff(current.ir, compiled.ir)
     changed = dsl_diff != "" or bool(ir_diff)
@@ -64,18 +69,8 @@ def update_strategy(
             "candidate_name": compiled.name,
             "candidate_ir_strategy_id": compiled.ir_strategy_id,
         }
-    if arguments.get("confirm") is not True:
-        raise ToolError(
-            "confirmation_required",
-            "apply requires confirm true",
-            path="$.confirm",
-        )
-    if "expected_version" not in arguments:
-        raise ToolError(
-            "validation_error",
-            "apply requires expected_version",
-            path="$.expected_version",
-        )
+    if not changed:
+        raise ToolError("no_changes", "strategy is unchanged")
     updated, saved = store.add_version(
         user.user_id,
         record.strategy_id,
@@ -83,6 +78,8 @@ def update_strategy(
         expected_version=arguments["expected_version"],
         expected_ir_hash=arguments.get("expected_ir_hash"),
     )
+    if saved.version != current.version + 1:
+        raise VersionConflict(current.version, current.ir_hash)
     return {
         "mode": "apply",
         "mutated": True,
@@ -97,6 +94,34 @@ def update_strategy(
         "ir": saved.ir,
         "updated_at": updated.updated_at,
     }
+
+
+def _require_current_predecessor(arguments: Mapping[str, Any], current: VersionRecord) -> None:
+    """Reject an apply that is not aimed at the row just read.
+
+    The diff is computed from that row. A stale ``expected_version`` must
+    fail here, before the diff and before ``add_version``, so a response
+    cannot describe version 1 while the write lands on a later version.
+    ``add_version`` checks the same guard again inside its write transaction.
+    """
+    if arguments.get("confirm") is not True:
+        raise ToolError(
+            "confirmation_required",
+            "apply requires confirm true",
+            path="$.confirm",
+        )
+    if "expected_version" not in arguments:
+        raise ToolError(
+            "validation_error",
+            "apply requires expected_version",
+            path="$.expected_version",
+        )
+    expected_version = arguments["expected_version"]
+    expected_ir_hash = arguments.get("expected_ir_hash")
+    if expected_version != current.version or (
+        expected_ir_hash is not None and expected_ir_hash != current.ir_hash
+    ):
+        raise VersionConflict(current.version, current.ir_hash)
 
 
 def validate(

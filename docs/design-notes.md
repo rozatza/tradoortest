@@ -42,6 +42,8 @@ When multi-user auth exists, replace the body of `get_current_user`. Rows alread
 
 The agent tools use the same seam. `POST /tools/{tool_name}` passes `CurrentUser` into the dispatcher, and every store or job call uses `user.user_id`. Arguments, headers, and query parameters cannot set the owner. A row for any other id is `not_found`. See `docs/agent-tools.md`.
 
+The author loop uses that same dependency. `data/agent.sqlite` stores sessions, messages, events, proposals, and validated hashes. Every table has `user_id`. There is still no users table. A session or proposal for any other id is HTTP 404. See `docs/agent-loop.md`.
+
 ## What this runtime does not include
 
 - Accounts, sessions, invites, or access-control lists.

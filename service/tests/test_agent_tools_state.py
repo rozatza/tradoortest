@@ -279,6 +279,131 @@ def test_overlapping_applies_keep_one_version(
     assert store.get(LOCAL_USER_ID, strategy_id)[0].latest_version == 2
 
 
+def test_identical_apply_does_not_append_and_put_still_does(
+    saved: tuple[Dispatcher, StrategyStore, JobQueue, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher, store, _jobs, strategy_id = saved
+    current = store.get_version(LOCAL_USER_ID, strategy_id, 1)
+    same = _invoke(
+        dispatcher,
+        "update_strategy",
+        {
+            "strategy_id": strategy_id,
+            "dsl": current.dsl,
+            "mode": "apply",
+            "confirm": True,
+            "expected_version": 1,
+            "expected_ir_hash": current.ir_hash,
+        },
+    )
+    assert same["ok"] is False
+    assert same["error"]["code"] == "no_changes"
+    assert same["error"]["message"] == "strategy is unchanged"
+    assert store.get(LOCAL_USER_ID, strategy_id)[0].latest_version == 1
+    assert _counts(store.path)[0] == 1
+    monkeypatch.chdir(tmp_path)
+    application = create_app(strategies=store)
+    client = TestClient(application)
+    put = client.put(f"/strategies/{strategy_id}", json={"dsl": current.dsl})
+    assert put.status_code == 200
+    assert put.json()["latest_version"] == 2
+    assert store.get(LOCAL_USER_ID, strategy_id)[0].latest_version == 2
+
+
+def test_apply_rejects_a_stale_predecessor_before_add_version(
+    saved: tuple[Dispatcher, StrategyStore, JobQueue, str],
+) -> None:
+    dispatcher, store, _jobs, strategy_id = saved
+    first = _invoke(
+        dispatcher,
+        "update_strategy",
+        {
+            "strategy_id": strategy_id,
+            "dsl": _changed_ema(),
+            "mode": "apply",
+            "confirm": True,
+            "expected_version": 1,
+        },
+    )
+    assert first["ok"] is True
+    assert first["data"]["from_version"] == 1
+    assert first["data"]["version"] == 2
+    assert first["data"]["dsl_diff"].startswith("--- v1\n+++ v2\n")
+    version_two = store.get_version(LOCAL_USER_ID, strategy_id, 2)
+    further = version_two.dsl.replace("warmup_bars: 30", "warmup_bars: 40", 1)
+    chained = _invoke(
+        dispatcher,
+        "update_strategy",
+        {
+            "strategy_id": strategy_id,
+            "dsl": further,
+            "mode": "apply",
+            "confirm": True,
+            "expected_version": 2,
+            "expected_ir_hash": version_two.ir_hash,
+        },
+    )
+    assert chained["ok"] is True
+    assert chained["data"]["from_version"] == 2
+    assert chained["data"]["version"] == 3
+    assert chained["data"]["from_ir_hash"] == version_two.ir_hash
+    assert chained["data"]["dsl_diff"].startswith("--- v2\n+++ v3\n")
+    calls = {"add": 0}
+    original_add = store.add_version
+    original_get = store.get_version
+
+    def guarded(*args: object, **kwargs: object):
+        calls["add"] += 1
+        return original_add(*args, **kwargs)
+
+    def stuck(*_args: object, **_kwargs: object):
+        return original_get(LOCAL_USER_ID, strategy_id, 1)
+
+    store.add_version = guarded  # type: ignore[method-assign]
+    store.get_version = stuck  # type: ignore[method-assign]
+    raced = _invoke(
+        dispatcher,
+        "update_strategy",
+        {
+            "strategy_id": strategy_id,
+            "dsl": further.replace("warmup_bars: 40", "warmup_bars: 50", 1),
+            "mode": "apply",
+            "confirm": True,
+            "expected_version": 2,
+        },
+    )
+    assert raced["error"]["code"] == "version_conflict"
+    assert raced["error"]["details"]["current_version"] == 1
+    assert calls["add"] == 0
+    assert "dsl_diff" not in raced.get("data", {})
+    assert store.get(LOCAL_USER_ID, strategy_id)[0].latest_version == 3
+
+
+def test_add_version_expected_version_is_the_latest_row(tmp_path: Path) -> None:
+    from app.strategies.errors import VersionConflict
+
+    store = StrategyStore(tmp_path / "strategies.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
+    try:
+        first = compile_body(json.dumps({"dsl": _DSL}).encode("utf-8"))
+        record, version = store.create(LOCAL_USER_ID, first)
+        second = compile_body(json.dumps({"dsl": _changed_ema()}).encode("utf-8"))
+        store.add_version(LOCAL_USER_ID, record.strategy_id, second)
+        with pytest.raises(VersionConflict) as exc:
+            store.add_version(
+                LOCAL_USER_ID,
+                record.strategy_id,
+                first,
+                expected_version=1,
+            )
+        assert exc.value.version == 2
+        assert store.get(LOCAL_USER_ID, record.strategy_id)[0].latest_version == 2
+        assert version.version == 1
+    finally:
+        store.close()
+
+
 def test_add_version_without_a_precondition_still_appends(tmp_path: Path) -> None:
     store = StrategyStore(tmp_path / "strategies.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
     try:

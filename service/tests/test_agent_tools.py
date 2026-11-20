@@ -25,11 +25,12 @@ from app.ohlcv.routes import OhlcvRuntime
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
 from app.tools import REGISTRY, TOOL_ORDER
 from app.tools.dispatch import Dispatcher
+from app.tools.errors import ToolError
 from app.tools.reference import MAX_REFERENCE_CHARS
 from app.tools.registry import MUTATES, export_specs
 from app.tools.runtime import ToolRuntime
 from app.tools.specs import INPUTS, OUTPUTS
-from app.tools.strict import MAX_STRING_LENGTH
+from app.tools.strict import MAX_STRING_LENGTH, validate_schema
 from test_ohlcv_any_mint import MINT, POOLS, PUMP
 
 _USER = CurrentUser(user_id=LOCAL_USER_ID)
@@ -413,3 +414,65 @@ def test_search_asset_maps_pool_source_failures(tmp_path: Path) -> None:
         _no_leak(failed, "redacted-test-token-value")
         if code in {"service_unavailable", "rate_limited"}:
             assert failed["error"]["retryable"] is True
+
+
+def _pattern_strings(node: object, found: list[str]) -> None:
+    if isinstance(node, dict):
+        pattern = node.get("pattern")
+        if isinstance(pattern, str):
+            found.append(pattern)
+        for value in node.values():
+            _pattern_strings(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _pattern_strings(item, found)
+
+
+def test_exported_schemas_reject_a_trailing_newline_without_python_anchor() -> None:
+    patterns: list[str] = []
+    for spec in export_specs():
+        _pattern_strings(spec["input_schema"], patterns)
+        _pattern_strings(spec["output_schema"], patterns)
+    assert patterns
+    for pattern in patterns:
+        assert "\\Z" not in pattern
+    encoded = json.dumps(export_specs())
+    assert "\\Z" not in encoded
+    dispatcher = _plain()
+    chart = _invoke(
+        dispatcher,
+        "add_chart",
+        {"symbol": "SOL", "timeframe": "1h", "chart_id": "abc\n"},
+    )
+    assert chart["error"]["code"] == "validation_error"
+    color = _invoke(
+        dispatcher,
+        "add_indicator",
+        {"indicator": "rsi", "params": {"period": 14}, "color": "#AABBCC\n"},
+    )
+    assert color["error"]["code"] == "validation_error"
+    strategy_id = _invoke(
+        dispatcher,
+        "backtest_status",
+        {"job_id": f"{'a' * 32}\n"},
+    )
+    assert strategy_id["error"]["code"] == "validation_error"
+    digest = _invoke(
+        dispatcher,
+        "update_strategy",
+        {
+            "strategy_id": "a" * 32,
+            "dsl": "name: x",
+            "expected_ir_hash": f"{'a' * 64}\n",
+        },
+    )
+    assert digest["error"]["code"] == "validation_error"
+    props = {
+        "type": "object",
+        "additionalProperties": False,
+        "patternProperties": {"^[a-z]+$": {"type": "integer"}},
+    }
+    validate_schema(props, {"abc": 1})
+    with pytest.raises(ToolError) as exc:
+        validate_schema(props, {"abc\n": 1})
+    assert exc.value.code == "validation_error"

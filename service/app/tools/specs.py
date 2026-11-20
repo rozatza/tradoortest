@@ -47,6 +47,16 @@ def _string(max_length: int, *, min_length: int = 1) -> dict[str, Any]:
     return {"type": "string", "minLength": min_length, "maxLength": max_length}
 
 
+def _patterned(pattern: str) -> dict[str, Any]:
+    """Identifier, hash, or color text.
+
+    ``not`` rejects a newline. That is valid ECMA-262 and closes the gap
+    where Python's ``$`` matches before a trailing newline. The pattern
+    itself does not use ``\\Z``.
+    """
+    return {"type": "string", "pattern": pattern, "not": {"pattern": "\\n"}}
+
+
 def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [{"type": "null"}, schema]}
 
@@ -127,7 +137,7 @@ def _dsl_field() -> dict[str, Any]:
 
 
 def _strategy_id() -> dict[str, Any]:
-    return {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+    return _patterned("^[0-9a-f]{32}$")
 
 
 def _version() -> dict[str, Any]:
@@ -135,7 +145,7 @@ def _version() -> dict[str, Any]:
 
 
 def _hash() -> dict[str, Any]:
-    return {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    return _patterned("^[0-9a-f]{64}$")
 
 
 def _iso() -> dict[str, Any]:
@@ -616,7 +626,7 @@ def _chart_input() -> dict[str, Any]:
             "mint": _string(44, min_length=32),
             "timeframe": {"enum": list(BAR_SIZES)},
             "title": _string(80),
-            "chart_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+            "chart_id": _patterned("^[a-z][a-z0-9_]{0,63}$"),
             "price_scale": {"enum": ["linear", "log"]},
             "visible_bars": {"type": "integer", "minimum": 1, "maximum": 5000},
         },
@@ -637,7 +647,7 @@ def _chart_output() -> dict[str, Any]:
             "mint": _string(64),
             "timeframe": {"enum": list(BAR_SIZES)},
             "title": _nullable(_string(80)),
-            "chart_id": _nullable({"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}),
+            "chart_id": _nullable(_patterned("^[a-z][a-z0-9_]{0,63}$")),
             "price_scale": {"enum": ["linear", "log"]},
             "visible_bars": _nullable({"type": "integer", "minimum": 1, "maximum": 5000}),
         },
@@ -664,9 +674,9 @@ def _indicator_input() -> dict[str, Any]:
             "params": _closed(_param_properties(), []),
             "source": {"enum": list(_SERIES)},
             "pane": {"enum": ["overlay", "separate"]},
-            "chart_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+            "chart_id": _patterned("^[a-z][a-z0-9_]{0,63}$"),
             "label": _string(80),
-            "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+            "color": _patterned("^#[0-9A-Fa-f]{6}$"),
         },
         ["indicator", "params"],
     )
@@ -694,9 +704,9 @@ def _indicator_output() -> dict[str, Any]:
             },
             "pane": {"enum": ["overlay", "separate"]},
             "warmup_bars": {"type": "integer", "minimum": 0, "maximum": 2000},
-            "chart_id": _nullable({"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}),
+            "chart_id": _nullable(_patterned("^[a-z][a-z0-9_]{0,63}$")),
             "label": _nullable(_string(80)),
-            "color": _nullable({"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"}),
+            "color": _nullable(_patterned("^#[0-9A-Fa-f]{6}$")),
         },
         [
             "directive_type",

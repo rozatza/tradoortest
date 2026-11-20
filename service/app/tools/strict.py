@@ -38,11 +38,124 @@ def _is_number(_checker: object, instance: object) -> bool:
     return isinstance(instance, float) and math.isfinite(instance)
 
 
+def _rewrite_dollar(pattern: str) -> str:
+    """Rewrite an unescaped ``$`` to Python ``\\Z`` outside a character class.
+
+    JSON Schema patterns are ECMA-262. There ``$`` matches only the end of
+    the text. Python's ``re`` also matches immediately before a final
+    newline, so ``"abc\\n"`` would pass ``^[a-z]+$``. The rewritten form is
+    used only inside this process. Exported schemas keep ``$`` and never
+    contain the Python-only ``\\Z`` anchor.
+    """
+    parts: list[str] = []
+    index = 0
+    in_class = False
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            parts.append(pattern[index : index + 2])
+            index += 2
+            continue
+        if char == "[" and not in_class:
+            in_class = True
+            parts.append(char)
+            index += 1
+            continue
+        if char == "]" and in_class:
+            in_class = False
+            parts.append(char)
+            index += 1
+            continue
+        if char == "$" and not in_class:
+            parts.append(r"\Z")
+            index += 1
+            continue
+        parts.append(char)
+        index += 1
+    return "".join(parts)
+
+
+def _ecma_search(pattern: str, text: str) -> bool:
+    """Return whether ``text`` matches ``pattern`` under ECMA-262 ``$``."""
+    try:
+        return re.search(_rewrite_dollar(pattern), text) is not None
+    except re.error:
+        return False
+
+
+def _pattern(validator: Draft202012Validator, patrn: str, instance: object, schema: object):
+    if validator.is_type(instance, "string") and not _ecma_search(patrn, instance):
+        yield ValidationError(f"{instance!r} does not match {patrn!r}")
+
+
+def _pattern_properties(
+    validator: Draft202012Validator,
+    pattern_properties: Mapping[str, Any],
+    instance: object,
+    schema: object,
+):
+    if not validator.is_type(instance, "object"):
+        return
+    for pattern, subschema in pattern_properties.items():
+        for key, value in instance.items():
+            if isinstance(key, str) and _ecma_search(pattern, key):
+                yield from validator.descend(value, subschema, path=key, schema_path=pattern)
+
+
+def _additional_properties(
+    validator: Draft202012Validator,
+    additional: object,
+    instance: object,
+    schema: Mapping[str, Any],
+):
+    """Same rule as Draft 2020-12, with ECMA-262 ``$`` on pattern keys.
+
+    A key such as ``abc\\n`` must stay an additional property. Python's
+    ``re`` would treat it as a patternProperties match.
+    """
+    if not validator.is_type(instance, "object") or not isinstance(instance, dict):
+        return
+    extras = sorted(_unmatched_keys(instance, schema), key=str)
+    if validator.is_type(additional, "object"):
+        for key in extras:
+            yield from validator.descend(instance[key], additional, path=key)
+        return
+    if additional or not extras:
+        return
+    if "patternProperties" in schema:
+        verb = "does" if len(extras) == 1 else "do"
+        joined = ", ".join(repr(key) for key in extras)
+        patterns = ", ".join(repr(key) for key in sorted(schema["patternProperties"]))
+        yield ValidationError(f"{joined} {verb} not match any of the regexes: {patterns}")
+        return
+    verb = "was" if len(extras) == 1 else "were"
+    joined = ", ".join(repr(key) for key in extras)
+    yield ValidationError(f"Additional properties are not allowed ({joined} {verb} unexpected)")
+
+
+def _unmatched_keys(instance: Mapping[str, Any], schema: Mapping[str, Any]):
+    properties = schema.get("properties", {})
+    patterns = schema.get("patternProperties", {})
+    for key in instance:
+        if not isinstance(key, str) or key in properties:
+            if key not in properties:
+                yield key
+            continue
+        if any(_ecma_search(pattern, key) for pattern in patterns):
+            continue
+        yield key
+
+
 ToolValidator = extend(
     Draft202012Validator,
     type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
         {"integer": _is_integer, "number": _is_number}
     ),
+    validators={
+        "pattern": _pattern,
+        "patternProperties": _pattern_properties,
+        "additionalProperties": _additional_properties,
+    },
 )
 
 
