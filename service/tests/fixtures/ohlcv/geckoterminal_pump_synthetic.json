@@ -1,0 +1,38 @@
+{
+  "synthetic": true,
+  "data": [
+    {
+      "id": "solana_Bonding",
+      "type": "pool",
+      "attributes": {
+        "address": "BondingCurvePool",
+        "name": "TOK / SOL",
+        "pool_created_at": "2026-11-19T23:16:57Z",
+        "reserve_in_usd": "2500.00",
+        "launchpad_details": {
+          "graduation_percentage": 17.29,
+          "completed": false,
+          "completed_at": null,
+          "migrated_destination_pool_address": null
+        }
+      },
+      "relationships": {
+        "base_token": {"data": {"id": "solana_MINT", "type": "token"}},
+        "quote_token": {"data": {"id": "solana_QuoteSol", "type": "token"}},
+        "dex": {"data": {"id": "pump-fun", "type": "dex"}}
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "solana_QuoteSol",
+      "type": "token",
+      "attributes": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "name": "Wrapped SOL"
+      }
+    },
+    {"id": "pump-fun", "type": "dex", "attributes": {"name": "Pump.fun"}}
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "synthetic": true,
+  "data": [
+    {
+      "id": "solana_PoolLow",
+      "type": "pool",
+      "attributes": {
+        "address": "PoolLow",
+        "name": "TOK / USDC",
+        "pool_created_at": "2020-01-01T00:00:00Z",
+        "reserve_in_usd": "10.00"
+      },
+      "relationships": {
+        "base_token": {"data": {"id": "solana_MINT", "type": "token"}},
+        "quote_token": {"data": {"id": "solana_QuoteUsdc", "type": "token"}},
+        "dex": {"data": {"id": "orca", "type": "dex"}}
+      }
+    },
+    {
+      "id": "solana_PoolHigh",
+      "type": "pool",
+      "attributes": {
+        "address": "PoolHigh",
+        "name": "TOK / SOL",
+        "pool_created_at": "2021-06-01T00:00:00Z",
+        "reserve_in_usd": "50.00"
+      },
+      "relationships": {
+        "base_token": {"data": {"id": "solana_MINT", "type": "token"}},
+        "quote_token": {"data": {"id": "solana_QuoteSol", "type": "token"}},
+        "dex": {"data": {"id": "raydium", "type": "dex"}}
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "solana_QuoteUsdc",
+      "type": "token",
+      "attributes": {"address": "QuoteUsdcMint", "symbol": "USDC", "name": "USD Coin"}
+    },
+    {
+      "id": "solana_QuoteSol",
+      "type": "token",
+      "attributes": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "name": "Wrapped SOL"
+      }
+    },
+    {"id": "orca", "type": "dex", "attributes": {"name": "Orca"}},
+    {"id": "raydium", "type": "dex", "attributes": {"name": "Raydium"}}
+  ]
+}

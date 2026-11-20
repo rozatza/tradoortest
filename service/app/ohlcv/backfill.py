@@ -42,9 +42,9 @@ from app.auth import LOCAL_USER_ID
 from app.ohlcv.adapters import open_source
 from app.ohlcv.adapters.geckoterminal import PUBLIC_HISTORY_DAYS, PUBLIC_HISTORY_MESSAGE
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
-from app.ohlcv.errors import SourceError, StoreError
+from app.ohlcv.errors import InvalidMint, SourceError, StoreError
 from app.ohlcv.gaps import GapRange, LongNoTrade, SeriesReport, series_report, unfetched_spans
-from app.ohlcv.registry import MAJORS, Asset, require_assets
+from app.ohlcv.registry import MAJORS, Asset, assets_from_mints, require_assets
 from app.ohlcv.source import FetchPage, OhlcvSource, iter_pages
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, BarStore, SqliteBarStore
 
@@ -194,6 +194,7 @@ def _fill_timeframe(
                 window_end=end,
                 provider_empty=page.provider_empty,
                 seed=_seed_bar(page, asset, timeframe),
+                provider=_page_provider(source, asset.mint, timeframe),
             )
             page_number += 1
             _say(
@@ -207,6 +208,17 @@ def _fill_timeframe(
                     rejected.append(item)
                     seen.add(key)
     return rejected
+
+
+def _page_provider(source: OhlcvSource, mint: str, timeframe: str) -> str:
+    """Who served this page. A source without the note keeps its own name."""
+    method = getattr(source, "served_provider", None)
+    if method is None:
+        return source.name
+    found = method(mint, timeframe)
+    if isinstance(found, str) and found != "":
+        return found
+    return source.name
 
 
 def _say(progress: Callable[[str], None] | None, message: str) -> None:
@@ -368,8 +380,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--days", type=int, default=90, help="how many days to cover (default 90)")
     parser.add_argument(
         "--symbols",
-        default=",".join(asset.symbol for asset in MAJORS),
+        default=None,
         help="comma-separated symbols (default: the five majors)",
+    )
+    parser.add_argument(
+        "--mints",
+        default=None,
+        help="comma-separated Solana mint addresses; any mint, not only the five majors",
     )
     parser.add_argument(
         "--timeframes",
@@ -394,6 +411,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--provider", default="geckoterminal", help="OHLCV source name")
     parser.add_argument(
+        "--warmup-bars",
+        type=int,
+        default=0,
+        help="flag a series with fewer real bars than this warmup (default 0; --mints only)",
+    )
+    parser.add_argument(
+        "--gt-max-calls",
+        type=int,
+        default=None,
+        help="cap on GeckoTerminal HTTP calls for one any-mint run (default 180)",
+    )
+    parser.add_argument(
+        "--pool-pages",
+        type=int,
+        default=1,
+        help="GeckoTerminal token-pool pages to rank (default 1, up to 20 pools a page)",
+    )
+    parser.add_argument(
+        "--birdeye-cu-budget",
+        type=int,
+        default=None,
+        help="Birdeye compute-unit budget for this process (default 30000, or BIRDEYE_CU_BUDGET)",
+    )
+    parser.add_argument(
         "--long-no-trade-minutes",
         type=int,
         default=120,
@@ -412,17 +453,30 @@ def main(
     args = parser.parse_args(argv)
     if args.days < 1:
         parser.error("days must be at least 1")
-    symbols = [part.strip() for part in args.symbols.split(",") if part.strip()]
-    if not symbols:
-        print("at least one symbol is required", file=sys.stderr)
-        return 1
+    if args.mints is None:
+        if args.symbols is None:
+            symbols = [asset.symbol for asset in MAJORS]
+        else:
+            symbols = [part.strip() for part in args.symbols.split(",") if part.strip()]
+        if not symbols:
+            print("at least one symbol is required", file=sys.stderr)
+            return 1
+    else:
+        symbols = []
     if args.days > PUBLIC_HISTORY_DAYS:
         print(PUBLIC_HISTORY_MESSAGE, file=sys.stderr)
+        return 1
+    if args.mints is not None and args.symbols is not None:
+        print("pass --symbols or --mints, not both", file=sys.stderr)
+        return 1
+    if args.mints is None and args.warmup_bars != 0:
+        print("--warmup-bars applies to --mints", file=sys.stderr)
         return 1
     try:
         ttl_seconds = _ttl_seconds(args.cache_ttl_hours)
         long_no_trade_minutes = _long_threshold(args.long_no_trade_minutes)
-    except ValueError as exc:
+        mint_assets = _mint_assets(args.mints) if args.mints is not None else None
+    except (ValueError, InvalidMint) as exc:
         print(_one_line(exc), file=sys.stderr)
         return 1
     store: SqliteBarStore | None = None
@@ -431,29 +485,62 @@ def main(
     try:
         if args.report is not None:
             _prepare_report_path(Path(args.report))
-        assets = require_assets(symbols)
+        if mint_assets is None:
+            if args.symbols is None:
+                symbols = [asset.symbol for asset in MAJORS]
+            if not symbols:
+                print("at least one symbol is required", file=sys.stderr)
+                return 1
+            assets = require_assets(symbols)
+        else:
+            assets = mint_assets
         timeframes = tuple(part.strip() for part in args.timeframes.split(",") if part.strip())
         clock = int(time.time()) if now is None else now
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
         try:
-            store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+            store = SqliteBarStore(
+                data_dir / "ohlcv.sqlite",
+                ttl_seconds=ttl_seconds,
+                now=None if now is None else (lambda: clock),
+            )
         except OSError as exc:
             print(_data_dir_line(data_dir, exc), file=sys.stderr)
             return 1
-        active = open_source(args.provider) if source is None else source
-        report = run_backfill(
-            source=active,
-            store=store,
-            assets=assets,
-            start=start,
-            end=end,
-            timeframes=timeframes,
-            user_id=LOCAL_USER_ID,
-            generated_at=clock,
-            progress=_progress,
-            long_no_trade_minutes=long_no_trade_minutes,
-        )
+        if mint_assets is None:
+            active = open_source(args.provider) if source is None else source
+            report = run_backfill(
+                source=active,
+                store=store,
+                assets=assets,
+                start=start,
+                end=end,
+                timeframes=timeframes,
+                user_id=LOCAL_USER_ID,
+                generated_at=clock,
+                progress=_progress,
+                long_no_trade_minutes=long_no_trade_minutes,
+            )
+        else:
+            if source is None:
+                active = _any_mint_source(args, data_dir, clock)
+            else:
+                active = source
+            from app.ohlcv.ingest import run_mint_ingest
+
+            report = run_mint_ingest(
+                source=active,
+                store=store,
+                assets=assets,
+                start=start,
+                end=end,
+                timeframes=timeframes,
+                user_id=LOCAL_USER_ID,
+                generated_at=clock,
+                progress=_progress,
+                long_no_trade_minutes=long_no_trade_minutes,
+                warmup_bars=args.warmup_bars,
+            )
         text = json.dumps(report, indent=2) + "\n"
         if args.report is not None:
             Path(args.report).write_text(text, encoding="utf-8")
@@ -503,6 +590,45 @@ def _ttl_seconds(hours: float | None) -> int:
     if seconds > MAX_CACHE_TTL_SECONDS:
         raise ValueError(_TTL_ERROR)
     return seconds
+
+
+def _mint_assets(raw: str) -> tuple[Asset, ...]:
+    mints = [part.strip() for part in raw.split(",") if part.strip()]
+    if not mints:
+        raise ValueError("at least one mint is required")
+    return assets_from_mints(mints)
+
+
+def _any_mint_source(args: argparse.Namespace, data_dir: Path, clock: int):
+    """Build the any-mint source. The Birdeye key, if any, comes from the environment."""
+    from app.ohlcv.adapters.any_mint import DEFAULT_GT_MAX_CALLS, AnyMintSource
+    from app.ohlcv.adapters.birdeye import DEFAULT_CU_BUDGET
+
+    max_calls = _optional_positive(args.gt_max_calls, "OHLCV_GT_MAX_CALLS", DEFAULT_GT_MAX_CALLS)
+    budget = _optional_positive(args.birdeye_cu_budget, "BIRDEYE_CU_BUDGET", DEFAULT_CU_BUDGET)
+    if max_calls is None or budget is None:
+        raise ValueError("OHLCV_GT_MAX_CALLS must be a positive whole number")
+    return AnyMintSource(
+        max_calls=max_calls,
+        max_pool_pages=args.pool_pages,
+        birdeye_budget=budget,
+        birdeye_ledger=data_dir / "birdeye-cu.json",
+        now=lambda: clock,
+    )
+
+
+def _optional_positive(value: int | None, env: str, default: int | None) -> int | None:
+    if value is None:
+        raw = os.environ.get(env)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{env} must be a positive whole number") from exc
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{env} must be a positive whole number")
+    return value
 
 
 def _long_threshold(minutes: int) -> int:

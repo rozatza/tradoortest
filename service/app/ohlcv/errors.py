@@ -25,3 +25,67 @@ class UnknownSymbol(SourceError):
 
 class StoreError(RuntimeError):
     """The local bar store refused a write."""
+
+
+class IngestExpired(StoreError):
+    """A stored ingest result reached the 24-hour TTL and was deleted."""
+
+
+class IngestError(SourceError):
+    """A coded ingest failure. ``status`` is the HTTP status for the API."""
+
+    code = "source_error"
+    status = 422
+
+
+class InvalidMint(IngestError):
+    """The mint is not a Solana address. Raised before any provider request."""
+
+    code = "invalid_mint"
+    status = 400
+
+
+class NoPool(IngestError):
+    """The mint has no DEX pool on the primary provider."""
+
+    code = "no_pool"
+    status = 404
+
+
+class NoDexPoolYet(IngestError):
+    """The mint is still on a bonding curve, so there is no DEX pool yet."""
+
+    code = "no_dex_pool_yet"
+    status = 422
+
+
+class RateLimitExhausted(IngestError):
+    """Retries or the configured call cap ran out."""
+
+    code = "rate_limit"
+    status = 429
+
+
+class ComputeBudgetExceeded(IngestError):
+    """The Birdeye compute-unit budget cannot pay for the next request."""
+
+    code = "cu_budget"
+    status = 429
+
+
+class HistoryLimitError(IngestError):
+    """The window is past the history the public API will serve."""
+
+    code = "history_limit"
+    status = 400
+
+
+class StoreUnavailable(StoreError):
+    """The local cache cannot be read or written. The message has no path."""
+
+
+HISTORY_LIMIT_MESSAGE = (
+    "the public GeckoTerminal API only serves about 180 days of history; "
+    "days must be 180 or less"
+)
+STORE_UNAVAILABLE_MESSAGE = "the local store is unavailable"

@@ -25,6 +25,7 @@ a credential, and errors report only the HTTP status.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -92,13 +93,21 @@ class _Pace:
         self._sleep = sleep
         self._monotonic = monotonic
         self._next = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        now = self._monotonic()
-        if now < self._next:
-            self._sleep(self._next - now)
-            now = self._monotonic()
-        self._next = now + self.interval
+        """Keep the gap under concurrency. The lock is not held while sleeping.
+
+        An interval of 0 returns immediately, so a test clock can stay still.
+        """
+        while True:
+            with self._lock:
+                now = self._monotonic()
+                delay = self._next - now
+                if delay <= 0:
+                    self._next = now + self.interval
+                    return
+            self._sleep(delay)
 
 
 class GeckoTerminalSource:
@@ -115,6 +124,7 @@ class GeckoTerminalSource:
         min_interval: float = 12.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        pace: _Pace | None = None,
     ) -> None:
         if page_limit < 1 or page_limit > _PAGE_LIMIT:
             raise ValueError("page_limit must be from 1 to 1000")
@@ -123,7 +133,8 @@ class GeckoTerminalSource:
         self._pools = POOLS if pools is None else pools
         self._page_limit = page_limit
         self._sleep = sleep
-        self._pace = _Pace(min_interval, sleep, monotonic)
+        # A shared pace keeps the pool lookup and the candle calls on one clock.
+        self._pace = _Pace(min_interval, sleep, monotonic) if pace is None else pace
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:

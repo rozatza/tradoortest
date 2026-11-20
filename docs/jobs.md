@@ -20,7 +20,7 @@ CoinGecko API Terms section 6 does not allow a persistent store of API data. The
 
 The retention window defaults to 24 hours. `JobQueue` takes `result_ttl_seconds` for a shorter window. A value above 24 hours is rejected. It is not clamped. A bool is rejected too. On startup, and on every read and start, a job with `created_at + ttl <= now` is deleted together with its result and any leftover body. The same pass deletes a result or a body whose job row is already gone. A worker that finishes after that purge writes nothing: the result is stored only when the job is still `running` in that write. A read that still finds the expired job is HTTP 410 `expired`, and that read deletes it. 410 is best-effort. Another start or read purges the row first, and so does startup, so the client can see HTTP 404 `not_found` without a 410. A later read of an id that was deleted is 404 as well. A job at 23 hours 59 minutes is still readable. A job at 24 hours 1 minute is not. Exactly 24 hours has reached the window and is deleted.
 
-Keeping results longer than 24 hours waits on ROZ-92, a provider whose terms allow storage.
+ROZ-92 did not lengthen this window. OHLCV from every provider, including a Birdeye fallback, also expires within 24 hours. See `docs/ohlcv.md`.
 
 Default limits are 2 jobs queued or running, and 30 new jobs per minute. The minute is the open 60 seconds before now: a job created exactly 60 seconds ago no longer counts, and one created 59 seconds ago still does. Queued jobs count toward the concurrency cap, not only jobs already `running`. A repeated `request_key` with the same body returns the original job and does not consume either limit. The same key with a different body is HTTP 409 `request_key_reused`.
 

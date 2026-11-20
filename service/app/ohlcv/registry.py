@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.ohlcv.errors import UnknownSymbol
+from app.ohlcv.errors import InvalidMint, UnknownSymbol
+from app.ohlcv.mint import require_mint
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 JUP_MINT = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
@@ -38,6 +39,25 @@ MAJORS: tuple[Asset, ...] = (
 
 BY_SYMBOL = {asset.symbol: asset for asset in MAJORS}
 BY_MINT = {asset.mint: asset for asset in MAJORS}
+
+
+def assets_from_mints(mints: list[str]) -> tuple[Asset, ...]:
+    """Validate mint addresses and keep the first of each duplicate.
+
+    The symbol is the mint. Callers that want SOL, JUP, JTO, BONK, or WIF
+    still use ``require_assets``. This path does not add those names.
+    """
+    found: list[Asset] = []
+    seen: set[str] = set()
+    for raw in mints:
+        mint = require_mint(raw)
+        if mint in seen:
+            continue
+        seen.add(mint)
+        found.append(Asset(symbol=mint, mint=mint))
+    if not found:
+        raise InvalidMint("invalid mint")
+    return tuple(found)
 
 
 def require_assets(symbols: list[str]) -> tuple[Asset, ...]:
