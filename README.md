@@ -6,7 +6,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 
 | Path | What it is |
 | --- | --- |
-| `web/` | Next.js placeholder page. No product features. |
+| `web/` | Next.js author chat. It streams one session over the agent SSE proxy and shows tool steps, proposal cards, and strategy cards. |
 | `service/` | FastAPI app. `GET /health`, the auth seam, the IR validator, the expression parser (`app/expr`), the strategy-file parser (`app/dsl`), the indicator library (`app/indicators`), historical OHLCV ingest (`app/ohlcv`), the backtest engine (`app/backtest`), the backtest job API (`app/jobs`), saved strategies (`app/strategies`), the agent tool layer (`app/tools`), and the author agent loop (`app/agent`). |
 | `docs/agent-loop.md` | The author loop, model tiers, both guardrails, the 24 hour persistence rule, and the SSE event contract. |
 | `docs/agent-tools.md` | The ten agent tools, their JSON Schemas, preview-before-apply, and the error envelope. |
@@ -33,7 +33,7 @@ make install
 make test
 ```
 
-`make test` creates `.venv`, installs Python dependencies from the hashed lock `service/requirements.lock`, installs `web/` dependencies when the lockfile changes, then runs ruff, pytest, and the web typecheck and production build. CI runs that same `make test` target.
+`make test` creates `.venv`, installs Python dependencies from the hashed lock `service/requirements.lock`, installs `web/` dependencies when the lockfile changes, then runs ruff, pytest, and the web typecheck, Vitest suite, and production build. CI runs that same `make test` target. The web tests mock the author API. They do not call a model or a market data host.
 
 Copy `.env.example` only if you want a local env file. It has no values. Do not put secrets in it.
 
@@ -43,7 +43,7 @@ Run the API locally, after `make install`:
 .venv/bin/python -m uvicorn app.main:app --app-dir service --port 8000
 ```
 
-`GET /health` returns `{"status": "ok"}`. `POST /backtests` starts a simulation job for the local user. Status and results are `GET /backtests/{job_id}` and `GET /backtests/{job_id}/results`. The queue is a SQLite file, `data/backtest-jobs.sqlite`, which git ignores. Details are in `docs/jobs.md`. Saved strategies are a different SQLite file, `data/strategies.sqlite`, also gitignored. `POST /strategies` validates DSL or IR and stores version 1. `PUT /strategies/{strategy_id}` appends the next immutable version. Diffs, archive, and the env vars are in `docs/strategies.md`. `GET /tools` lists the agent tools and `POST /tools/{tool_name}` runs one. Contracts, the preview-before-apply rule, and the error codes are in `docs/agent-tools.md`. `POST /agent/sessions` opens an author session and `POST /agent/sessions/{session_id}/messages` runs one turn. Edits stay pending until `POST /agent/proposals/{proposal_id}/accept`. The provider seam, caps, guardrails, and SSE frames are in `docs/agent-loop.md`. The transcript is `data/agent.sqlite`, also gitignored. The web placeholder is `npm run dev --prefix web`.
+`GET /health` returns `{"status": "ok"}`. `POST /backtests` starts a simulation job for the local user. Status and results are `GET /backtests/{job_id}` and `GET /backtests/{job_id}/results`. The queue is a SQLite file, `data/backtest-jobs.sqlite`, which git ignores. Details are in `docs/jobs.md`. Saved strategies are a different SQLite file, `data/strategies.sqlite`, also gitignored. `POST /strategies` validates DSL or IR and stores version 1. `PUT /strategies/{strategy_id}` appends the next immutable version. Diffs, archive, and the env vars are in `docs/strategies.md`. `GET /tools` lists the agent tools and `POST /tools/{tool_name}` runs one. Contracts, the preview-before-apply rule, and the error codes are in `docs/agent-tools.md`. `POST /agent/sessions` opens an author session and `POST /agent/sessions/{session_id}/messages` runs one turn. Edits stay pending until `POST /agent/proposals/{proposal_id}/accept`. The provider seam, caps, guardrails, and SSE frames are in `docs/agent-loop.md`. The transcript is `data/agent.sqlite`, also gitignored. The chat UI is `npm run dev --prefix web`. Set `AGENT_API_ORIGIN` in the environment (see the commented line in `.env.example`) to the API origin, for example `http://127.0.0.1:8000`. The Next server proxies `/api/agent` to that origin. The value is not a `NEXT_PUBLIC_` variable and is not sent to the browser.
 
 Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Any other Solana mint is `--mints`. GeckoTerminal stays the primary source. Birdeye is an optional fallback and stays off unless `BIRDEYE_API_KEY` is set in the environment. Details, rate limits, and the gap report are in `docs/ohlcv.md`. A local live check, not part of CI, is `scripts/acceptance_roz92.py`.
 
@@ -57,7 +57,7 @@ Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. 
 
 - `ruff check` on `service/`
 - `pytest` (health, auth seam, schema, valid examples, invalid fixtures, DSL round-trip, canonical hash)
-- `tsc --noEmit` and `next build` in `web/`
+- `tsc --noEmit`, Vitest, and `next build` in `web/`
 
 Valid IR examples live in `schemas/examples/` (RSI cross, EMA cross, Bollinger revert). Invalid fixtures live in `service/tests/fixtures/invalid/`.
 

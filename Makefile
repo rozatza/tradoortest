@@ -10,7 +10,7 @@ STAMP_WEB := web/node_modules/.install-stamp
 .PHONY: help test lint test-service test-web install
 
 help:
-	@echo "make test    install deps if needed, then ruff, pytest, and the web check"
+	@echo "make test    install deps if needed, then ruff, pytest, and the web checks"
 	@echo "make install create .venv and install web dependencies"
 
 install: $(STAMP_PY) $(STAMP_WEB)
@@ -38,6 +38,7 @@ test-service: $(STAMP_PY)
 
 test-web: $(STAMP_WEB)
 	npm run lint --prefix web
+	npm test --prefix web
 	npm run build --prefix web
 
 test: lint test-service test-web

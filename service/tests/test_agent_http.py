@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.agent.errors import AgentError
 from app.agent.providers import ProviderRequest, ProviderResponse, StubProvider, ToolCall
 from app.agent.store import AgentStore, ProposalRecord
 from app.auth import LOCAL_USER_ID, CurrentUser, get_current_user
@@ -701,6 +702,131 @@ def test_disconnect_during_a_slow_turn_keeps_health_fast(tmp_path: Path) -> None
         assert asyncio.run(probe()) < 0.2
     finally:
         release.set()
+        bundle.close()
+
+
+def test_sync_message_persists_error_and_turn_complete(tmp_path: Path) -> None:
+    """A non-AgentError on the sync route must not leave user_message open."""
+
+    class Boom:
+        name = "stub"
+
+        def complete(self, _request: ProviderRequest) -> ProviderResponse:
+            raise RuntimeError("secret /tmp/agent.sqlite redacted-test-token-value")
+
+    store = AgentStore(tmp_path / "agent.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
+    application = create_app(agent_store=store, llm_provider=Boom())
+    client = TestClient(application, raise_server_exceptions=False)
+    try:
+        session_id = client.post("/agent/sessions", json={"title": "sync"}).json()["session_id"]
+        posted = client.post(
+            f"/agent/sessions/{session_id}/messages",
+            json={"content": "boom"},
+        )
+        assert posted.status_code == 500
+        assert posted.json()["error"]["code"] == "internal_error"
+        assert posted.json()["error"]["message"] == "the request could not be completed"
+        assert "Internal Server Error" not in posted.text
+        _no_leak(posted.text)
+        assert "redacted-test-token-value" not in posted.text
+        replay = client.get(f"/agent/sessions/{session_id}/events")
+        assert replay.status_code == 200
+        events = replay.json()["events"]
+        assert [event["type"] for event in events] == ["user_message", "error", "turn_complete"]
+        assert [event["seq"] for event in events] == [1, 2, 3]
+        assert events[0]["payload"]["content"] == "boom"
+        assert events[1]["payload"]["code"] == "internal_error"
+        assert events[1]["payload"]["message"] == "the request could not be completed"
+        assert events[2]["payload"]["status"] == "error"
+        assert events[2]["payload"]["error"]["code"] == "internal_error"
+        assert events[2]["turn_id"] == events[0]["turn_id"]
+        detail = client.get(f"/agent/sessions/{session_id}")
+        assert [event["type"] for event in detail.json()["events"]] == [
+            "user_message",
+            "error",
+            "turn_complete",
+        ]
+    finally:
+        store.close()
+
+
+def test_sync_agent_error_is_not_closed_twice(tmp_path: Path) -> None:
+    class Limited:
+        name = "stub"
+
+        def complete(self, _request: ProviderRequest) -> ProviderResponse:
+            raise AgentError("rate_limited", "the provider is rate limited", status=429)
+
+    store = AgentStore(tmp_path / "agent.sqlite", clock=lambda: "2026-01-01T00:00:00Z")
+    application = create_app(agent_store=store, llm_provider=Limited())
+    client = TestClient(application, raise_server_exceptions=False)
+    try:
+        session_id = client.post("/agent/sessions", json={}).json()["session_id"]
+        posted = client.post(
+            f"/agent/sessions/{session_id}/messages",
+            json={"content": "slow"},
+        )
+        assert posted.status_code == 200, posted.text
+        assert posted.json()["status"] == "error"
+        events = client.get(f"/agent/sessions/{session_id}/events").json()["events"]
+        assert [event["type"] for event in events] == ["user_message", "error", "turn_complete"]
+        assert events[1]["payload"]["code"] == "rate_limited"
+    finally:
+        store.close()
+
+
+def test_lone_surrogate_in_title_or_message_is_422(tmp_path: Path) -> None:
+    bundle = _Bundle(tmp_path)
+    headers = {"content-type": "application/json"}
+    try:
+        titled = bundle.client.post(
+            "/agent/sessions",
+            content=b'{"title":"\\ud800"}',
+            headers=headers,
+        )
+        assert titled.status_code == 422
+        title_error = titled.json()["error"]
+        assert title_error["code"] == "invalid_string"
+        assert title_error["path"] == "$.title"
+        assert "index 0" in title_error["message"]
+        assert "Internal Server Error" not in titled.text
+        _no_leak(titled.text)
+        created = bundle.session(title="ok")
+        assert created.status_code == 201
+        session_id = created.json()["session_id"]
+        posted = bundle.client.post(
+            f"/agent/sessions/{session_id}/messages",
+            content=b'{"content":"\\ud800"}',
+            headers=headers,
+        )
+        assert posted.status_code == 422
+        body_error = posted.json()["error"]
+        assert body_error["code"] == "invalid_string"
+        assert body_error["path"] == "$.content"
+        assert "index 0" in body_error["message"]
+        streamed = bundle.client.post(
+            f"/agent/sessions/{session_id}/messages/stream",
+            content=b'{"content":"prefix \\ud800"}',
+            headers=headers,
+        )
+        assert streamed.status_code == 422
+        assert streamed.json()["error"]["code"] == "invalid_string"
+        assert streamed.json()["error"]["path"] == "$.content"
+        paired = bundle.client.post(
+            f"/agent/sessions/{session_id}/messages",
+            content=b'{"content":"ok \\ud83d\\ude00"}',
+            headers=headers,
+        )
+        assert paired.status_code == 200, paired.text
+        events = bundle.client.get(f"/agent/sessions/{session_id}/events").json()["events"]
+        assert [event["type"] for event in events] == [
+            "user_message",
+            "assistant_message",
+            "turn_complete",
+        ]
+        assert events[0]["payload"]["content"] == "ok 😀"
+        assert "\\ud800" not in json.dumps(events)
+    finally:
         bundle.close()
 
 

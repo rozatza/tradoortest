@@ -5,14 +5,27 @@
   color: #1c2118;
 }
 
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
 body {
   margin: 0;
 }
 
 main {
-  max-width: 40rem;
-  margin: 4rem auto;
-  padding: 0 1.5rem;
+  max-width: 46rem;
+  height: 100%;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
 }
 
 .eyebrow {
@@ -24,11 +37,221 @@ main {
 }
 
 h1 {
-  margin: 0.35rem 0 0.75rem;
-  font-size: 2rem;
+  margin: 0.2rem 0 0.35rem;
+  font-size: 1.75rem;
+  font-weight: 600;
+}
+
+h2 {
+  margin: 0;
+  font-size: 1rem;
   font-weight: 600;
 }
 
 p {
+  margin: 0;
   line-height: 1.5;
+}
+
+.lede {
+  color: #3d4638;
+}
+
+.chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.thread {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding-right: 0.15rem;
+}
+
+.empty {
+  color: #5c6656;
+}
+
+.bubble,
+.card,
+.tool-step,
+.alert {
+  border: 1px solid #d5ddd0;
+  border-radius: 0.6rem;
+  background: #fff;
+  padding: 0.75rem 0.9rem;
+}
+
+.bubble.user {
+  background: #e7f0e4;
+}
+
+.who {
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #5c6656;
+  margin-bottom: 0.2rem;
+}
+
+.tool-step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 0.6rem;
+  align-items: baseline;
+}
+
+.working {
+  color: #3d4638;
+}
+
+.mark {
+  color: #1f6b3a;
+  font-weight: 700;
+}
+
+.tool-name {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+.tool-error {
+  grid-column: 1 / -1;
+  margin-top: 0.35rem;
+  color: #8a2e24;
+}
+
+.card .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.8rem;
+  margin: 0.4rem 0;
+  color: #3d4638;
+  font-size: 0.9rem;
+}
+
+.status {
+  text-transform: lowercase;
+}
+
+.diff {
+  margin: 0;
+  max-height: 8rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+  background: #f7f8f5;
+  padding: 0.5rem;
+  border-radius: 0.35rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+}
+
+button {
+  font: inherit;
+  border: 1px solid #1f6b3a;
+  background: #1f6b3a;
+  color: #fff;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #fff;
+  color: #1c2118;
+  border-color: #8a9484;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.strategy dl {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.45rem 0 0;
+}
+
+.strategy dl div {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 0.5rem;
+}
+
+.strategy dt {
+  color: #5c6656;
+}
+
+.strategy dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.strategy-name {
+  margin-top: 0.3rem;
+  font-weight: 600;
+}
+
+.alert {
+  background: #f8ecea;
+  border-color: #e3c2bd;
+  color: #6d241c;
+}
+
+.quote {
+  display: block;
+  margin-top: 0.35rem;
+  color: #1c2118;
+}
+
+.composer {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.composer label {
+  font-size: 0.85rem;
+  color: #3d4638;
+}
+
+textarea {
+  font: inherit;
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #c5cfc0;
+  border-radius: 0.45rem;
+  padding: 0.55rem 0.7rem;
+  background: #fff;
+  color: inherit;
+}
+
+textarea:focus,
+button:focus-visible {
+  outline: 2px solid #1f6b3a;
+  outline-offset: 2px;
+}
+
+@media (max-width: 40rem) {
+  main {
+    padding: 1rem 0.8rem 0.8rem;
+  }
+
+  h1 {
+    font-size: 1.45rem;
+  }
 }
