@@ -13,9 +13,11 @@ Take-profit fills at its limit. Stop-loss fills at the stop, or at the open
 when the bar gaps through the stop. A synthetic bar cannot touch a leg, the
 same as a missing bar. The next real bar is read on its own.
 
-The decision for bar ``i`` reads bars ``0..i`` only. Indicator functions are
-the causal library in ``app.indicators``, called on the grid with holes left
-as NaN. A later bar cannot change an earlier fill.
+The decision for bar ``i`` reads bars ``0..i`` only. ``app.runner`` makes
+that decision from a window that ends at ``i``. This module applies it to
+the book. Indicator functions are the causal library in ``app.indicators``,
+called on the grid with holes left as NaN. A later bar cannot change an
+earlier fill.
 
 Metrics and the trade log are ``docs/metrics.md``. A fill quantity is rounded
 down to ``1e-12``, a stand-in for a token's base units, so a buy never takes
@@ -46,7 +48,6 @@ from fractions import Fraction
 from typing import Any
 
 from app.backtest.errors import BacktestError
-from app.backtest.eval import EvalContext, EvalMemory, evaluate
 from app.backtest.metrics import Metrics, Trade, compute_metrics
 from app.backtest.money import decimal_ratio, floor_qty, quantize_cents
 from app.backtest.quality import AssetFlags, QualityCounts, asset_flags, outage_lints
@@ -55,6 +56,16 @@ from app.indicators.errors import IndicatorError
 from app.indicators.lints import collect_lints
 from app.ir.validate import format_issues, validate_ir
 from app.ohlcv.bars import MAX_ABS_VALUE, Bar
+from app.runner import (
+    BarDecision,
+    BookView,
+    OcoDrop,
+    OcoLevels,
+    config_from_document,
+    initial_state,
+    make_window,
+)
+from app.runner import step as decide_bar
 
 # IR bar sizes. 3m, 30m, and the multi-hour sizes are not fetched as native
 # OHLCV; the engine still runs them when the caller supplies those bars.
@@ -331,7 +342,6 @@ def _run_backtest(
         raise BacktestError(format_issues(issues), code=first.keyword, path=first.path)
     bar_size = document["engine"]["bar_size"]
     step = _BAR_SECONDS[bar_size]
-    warmup = int(document["engine"]["warmup_bars"])
     assets = list(document["assets"])
     asset_ids = [asset["id"] for asset in assets]
     _reject_unknown_bars(asset_ids, bars)
@@ -368,7 +378,6 @@ def _run_backtest(
         document,
         frames,
         grid,
-        warmup,
         initial,
         lints,
         flags,
@@ -596,7 +605,6 @@ def _walk(
     document: Mapping[str, Any],
     frames: dict[str, _Frame],
     grid: list[int],
-    warmup: int,
     initial: Decimal,
     lints: list[str],
     flags: dict[str, AssetFlags],
@@ -604,9 +612,7 @@ def _walk(
     threshold: int,
 ) -> BacktestResult:
     book = _Book(cash=initial, positions={}, ocos={})
-    signals = {signal["id"]: signal["expr"] for signal in document["signals"]}
     actions = {action["id"]: action for action in document["actions"]}
-    rules = list(document["rules"])
     portfolio = document["portfolio"]
     allow_pyramiding = bool(portfolio["allow_pyramiding"])
     max_positions = int(portfolio["max_positions"])
@@ -614,7 +620,6 @@ def _walk(
     slippage_bps = _dec(document["costs"]["slippage_bps"])
     if slippage_bps >= _BPS:
         raise BacktestError("slippage_bps must be less than 10000; a sell would fill at 0")
-    memory = {asset_id: EvalMemory() for asset_id in frames}
     fills: list[Fill] = []
     skipped: list[SkippedOrder] = []
     curve: list[EquityPoint] = []
@@ -624,85 +629,38 @@ def _walk(
     closed_acc: list[_Acc] = []
     missing_bars = synthetic_bars = outage_bars = 0
     missing_held = synthetic_held = outage_held = 0
-    pairs = _rule_pairs(rules, actions)
+    config = config_from_document(document)
+    runner_state = initial_state(config.asset_ids)
+    series = {asset_id: frame.series for asset_id, frame in frames.items()}
     for index, open_time in enumerate(grid):
         held_before = set(book.positions)
         filled_now: set[str] = set()
         _mark_bar(frames, grid, index, marks, last_mark)
-        truth = _snapshot(pairs, signals, frames, memory, book, index)
-        if index >= warmup:
-            _settle_ocos(
-                book,
-                frames,
-                open_time,
-                fills,
-                marks,
-                open_acc,
-                closed_acc,
-                filled_now,
-                commission_bps=commission_bps,
-                slippage_bps=slippage_bps,
-            )
-            for rule in rules:
-                action = actions[rule["do"]]
-                asset_id = action["asset"]
-                if not truth[(rule["when"], asset_id)]:
-                    continue
-                bar = frames[asset_id].by_time.get(open_time)
-                if bar is None:
-                    skipped.append(SkippedOrder(open_time, asset_id, action["id"], "missing_bar"))
-                    continue
-                if bar.synthetic:
-                    skipped.append(
-                        SkippedOrder(open_time, asset_id, action["id"], "synthetic_bar")
-                    )
-                    continue
-                outcome = _fill(
-                    action,
-                    _price(bar.close),
-                    book,
-                    marks,
-                    allow_pyramiding=allow_pyramiding,
-                    max_positions=max_positions,
-                    commission_bps=commission_bps,
-                    slippage_bps=slippage_bps,
-                )
-                if isinstance(outcome, str):
-                    skipped.append(SkippedOrder(open_time, asset_id, action["id"], outcome))
-                    continue
-                side, qty, price, notional, commission = outcome
-                if side == "buy":
-                    _attach_oco(book, action, price, open_time, lints)
-                    _note_buy(open_acc, asset_id, open_time, qty, price, notional, commission)
-                else:
-                    if asset_id not in book.positions:
-                        book.ocos.pop(asset_id, None)
-                    _note_sell(
-                        open_acc,
-                        closed_acc,
-                        asset_id,
-                        open_time,
-                        qty,
-                        price,
-                        notional,
-                        commission,
-                        False,
-                    )
-                filled_now.add(asset_id)
-                fills.append(
-                    Fill(
-                        open_time,
-                        asset_id,
-                        side,
-                        qty,
-                        price,
-                        notional,
-                        commission,
-                        _equity(book, marks),
-                        "market",
-                        False,
-                    )
-                )
+        bars_now = {asset_id: frame.by_time.get(open_time) for asset_id, frame in frames.items()}
+        outcome = decide_bar(
+            config,
+            runner_state,
+            make_window(index, open_time, series, bars_now),
+            _book_view(book),
+        )
+        runner_state = outcome.state
+        _apply_decision(
+            outcome.decision,
+            actions,
+            book,
+            marks,
+            open_acc,
+            closed_acc,
+            fills,
+            skipped,
+            lints,
+            filled_now,
+            open_time,
+            allow_pyramiding=allow_pyramiding,
+            max_positions=max_positions,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
         for asset_id, flag in flags.items():
             slot_missing = flag.missing[index]
             slot_synthetic = flag.synthetic[index]
@@ -768,15 +726,109 @@ def _walk(
     )
 
 
-def _rule_pairs(
-    rules: Sequence[Mapping[str, Any]], actions: Mapping[str, Mapping[str, Any]]
-) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    for rule in rules:
-        pair = (rule["when"], actions[rule["do"]]["asset"])
-        if pair not in pairs:
-            pairs.append(pair)
-    return pairs
+def _book_view(book: _Book) -> BookView:
+    """Entry prices and OCO levels before this bar's fills. The runner only reads them."""
+    return BookView(
+        tuple((asset_id, position.entry) for asset_id, position in book.positions.items()),
+        tuple(
+            (asset_id, OcoLevels(oco.take_profit, oco.stop_loss, oco.attached_at))
+            for asset_id, oco in book.ocos.items()
+        ),
+    )
+
+
+def _apply_decision(
+    decision: BarDecision,
+    actions: Mapping[str, Mapping[str, Any]],
+    book: _Book,
+    marks: dict[str, Decimal],
+    open_acc: dict[str, _Acc],
+    closed_acc: list[_Acc],
+    fills: list[Fill],
+    skipped: list[SkippedOrder],
+    lints: list[str],
+    filled_now: set[str],
+    open_time: int,
+    *,
+    allow_pyramiding: bool,
+    max_positions: int,
+    commission_bps: Decimal,
+    slippage_bps: Decimal,
+) -> None:
+    """Apply one bar's decision. OCO first, then rules, same as the walk used to."""
+    for item in decision.oco:
+        if isinstance(item, OcoDrop):
+            book.ocos.pop(item.asset_id, None)
+            continue
+        _fill_oco(
+            book,
+            item.asset_id,
+            item.leg,
+            item.raw_price,
+            item.limit_below_low,
+            open_time,
+            fills,
+            marks,
+            open_acc,
+            closed_acc,
+            filled_now,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
+    for attempt in decision.rules:
+        action = actions[attempt.action_id]
+        asset_id = attempt.asset_id
+        if attempt.skip is not None:
+            skipped.append(SkippedOrder(open_time, asset_id, action["id"], attempt.skip))
+            continue
+        if attempt.close is None:
+            raise BacktestError("a rule attempt has no close and no skip reason")
+        outcome = _fill(
+            action,
+            attempt.close,
+            book,
+            marks,
+            allow_pyramiding=allow_pyramiding,
+            max_positions=max_positions,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
+        if isinstance(outcome, str):
+            skipped.append(SkippedOrder(open_time, asset_id, action["id"], outcome))
+            continue
+        side, qty, price, notional, commission = outcome
+        if side == "buy":
+            _attach_oco(book, action, price, open_time, lints)
+            _note_buy(open_acc, asset_id, open_time, qty, price, notional, commission)
+        else:
+            if asset_id not in book.positions:
+                book.ocos.pop(asset_id, None)
+            _note_sell(
+                open_acc,
+                closed_acc,
+                asset_id,
+                open_time,
+                qty,
+                price,
+                notional,
+                commission,
+                False,
+            )
+        filled_now.add(asset_id)
+        fills.append(
+            Fill(
+                open_time,
+                asset_id,
+                side,
+                qty,
+                price,
+                notional,
+                commission,
+                _equity(book, marks),
+                "market",
+                False,
+            )
+        )
 
 
 def _mark_bar(
@@ -796,101 +848,6 @@ def _mark_bar(
             # Equity of a position already held. Not an indicator input, and
             # not a price copied into the hole for a fill.
             marks[asset_id] = last_mark[asset_id]
-
-
-def _snapshot(
-    pairs: Sequence[tuple[str, str]],
-    signals: Mapping[str, Mapping[str, Any]],
-    frames: dict[str, _Frame],
-    memory: dict[str, EvalMemory],
-    book: _Book,
-    index: int,
-) -> dict[tuple[str, str], bool]:
-    """Signal values from the book before any fill on this bar."""
-    truth: dict[tuple[str, str], bool] = {}
-    for signal_id, asset_id in pairs:
-        position = book.positions.get(asset_id)
-        entry = float(position.entry_price) if position is not None else None
-        value = evaluate(
-            signals[signal_id],
-            EvalContext(index, frames[asset_id].series, entry, memory[asset_id]),
-            (signal_id,),
-        )
-        truth[(signal_id, asset_id)] = value is True
-    return truth
-
-
-def _settle_ocos(
-    book: _Book,
-    frames: dict[str, _Frame],
-    open_time: int,
-    fills: list[Fill],
-    marks: dict[str, Decimal],
-    open_acc: dict[str, _Acc],
-    closed_acc: list[_Acc],
-    filled_now: set[str],
-    *,
-    commission_bps: Decimal,
-    slippage_bps: Decimal,
-) -> None:
-    """Fill a touched OCO leg before this bar's rules.
-
-    The entry bar is skipped: the pair is attached later in the bar, and a
-    pair whose ``attached_at`` is this bar is not read. A missing bar and a
-    synthetic bar are not touches. The next real bar is evaluated on its own
-    high and low.
-    """
-    for asset_id in frames:
-        oco = book.ocos.get(asset_id)
-        if oco is None or asset_id not in book.positions:
-            book.ocos.pop(asset_id, None)
-            continue
-        if oco.attached_at == open_time:
-            continue
-        bar = frames[asset_id].by_time.get(open_time)
-        if bar is None or bar.synthetic:
-            continue
-        leg = _oco_leg(bar, oco)
-        if leg is None:
-            continue
-        raw = _live_price(bar, oco, leg)
-        below = leg == "take_profit" and raw < _price(bar.low)
-        _fill_oco(
-            book,
-            asset_id,
-            leg,
-            raw,
-            below,
-            open_time,
-            fills,
-            marks,
-            open_acc,
-            closed_acc,
-            filled_now,
-            commission_bps=commission_bps,
-            slippage_bps=slippage_bps,
-        )
-
-
-def _oco_leg(bar: Bar | None, oco: _Oco) -> str | None:
-    """Stop wins when one bar touches both levels. A hole touches neither."""
-    if bar is None:
-        return None
-    if _price(bar.low) <= oco.stop_loss:
-        return "stop_loss"
-    if _price(bar.high) >= oco.take_profit:
-        return "take_profit"
-    return None
-
-
-def _live_price(bar: Bar, oco: _Oco, leg: str) -> Decimal:
-    """Limit at the target. Stop at the stop, or at the open when gapped through."""
-    opened = _price(bar.open)
-    if leg == "stop_loss" and opened <= oco.stop_loss:
-        return opened
-    if leg == "stop_loss":
-        return oco.stop_loss
-    return oco.take_profit
 
 
 def _fill_oco(
