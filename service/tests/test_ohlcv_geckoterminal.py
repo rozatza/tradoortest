@@ -71,6 +71,11 @@ def test_pagination_walks_backward_and_paces_calls() -> None:
     start = 1_700_000_040
     stamps = [start, start + 60, start + 120]
     sleeps: list[float] = []
+    clock = {"now": 0.0}
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
 
     def candle(stamp: int) -> list[float]:
         return [stamp, 1.0, 2.0, 0.5, 1.5, 4.0]
@@ -84,8 +89,8 @@ def test_pagination_walks_backward_and_paces_calls() -> None:
         _client(handler),
         page_limit=2,
         min_interval=12,
-        sleep=sleeps.append,
-        monotonic=lambda: 0.0,
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
     )
     result = source.fetch_bars(SOL_MINT, "1m", start, start + 180)
     assert [bar.open_time for bar in result.bars] == stamps

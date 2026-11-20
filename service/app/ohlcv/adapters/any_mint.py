@@ -4,15 +4,20 @@
 is checked before a request. The pool is chosen by liquidity (see
 ``app.ohlcv.pools``). Candles come from that pool. When GeckoTerminal has
 no pool, or a pool but no candles, and ``BIRDEYE_API_KEY`` is set, Birdeye
-``/defi/v3/ohlcv`` may serve the series. With no key that step is skipped
-and is not an error.
+``/defi/v3/ohlcv`` may serve the series. A pre-migration pump.fun mint is
+``no DEX pool yet`` even when the key is set; Birdeye is not called. With
+no key the fallback is skipped and is not an error.
 
 Each series records which provider served it. The chosen pool, when there
-is one, is available from ``pool_for``.
+is one, is available from ``pool_for``. In-memory pool and missing-pool
+notes expire within 24 hours. The GeckoTerminal call cap and the Birdeye
+call cap reset at the start of each ingest. The monthly compute-unit
+ledger does not.
 """
 
 from __future__ import annotations
 
+import contextvars
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -30,6 +35,9 @@ from app.ohlcv.source import FetchPage, FetchResult
 _UNSET = object()
 
 DEFAULT_GT_MAX_CALLS = 180
+# Same ceiling as the bar cache. A migrated mint is resolved again without
+# a process restart, and the note is not kept longer than the bars.
+MEMORY_TTL_SECONDS = 24 * 60 * 60
 _ATTEMPTS = 5
 _NO_RETRY = (httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.ProxyError)
 
@@ -47,6 +55,11 @@ class CallBudget:
         if self.used >= self.limit:
             raise RateLimitExhausted("GeckoTerminal request cap exhausted")
         self.used += 1
+
+
+_budget_var: contextvars.ContextVar[CallBudget | None] = contextvars.ContextVar(
+    "gt_call_budget", default=None
+)
 
 
 class AnyMintSource:
@@ -74,19 +87,20 @@ class AnyMintSource:
             raise ValueError("pool page cap must be a positive whole number")
         if max_pool_pages < 1:
             raise ValueError("pool page cap must be a positive whole number")
+        self._call_limit = max_calls
         self._budget = CallBudget(max_calls)
         self._owns_client = client is None
-        self._client = client if client is not None else _new_client(self._budget)
+        self._client = client if client is not None else _new_client(self._take)
         if client is not None:
-            self._client.event_hooks.setdefault("request", []).append(self._budget.take)
+            self._client.event_hooks.setdefault("request", []).append(self._take)
         self._sleep = sleep
         self._pace = _Pace(min_interval, sleep, monotonic)
         self._now = (lambda: int(time.time())) if now is None else now
         self._max_pool_pages = max_pool_pages
         self._pool_map: dict[str, str] = {}
-        self._chosen: dict[str, ChosenPool] = {}
-        self._missing: dict[str, NoPool | NoDexPoolYet] = {}
-        self._served: dict[tuple[str, str], str] = {}
+        self._chosen: dict[str, tuple[int, ChosenPool]] = {}
+        self._missing: dict[str, tuple[int, NoPool | NoDexPoolYet]] = {}
+        self._served: dict[tuple[str, str], tuple[int, str]] = {}
         self._gt = GeckoTerminalSource(
             self._client,
             pools=self._pool_map,
@@ -120,11 +134,33 @@ class AnyMintSource:
             self._client.close()
         self._birdeye.close()
 
+    def begin_run(self) -> tuple[contextvars.Token[CallBudget | None], object]:
+        """Fresh GeckoTerminal and Birdeye call caps for one ingest."""
+        budget_token = _budget_var.set(CallBudget(self._call_limit))
+        return budget_token, self._birdeye.begin_run()
+
+    def end_run(self, token: tuple[contextvars.Token[CallBudget | None], object]) -> None:
+        budget_token, birdeye_token = token
+        self._birdeye.end_run(birdeye_token)
+        _budget_var.reset(budget_token)
+
+    def _take(self, _request: object = None) -> None:
+        budget = _budget_var.get()
+        if budget is None:
+            budget = self._budget
+        budget.take()
+
     def pool_for(self, mint: str) -> ChosenPool | None:
-        return self._chosen.get(mint)
+        found = self._recall(self._chosen, mint)
+        if isinstance(found, ChosenPool):
+            return found
+        return None
 
     def served_provider(self, mint: str, timeframe: str) -> str:
-        return self._served.get((mint, timeframe), "geckoterminal")
+        found = self._recall(self._served, (mint, timeframe))
+        if isinstance(found, str) and found != "":
+            return found
+        return "geckoterminal"
 
     def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
         bars = []
@@ -141,7 +177,10 @@ class AnyMintSource:
         if failure is not None:
             yield from self._fallback_or_raise(mint, timeframe, start, end, failure)
             return
-        self._pool_map[mint] = self._chosen[mint].address
+        chosen = self.pool_for(mint)
+        if chosen is None:
+            raise NoPool(f"no pool for mint {mint}")
+        self._pool_map[mint] = chosen.address
         try:
             pending = self._gt.fetch_pages(mint, timeframe, start, end)
             first = next(pending, None)
@@ -151,7 +190,7 @@ class AnyMintSource:
         if first is None:
             return
         if first.bars or first.rejected or not first.provider_empty:
-            self._served[(mint, timeframe)] = "geckoterminal"
+            self._mark(mint, timeframe, "geckoterminal")
             yield first
             try:
                 yield from pending
@@ -162,10 +201,10 @@ class AnyMintSource:
         if self._birdeye.enabled:
             pages = self._birdeye_pages(mint, timeframe, start, end)
             if any(page.bars for page in pages):
-                self._served[(mint, timeframe)] = "birdeye"
+                self._mark(mint, timeframe, "birdeye")
                 yield from pages
                 return
-        self._served[(mint, timeframe)] = "geckoterminal"
+        self._mark(mint, timeframe, "geckoterminal")
         yield first
 
     def _fallback_or_raise(
@@ -176,11 +215,11 @@ class AnyMintSource:
         end: int,
         failure: NoPool | NoDexPoolYet,
     ) -> Iterator[FetchPage]:
-        if not self._birdeye.enabled:
+        if isinstance(failure, NoDexPoolYet) or not self._birdeye.enabled:
             raise failure
         pages = self._birdeye_pages(mint, timeframe, start, end)
         if any(page.bars for page in pages):
-            self._served[(mint, timeframe)] = "birdeye"
+            self._mark(mint, timeframe, "birdeye")
             yield from pages
             return
         raise failure
@@ -189,25 +228,44 @@ class AnyMintSource:
         return list(self._birdeye.fetch_pages(mint, timeframe, start, end))
 
     def _resolve(self, mint: str) -> NoPool | NoDexPoolYet | None:
-        if mint in self._chosen:
+        if self._recall(self._chosen, mint) is not None:
             return None
-        if mint in self._missing:
-            return self._missing[mint]
+        missing = self._recall(self._missing, mint)
+        if isinstance(missing, (NoPool, NoDexPoolYet)):
+            return missing
         try:
             payload = self._pool_pages(mint)
             chosen = choose_pool(payload, mint, resolved_at=int(self._now()))
         except NoDexPoolYet as exc:
-            self._missing[mint] = exc
+            self._remember(self._missing, mint, exc)
             return exc
         except NoPool as exc:
             if self._token_ungraduated(mint):
                 upgraded = NoDexPoolYet("no DEX pool yet")
-                self._missing[mint] = upgraded
+                self._remember(self._missing, mint, upgraded)
                 return upgraded
-            self._missing[mint] = exc
+            self._remember(self._missing, mint, exc)
             return exc
-        self._chosen[mint] = chosen
+        self._remember(self._chosen, mint, chosen)
         return None
+
+    def _remember(self, table: dict[Any, tuple[int, Any]], key: Any, value: Any) -> None:
+        table[key] = (int(self._now()), value)
+
+    def _recall(self, table: dict[Any, tuple[int, Any]], key: Any) -> Any:
+        found = table.get(key)
+        if found is None:
+            return None
+        stamp, value = found
+        if int(self._now()) - stamp >= MEMORY_TTL_SECONDS:
+            table.pop(key, None)
+            if table is self._chosen and isinstance(key, str):
+                self._pool_map.pop(key, None)
+            return None
+        return value
+
+    def _mark(self, mint: str, timeframe: str, provider: str) -> None:
+        self._remember(self._served, (mint, timeframe), provider)
 
     def _pool_pages(self, mint: str) -> dict[str, Any]:
         combined: list[Any] = []
@@ -285,11 +343,11 @@ class AnyMintSource:
         raise SourceError(f"GeckoTerminal returned HTTP {last_status}")
 
 
-def _new_client(budget: CallBudget) -> httpx.Client:
+def _new_client(take: Callable[..., None]) -> httpx.Client:
     return httpx.Client(
         timeout=30.0,
         headers={"Accept": "application/json", "User-Agent": "tradoortest-ohlcv"},
-        event_hooks={"request": [budget.take]},
+        event_hooks={"request": [take]},
     )
 
 

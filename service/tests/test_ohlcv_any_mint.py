@@ -86,6 +86,18 @@ def test_tie_break_is_liquidity_then_older_pool_then_address() -> None:
     same_age["data"][1]["attributes"]["address"] = "BBB"
     assert choose_pool(same_age, MINT, resolved_at=1_700_000_000).address == "AAA"
 
+    larger_first = json.loads(json.dumps(same_age))
+    larger_first["data"][0]["attributes"]["address"] = "ZZZ"
+    larger_first["data"][1]["attributes"]["address"] = "AAA"
+    assert choose_pool(larger_first, MINT, resolved_at=1_700_000_000).address == "AAA"
+
+    missing_time = json.loads(json.dumps(POOLS))
+    missing_time["data"][0]["attributes"]["reserve_in_usd"] = "50.00"
+    missing_time["data"][0]["attributes"]["address"] = "AAA"
+    del missing_time["data"][0]["attributes"]["pool_created_at"]
+    missing_time["data"][1]["attributes"]["address"] = "ZZZ"
+    assert choose_pool(missing_time, MINT, resolved_at=1_700_000_000).address == "ZZZ"
+
     bonding = json.loads(json.dumps(POOLS))
     bonding["data"][1]["relationships"]["dex"]["data"]["id"] = "pump-fun"
     bonding["data"][1]["attributes"]["launchpad_details"] = {"completed": False}
@@ -235,7 +247,9 @@ def test_history_beyond_180_days_is_a_clear_error_and_is_not_clamped(
         source.close()
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "history_limit"
+    assert response.json()["error"]["path"] == "$.days"
     assert "180" in response.json()["error"]["message"]
+    assert "--days" not in response.json()["error"]["message"]
     assert calls == []
 
 
@@ -551,15 +565,35 @@ def _source(
     )
 
 
+def _instant_pace():
+    clock = {"t": 0.0}
+
+    def sleep(seconds: float) -> None:
+        clock["t"] += float(seconds)
+
+    def monotonic() -> float:
+        return clock["t"]
+
+    return sleep, monotonic
+
+
 def _birdeye(api_key: str, transport: httpx.MockTransport, budget: int, sleep, clock):
     from app.ohlcv.adapters.birdeye import BirdeyeSource
+
+    pace_sleep, monotonic = _instant_pace()
+
+    def _sleep(seconds: float) -> None:
+        if sleep is not None:
+            sleep(seconds)
+        pace_sleep(seconds)
 
     return BirdeyeSource(
         api_key=api_key,
         client=httpx.Client(transport=transport),
         budget=budget,
-        min_interval=0,
-        sleep=sleep or (lambda _seconds: None),
+        min_interval=1,
+        sleep=_sleep,
+        monotonic=monotonic,
         now=clock,
     )
 

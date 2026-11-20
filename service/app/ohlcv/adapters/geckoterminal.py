@@ -25,6 +25,7 @@ a credential, and errors report only the HTTP status.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -92,13 +93,21 @@ class _Pace:
         self._sleep = sleep
         self._monotonic = monotonic
         self._next = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        now = self._monotonic()
-        if now < self._next:
-            self._sleep(self._next - now)
-            now = self._monotonic()
-        self._next = now + self.interval
+        """Keep the gap under concurrency. The lock is not held while sleeping.
+
+        An interval of 0 returns immediately, so a test clock can stay still.
+        """
+        while True:
+            with self._lock:
+                now = self._monotonic()
+                delay = self._next - now
+                if delay <= 0:
+                    self._next = now + self.interval
+                    return
+            self._sleep(delay)
 
 
 class GeckoTerminalSource:

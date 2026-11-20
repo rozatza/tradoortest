@@ -71,3 +71,21 @@ class ComputeBudgetExceeded(IngestError):
 
     code = "cu_budget"
     status = 429
+
+
+class HistoryLimitError(IngestError):
+    """The window is past the history the public API will serve."""
+
+    code = "history_limit"
+    status = 400
+
+
+class StoreUnavailable(StoreError):
+    """The local cache cannot be read or written. The message has no path."""
+
+
+HISTORY_LIMIT_MESSAGE = (
+    "the public GeckoTerminal API only serves about 180 days of history; "
+    "days must be 180 or less"
+)
+STORE_UNAVAILABLE_MESSAGE = "the local store is unavailable"

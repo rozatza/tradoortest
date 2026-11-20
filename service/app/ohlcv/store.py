@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Sequence
+from functools import wraps
 from pathlib import Path
 from typing import Protocol
 
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS fetched (
     end INTEGER NOT NULL,
     stored_at INTEGER NOT NULL,
     empty INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, mint, timeframe, start, end)
 );
 CREATE TABLE IF NOT EXISTS rejections (
@@ -78,7 +81,9 @@ CREATE TABLE IF NOT EXISTS pool_resolutions (
     mint TEXT NOT NULL,
     address TEXT NOT NULL,
     dex TEXT NOT NULL,
+    dex_id TEXT NOT NULL,
     quote_token TEXT NOT NULL,
+    quote_symbol TEXT,
     liquidity_usd TEXT NOT NULL,
     resolved_at INTEGER NOT NULL,
     pool_created_at INTEGER,
@@ -194,6 +199,17 @@ class BarStore(Protocol):
     ) -> None: ...
 
 
+def _serialized(method):
+    """One store, many request threads. The connection is not safe to share."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class SqliteBarStore:
     """One SQLite file. Upserts are idempotent on the primary key."""
 
@@ -215,11 +231,16 @@ class SqliteBarStore:
         self._ttl = ttl_seconds
         self._now = (lambda: int(time.time())) if now is None else now
         path.parent.mkdir(parents=True, exist_ok=True)
-        # The HTTP handler runs on a worker thread. This process is one user.
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # Request threads share this connection. ``_serialized`` holds the lock
+        # for each call, and busy_timeout covers a writer in another process.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
+        self._conn.execute("PRAGMA secure_delete=ON")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._ensure_schema()
         self._purge()
 
+    @_serialized
     def close(self) -> None:
         """Purge expired rows, then close the file.
 
@@ -232,6 +253,7 @@ class SqliteBarStore:
         finally:
             self._conn.close()
 
+    @_serialized
     def upsert(self, bars: Sequence[Bar], *, user_id: str) -> int:
         self._purge()
         stored_at = int(self._now())
@@ -240,6 +262,7 @@ class SqliteBarStore:
             self._conn.executemany(_UPSERT, rows)
         return len(rows)
 
+    @_serialized
     def replace_window(
         self,
         bars: Sequence[Bar],
@@ -271,6 +294,7 @@ class SqliteBarStore:
             )
             self._conn.executemany(_UPSERT, rows)
 
+    @_serialized
     def load(
         self,
         *,
@@ -307,6 +331,7 @@ class SqliteBarStore:
             for row in cursor
         ]
 
+    @_serialized
     def open_times(
         self,
         *,
@@ -328,6 +353,7 @@ class SqliteBarStore:
         )
         return {row[0] for row in cursor}
 
+    @_serialized
     def fetched_ranges(
         self,
         *,
@@ -351,6 +377,7 @@ class SqliteBarStore:
         )
         return [(row[0], row[1]) for row in cursor]
 
+    @_serialized
     def empty_ranges(
         self,
         *,
@@ -379,6 +406,7 @@ class SqliteBarStore:
         )
         return [(row[0], row[1]) for row in cursor]
 
+    @_serialized
     def rejections(
         self,
         *,
@@ -409,6 +437,7 @@ class SqliteBarStore:
             )
         return found
 
+    @_serialized
     def commit_page(
         self,
         bars: Sequence[Bar],
@@ -423,6 +452,7 @@ class SqliteBarStore:
         window_end: int,
         provider_empty: bool = False,
         seed: Bar | None = None,
+        provider: str = "geckoterminal",
     ) -> None:
         """Upsert one page and record its fetched span in a single transaction.
 
@@ -518,17 +548,20 @@ class SqliteBarStore:
             empty_page = 1 if provider_empty else 0
             self._conn.execute(
                 """
-                INSERT INTO fetched (user_id, mint, timeframe, start, end, stored_at, empty)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO fetched (
+                    user_id, mint, timeframe, start, end, stored_at, empty, provider
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, mint, timeframe, start, end) DO UPDATE SET
                     stored_at = excluded.stored_at,
-                    empty = excluded.empty
+                    empty = excluded.empty,
+                    provider = excluded.provider
                 """,
-                (user_id, mint, timeframe, span_start, end, stored_at, empty_page),
+                (user_id, mint, timeframe, span_start, end, stored_at, empty_page, provider),
             )
             if timeframe == "1m":
                 self._rewrite_synthetics(user_id, mint, window_start, window_end)
 
+    @_serialized
     def save_pool(
         self,
         *,
@@ -536,7 +569,9 @@ class SqliteBarStore:
         mint: str,
         address: str,
         dex: str,
+        dex_id: str,
         quote_token: str,
+        quote_symbol: str | None,
         liquidity_usd: str,
         resolved_at: int,
         pool_created_at: int | None,
@@ -549,13 +584,15 @@ class SqliteBarStore:
             self._conn.execute(
                 """
                 INSERT INTO pool_resolutions (
-                    user_id, mint, address, dex, quote_token, liquidity_usd,
-                    resolved_at, pool_created_at, provider, stored_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id, mint, address, dex, dex_id, quote_token, quote_symbol,
+                    liquidity_usd, resolved_at, pool_created_at, provider, stored_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, mint) DO UPDATE SET
                     address = excluded.address,
                     dex = excluded.dex,
+                    dex_id = excluded.dex_id,
                     quote_token = excluded.quote_token,
+                    quote_symbol = excluded.quote_symbol,
                     liquidity_usd = excluded.liquidity_usd,
                     resolved_at = excluded.resolved_at,
                     pool_created_at = excluded.pool_created_at,
@@ -567,7 +604,9 @@ class SqliteBarStore:
                     mint,
                     address,
                     dex,
+                    dex_id,
                     quote_token,
+                    quote_symbol,
                     liquidity_usd,
                     resolved_at,
                     pool_created_at,
@@ -576,14 +615,15 @@ class SqliteBarStore:
                 ),
             )
 
+    @_serialized
     def load_pool(self, *, user_id: str, mint: str) -> dict[str, object] | None:
         """The fresh pool row, or ``None`` after the TTL has deleted it."""
         self._purge()
         _owner(user_id)
         row = self._conn.execute(
             """
-            SELECT address, dex, quote_token, liquidity_usd, resolved_at,
-                   pool_created_at, provider
+            SELECT address, dex, dex_id, quote_token, quote_symbol, liquidity_usd,
+                   resolved_at, pool_created_at, provider
             FROM pool_resolutions
             WHERE user_id = ? AND mint = ?
             """,
@@ -594,13 +634,45 @@ class SqliteBarStore:
         return {
             "address": row[0],
             "dex": row[1],
-            "quote_token": row[2],
-            "liquidity_usd": row[3],
-            "resolved_at": row[4],
-            "pool_created_at": row[5],
-            "provider": row[6],
+            "dex_id": row[2],
+            "quote_token": row[3],
+            "quote_symbol": row[4],
+            "liquidity_usd": row[5],
+            "resolved_at": row[6],
+            "pool_created_at": row[7],
+            "provider": row[8],
         }
 
+    @_serialized
+    def series_providers(
+        self,
+        *,
+        user_id: str,
+        mint: str,
+        timeframe: str,
+        start: int,
+        end: int,
+    ) -> list[str]:
+        """Providers recorded on fetched spans that overlap ``[start, end)``.
+
+        One name when the window is a single provider. More than one when
+        GeckoTerminal and Birdeye each covered part of it. The rows expire
+        with the bars.
+        """
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT DISTINCT provider FROM fetched
+            WHERE user_id = ? AND mint = ? AND timeframe = ?
+              AND start < ? AND end > ? AND provider != ''
+            ORDER BY provider
+            """,
+            (user_id, mint, timeframe, end, start),
+        )
+        return [row[0] for row in cursor if isinstance(row[0], str)]
+
+    @_serialized
     def save_ingest_result(self, *, user_id: str, job_id: str, payload: dict[str, object]) -> None:
         """Store the job result. It is deleted by the same purge as the bars."""
         self._purge()
@@ -620,6 +692,7 @@ class SqliteBarStore:
                 (user_id, job_id, text, int(self._now())),
             )
 
+    @_serialized
     def read_ingest_result(self, *, user_id: str, job_id: str) -> dict[str, object] | None:
         """Return the result, or raise ``IngestExpired`` when this read deletes it.
 
@@ -650,12 +723,13 @@ class SqliteBarStore:
             raise StoreError("stored ingest result is not an object")
         return payload
 
+    @_serialized
     def _ensure_schema(self) -> None:
         self._conn.executescript(_CREATE)
         bars = {row[1] for row in self._conn.execute("PRAGMA table_info(bars)")}
         fetched = {row[1] for row in self._conn.execute("PRAGMA table_info(fetched)")}
         rejections = {row[1] for row in self._conn.execute("PRAGMA table_info(rejections)")}
-        fresh = {"synthetic", "stored_at"} <= bars and {"stored_at", "empty"} <= fetched
+        fresh = {"synthetic", "stored_at"} <= bars and {"stored_at", "empty", "provider"} <= fetched
         fresh = fresh and "stored_at" in rejections
         if not fresh:
             self._conn.executescript(
@@ -666,9 +740,13 @@ class SqliteBarStore:
                 """
             )
             self._conn.executescript(_CREATE)
+        pool_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(pool_resolutions)")}
+        if pool_cols and "dex_id" not in pool_cols:
+            self._conn.execute("DROP TABLE pool_resolutions")
         self._conn.executescript(_PROVIDER_TABLES)
         self._conn.commit()
 
+    @_serialized
     def _purge(self) -> None:
         """Drop rows and fetched spans that have reached the TTL."""
         cutoff = int(self._now()) - self._ttl

@@ -51,8 +51,7 @@ def test_birdeye_is_a_clean_noop_without_a_key(monkeypatch: pytest.MonkeyPatch) 
     wrapped = AnyMintSource(
         httpx.Client(transport=httpx.MockTransport(handler)),
         api_key=None,
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
     )
     try:
         with pytest.raises(Exception, match="no pool") as caught:
@@ -179,8 +178,7 @@ def test_birdeye_does_not_interpolate_a_hole() -> None:
     source = BirdeyeSource(
         api_key=_KEY,
         client=_client(_fixture_only),
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
     )
     try:
         result = source.fetch_bars(MINT, "1m", 1_699_999_980, 1_700_000_220)
@@ -197,8 +195,7 @@ def test_birdeye_key_is_absent_from_errors_repr_and_output() -> None:
     source = BirdeyeSource(
         api_key=_KEY,
         client=_client(handler),
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
         max_calls=10,
     )
     try:
@@ -224,8 +221,7 @@ def test_birdeye_cu_budget_fails_before_the_request() -> None:
         api_key=_KEY,
         client=_client(handler),
         budget=20,
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
     )
     try:
         with pytest.raises(ComputeBudgetExceeded, match="compute-unit budget exceeded") as caught:
@@ -279,8 +275,7 @@ def test_birdeye_rate_limit_exhaustion_hides_the_body() -> None:
     source = BirdeyeSource(
         api_key=_KEY,
         client=_client(handler),
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
     )
     try:
         with pytest.raises(RateLimitExhausted, match="Birdeye rate limit exhausted") as caught:
@@ -356,6 +351,18 @@ def test_birdeye_bars_are_purged_with_the_job_result(tmp_path: Path) -> None:
         source.close()
 
 
+def _pace_kwargs() -> dict[str, object]:
+    clock = {"t": 0.0}
+
+    def sleep(seconds: float) -> None:
+        clock["t"] += float(seconds)
+
+    def monotonic() -> float:
+        return clock["t"]
+
+    return {"min_interval": 1, "sleep": sleep, "monotonic": monotonic}
+
+
 def _fixture_only(request: httpx.Request) -> httpx.Response:
     assert request.url.params["padding"] == "false"
     return httpx.Response(200, json=FIXTURE)
@@ -370,15 +377,13 @@ def _wrapped(handler, *, now=lambda: 1_700_000_000) -> AnyMintSource:
     birdeye = BirdeyeSource(
         api_key=_KEY,
         client=httpx.Client(transport=transport),
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
         now=now,
     )
     return AnyMintSource(
         httpx.Client(transport=transport),
         birdeye=birdeye,
         api_key=_KEY,
-        min_interval=0,
-        sleep=lambda _seconds: None,
+        **_pace_kwargs(),
         now=now,
     )

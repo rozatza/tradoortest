@@ -194,6 +194,7 @@ def _fill_timeframe(
                 window_end=end,
                 provider_empty=page.provider_empty,
                 seed=_seed_bar(page, asset, timeframe),
+                provider=_page_provider(source, asset.mint, timeframe),
             )
             page_number += 1
             _say(
@@ -207,6 +208,17 @@ def _fill_timeframe(
                     rejected.append(item)
                     seen.add(key)
     return rejected
+
+
+def _page_provider(source: OhlcvSource, mint: str, timeframe: str) -> str:
+    """Who served this page. A source without the note keeps its own name."""
+    method = getattr(source, "served_provider", None)
+    if method is None:
+        return source.name
+    found = method(mint, timeframe)
+    if isinstance(found, str) and found != "":
+        return found
+    return source.name
 
 
 def _say(progress: Callable[[str], None] | None, message: str) -> None:

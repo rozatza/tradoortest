@@ -15,8 +15,11 @@ copied forward. ``outlier`` is false, so a candle is not dropped for us.
 
 from __future__ import annotations
 
+import contextvars
 import json
+import math
 import os
+import threading
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -37,6 +40,9 @@ _MAX_CANDLES = 5000
 _ATTEMPTS = 5
 _NO_RETRY = (httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.ProxyError)
 BASE_URL = "https://public-api.birdeye.so"
+_call_box: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "birdeye_calls", default=None
+)
 _TYPE = {
     "1m": "1m",
     "5m": "5m",
@@ -80,21 +86,42 @@ class CuLedger:
         self.budget = budget
         self.path = path
         self._now = (lambda: int(time.time())) if now is None else now
+        self._lock = threading.Lock()
+        self._inflight = 0
         self.period, self.used = self._load()
 
     def reserve(self, candles: int) -> int:
         """Refuse before a call the budget cannot pay for, else return the cost."""
+        with self._lock:
+            return self._reserve_locked(candles)
+
+    def _reserve_locked(self, candles: int) -> int:
         self._roll()
         cost = cu_for_candles(candles)
+        held = self._inflight
+        self.used += held
         if self.used + cost > self.budget:
+            self.used -= held
             raise ComputeBudgetExceeded("Birdeye compute-unit budget exceeded")
+        self.used -= held
+        self._inflight += cost
         return cost
 
     def commit(self, cost: int) -> None:
         """Record a call that returned HTTP 200. A failed call is not billed."""
+        with self._lock:
+            self._commit_locked(cost)
+
+    def _commit_locked(self, cost: int) -> None:
+        self._inflight = max(0, self._inflight - cost)
         self._roll()
         self.used += cost
         self._write()
+
+    def release(self, cost: int) -> None:
+        """Drop a reservation when the call did not return HTTP 200."""
+        with self._lock:
+            self._inflight = max(0, self._inflight - cost)
 
     def _roll(self) -> None:
         period = _period(self._now())
@@ -154,6 +181,8 @@ class BirdeyeSource:
             raise ValueError("Birdeye pace must be a number of seconds")
         if min_interval < 0:
             raise ValueError("Birdeye pace must be a number of seconds")
+        if min_interval == 0 or not math.isfinite(min_interval):
+            raise ValueError("Birdeye pace must be a positive number of seconds")
         if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
             raise ValueError("Birdeye call cap must be a positive whole number")
         key = _key(api_key)
@@ -162,6 +191,7 @@ class BirdeyeSource:
         self.min_interval = float(min_interval)
         self.max_calls = max_calls
         self._calls = 0
+        self._call_lock = threading.Lock()
         self._client = client
         self._owns_client = client is None
         self._sleep = sleep
@@ -207,7 +237,11 @@ class BirdeyeSource:
         candles = max(1, (end - start + step - 1) // step)
         candles = min(candles, _MAX_CANDLES)
         cost = self.ledger.reserve(candles)
-        payload = self._get_json(mint, timeframe, start, end)
+        try:
+            payload = self._get_json(mint, timeframe, start, end)
+        except BaseException:
+            self.ledger.release(cost)
+            raise
         self.ledger.commit(cost)
         items = _items(payload)
         if not items:
@@ -269,10 +303,24 @@ class BirdeyeSource:
             return payload
         raise SourceError(f"Birdeye returned HTTP {last_status}")
 
+    def begin_run(self) -> contextvars.Token[list[int] | None]:
+        """Start a fresh call cap for this ingest. The monthly ledger is not reset."""
+        return _call_box.set([0])
+
+    def end_run(self, token: contextvars.Token[list[int] | None]) -> None:
+        _call_box.reset(token)
+
     def _take_call(self) -> None:
-        if self._calls >= self.max_calls:
-            raise RateLimitExhausted("Birdeye request cap exhausted")
-        self._calls += 1
+        box = _call_box.get()
+        if box is not None:
+            if box[0] >= self.max_calls:
+                raise RateLimitExhausted("Birdeye request cap exhausted")
+            box[0] += 1
+            return
+        with self._call_lock:
+            if self._calls >= self.max_calls:
+                raise RateLimitExhausted("Birdeye request cap exhausted")
+            self._calls += 1
 
     def _headers(self) -> dict[str, str]:
         # Per request, so an injected test client still sends the key, and
