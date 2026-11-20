@@ -10,6 +10,7 @@ a failed run return 4xx. None of these routes is a 500 for those failures.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -30,6 +31,8 @@ from app.expr.errors import ExprError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.ir.validate import validate_ir
+from app.jobs.analysis import trade_timing
+from app.jobs.chart import BARS_SCHEMA, INDICATORS_SCHEMA
 from app.jobs.export import EXPORT_NAMES, ExportError, render_export
 from app.jobs.queue import JobExpired, JobQueue, JobRecord, KeyReused, LimitReached, QueueBusy
 
@@ -122,6 +125,166 @@ async def backtest_export(
             "content-disposition": f'attachment; filename="{name}"',
         },
     )
+
+
+@router.get("/backtests/{job_id}/bars")
+async def backtest_bars(job_id: str, request: Request, user: CurrentUserDep) -> JSONResponse:
+    """Capped candles for the price chart. The read stays off the event loop."""
+    loaded = await run_in_threadpool(_bars_document, request, user.user_id, job_id)
+    return _chart_response(loaded)
+
+
+@router.get("/backtests/{job_id}/indicators")
+async def backtest_indicators(
+    job_id: str,
+    request: Request,
+    user: CurrentUserDep,
+) -> JSONResponse:
+    """Capped indicator series from the server-side library. Off the event loop."""
+    loaded = await run_in_threadpool(_indicators_document, request, user.user_id, job_id)
+    return _chart_response(loaded)
+
+
+@router.get("/backtests/{job_id}/analysis")
+async def backtest_analysis(
+    job_id: str,
+    request: Request,
+    user: CurrentUserDep,
+) -> JSONResponse:
+    """UTC hour and weekday counts from the stored trade log. Off the event loop."""
+    loaded = await run_in_threadpool(_analysis_document, request, user.user_id, job_id)
+    return _chart_response(loaded)
+
+
+def _chart_response(loaded: dict[str, Any] | JSONResponse) -> JSONResponse:
+    if isinstance(loaded, JSONResponse):
+        return loaded
+    return JSONResponse(
+        status_code=200,
+        content=loaded,
+        headers={"cache-control": "no-store"},
+    )
+
+
+def _bars_document(request: Request, user_id: str, job_id: str) -> dict[str, Any] | JSONResponse:
+    _refuse_event_loop()
+    return _chart_document(request, user_id, job_id, "bars")
+
+
+def _indicators_document(
+    request: Request,
+    user_id: str,
+    job_id: str,
+) -> dict[str, Any] | JSONResponse:
+    _refuse_event_loop()
+    return _chart_document(request, user_id, job_id, "indicators")
+
+
+def _analysis_document(
+    request: Request,
+    user_id: str,
+    job_id: str,
+) -> dict[str, Any] | JSONResponse:
+    """Read the trade log with SQLite ``json_extract``. Do not parse the result row."""
+    _refuse_event_loop()
+    gated = _gate_job(request, user_id, job_id)
+    if isinstance(gated, JSONResponse):
+        return gated
+    _job, queue = gated
+    try:
+        kind, text = queue.trades_json(user_id, job_id)
+    except QueueBusy:
+        return _busy()
+    except JobExpired:
+        return _expired()
+    if kind is None and text is None:
+        return error_response(409, "not_ready", "backtest results are not ready", None)
+    if kind == "missing" or kind == "null":
+        return {
+            "schema": "tradoortest.backtest_analysis.v1",
+            "available": False,
+            "timezone": "UTC",
+            "trades_total": 0,
+            "trades_used": 0,
+            "reason": "trade log unavailable",
+        }
+    if kind != "array" or text is None:
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    try:
+        trades = json.loads(text)
+        payload = trade_timing(trades)
+    except (json.JSONDecodeError, ValueError):
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    return payload
+
+
+def _chart_document(
+    request: Request,
+    user_id: str,
+    job_id: str,
+    kind: str,
+) -> dict[str, Any] | JSONResponse:
+    gated = _gate_job(request, user_id, job_id)
+    if isinstance(gated, JSONResponse):
+        return gated
+    _job, queue = gated
+    try:
+        if kind == "bars":
+            text = queue.bars_json(user_id, job_id)
+            schema = BARS_SCHEMA
+            reason = "bars unavailable"
+        else:
+            text = queue.indicators_json(user_id, job_id)
+            schema = INDICATORS_SCHEMA
+            reason = "indicators unavailable"
+    except QueueBusy:
+        return _busy()
+    except JobExpired:
+        return _expired()
+    if text is None:
+        return {"schema": schema, "available": False, "reason": reason}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    if not isinstance(payload, dict):
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    return payload
+
+
+def _gate_job(
+    request: Request,
+    user_id: str,
+    job_id: str,
+) -> tuple[JobRecord, JobQueue] | JSONResponse:
+    try:
+        queue = _queue(request)
+    except QueueBusy:
+        return _busy()
+    try:
+        job = queue.get(user_id, job_id)
+    except JobExpired:
+        return _expired()
+    except KeyError:
+        return error_response(404, "not_found", "backtest job was not found", None)
+    if job.status in {"queued", "running"}:
+        return error_response(409, "not_ready", "backtest results are not ready", None)
+    if job.status == "failed":
+        error = job.error or {
+            "code": "backtest_error",
+            "message": "the backtest could not finish",
+            "path": None,
+        }
+        return JSONResponse(status_code=422, content={"error": error})
+    return job, queue
+
+
+def _refuse_event_loop() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError("chart read is on the event loop")
 
 
 def _render_export(

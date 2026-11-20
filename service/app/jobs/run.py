@@ -15,6 +15,7 @@ from typing import Any
 from app.backtest import run_backtest
 from app.backtest.engine import BacktestResult
 from app.backtest.log import METRIC_COLUMNS, trade_rows
+from app.jobs.chart import chart_documents, publish_chart_parts
 from app.ohlcv.bars import Bar
 
 _RESULT_SCHEMA = "tradoortest.backtest_result.v1"
@@ -35,6 +36,11 @@ def run_backtest_job(body: Mapping[str, Any]) -> dict[str, Any]:
     result = run_backtest(document, bars, long_no_trade_minutes=int(minutes))
     payload = _payload(result)
     json.dumps(payload, allow_nan=False)
+    bars_doc, indicator_doc = chart_documents(body, payload)
+    publish_chart_parts(
+        json.dumps(bars_doc, allow_nan=False, separators=(",", ":")),
+        json.dumps(indicator_doc, allow_nan=False, separators=(",", ":")),
+    )
     return payload
 
 

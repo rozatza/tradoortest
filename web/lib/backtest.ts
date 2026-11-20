@@ -298,6 +298,20 @@ export async function loadBacktest(jobId: string): Promise<LoadedBacktest> {
   return { kind: "ready", jobId, result: body };
 }
 
+const CHART_READS = new Set(["/bars", "/indicators", "/analysis"]);
+
+/** GET one allowlisted chart read. The path is not taken from the caller. */
+export async function fetchJobJson(jobId: string, suffix: string): Promise<unknown> {
+  if (!isJobId(jobId) || !CHART_READS.has(suffix)) {
+    throw new BacktestRequestError(422, "invalid_id", "job_id is invalid");
+  }
+  const response = await request(`/api/backtests/${jobId}${suffix}`, "application/json");
+  if (!response.ok) {
+    throw await errorFrom(response);
+  }
+  return readJson(response);
+}
+
 export async function downloadBacktest(jobId: string, kind: DownloadKind): Promise<void> {
   if (!isJobId(jobId)) {
     throw new BacktestRequestError(422, "invalid_id", "job_id is invalid");
