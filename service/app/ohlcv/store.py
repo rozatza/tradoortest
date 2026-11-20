@@ -577,7 +577,11 @@ class SqliteBarStore:
         pool_created_at: int | None,
         provider: str,
     ) -> None:
-        """Remember the pool chosen for ``mint``. The row expires with the bars."""
+        """Remember the pool chosen for ``mint``. The row expires with the bars.
+
+        Saving the same ``resolved_at`` again does not move ``stored_at``, so
+        a repeat request cannot keep the pool past 24 hours from resolution.
+        """
         self._purge()
         _owner(user_id)
         with self._conn:
@@ -597,7 +601,11 @@ class SqliteBarStore:
                     resolved_at = excluded.resolved_at,
                     pool_created_at = excluded.pool_created_at,
                     provider = excluded.provider,
-                    stored_at = excluded.stored_at
+                    stored_at = CASE
+                        WHEN excluded.resolved_at <> pool_resolutions.resolved_at
+                        THEN excluded.stored_at
+                        ELSE pool_resolutions.stored_at
+                    END
                 """,
                 (
                     user_id,
@@ -754,7 +762,10 @@ class SqliteBarStore:
             self._conn.execute("DELETE FROM bars WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM fetched WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM rejections WHERE stored_at <= ?", (cutoff,))
-            self._conn.execute("DELETE FROM pool_resolutions WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute(
+                "DELETE FROM pool_resolutions WHERE stored_at <= ? OR resolved_at <= ?",
+                (cutoff, cutoff),
+            )
             self._conn.execute("DELETE FROM ingest_results WHERE stored_at <= ?", (cutoff,))
 
     def _rewrite_synthetics(self, user_id: str, mint: str, start: int, end: int) -> None:

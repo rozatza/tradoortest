@@ -499,7 +499,11 @@ def main(
         start, end = plan_window(clock, args.days, timeframes)
         data_dir = Path(args.data_dir or os.environ.get("OHLCV_DATA_DIR") or "data")
         try:
-            store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=ttl_seconds)
+            store = SqliteBarStore(
+                data_dir / "ohlcv.sqlite",
+                ttl_seconds=ttl_seconds,
+                now=None if now is None else (lambda: clock),
+            )
         except OSError as exc:
             print(_data_dir_line(data_dir, exc), file=sys.stderr)
             return 1

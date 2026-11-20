@@ -137,6 +137,8 @@ async def start_ingest(request: Request, user: CurrentUserDep) -> JSONResponse:
         runtime = _runtime(request)
     except StoreUnavailable:
         return _unavailable()
+    except SourceError:
+        return _unavailable()
     except ValueError as exc:
         return _value_error(exc)
     except (sqlite3.Error, OSError):
@@ -188,6 +190,8 @@ def ingest_result(job_id: str, request: Request, user: CurrentUserDep) -> JSONRe
     except IngestExpired:
         return error_response(410, "expired", "the ingest result has expired", None)
     except StoreUnavailable:
+        return _unavailable()
+    except SourceError:
         return _unavailable()
     except ValueError as exc:
         return _value_error(exc)

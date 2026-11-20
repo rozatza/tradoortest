@@ -19,6 +19,7 @@ import contextvars
 import json
 import math
 import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -151,8 +152,18 @@ class CuLedger:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"period": self.period, "used": self.used}
-        self.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        payload = json.dumps({"period": self.period, "used": self.used}) + "\n"
+        fd, name = tempfile.mkstemp(dir=self.path.parent, prefix=".birdeye-cu-", suffix=".tmp")
+        tmp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 def _period(now: int) -> str:

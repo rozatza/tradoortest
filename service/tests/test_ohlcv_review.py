@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from app.auth import LOCAL_USER_ID
 from app.main import create_app
 from app.ohlcv.adapters.any_mint import MEMORY_TTL_SECONDS, AnyMintSource
-from app.ohlcv.adapters.birdeye import BirdeyeSource
+from app.ohlcv.adapters.birdeye import BirdeyeSource, CuLedger
 from app.ohlcv.backfill import main, plan_window
 from app.ohlcv.bars import Bar
 from app.ohlcv.errors import (
@@ -624,6 +624,100 @@ def test_birdeye_rejects_non_positive_pace_and_hides_the_key() -> None:
     assert _KEY not in repr(caught.value)
 
 
+def test_resaving_a_pool_does_not_extend_it_past_resolution(tmp_path: Path) -> None:
+    """A repeat save of the same resolution cannot keep the pool for another day."""
+    t0 = 1_700_000_000
+    ttl = 24 * 60 * 60
+    clock = {"now": t0}
+    store = SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=ttl, now=lambda: clock["now"])
+    try:
+        _save_pool_at(store, t0)
+        clock["now"] = t0 + ttl - 5
+        _save_pool_at(store, t0)
+        stored = store._conn.execute(
+            "SELECT stored_at, resolved_at FROM pool_resolutions"
+        ).fetchone()
+        assert stored == (t0, t0)
+        assert store.load_pool(user_id=LOCAL_USER_ID, mint=MINT) is not None
+        clock["now"] = t0 + ttl + 5
+        assert store.load_pool(user_id=LOCAL_USER_ID, mint=MINT) is None
+        count = store._conn.execute("SELECT COUNT(*) FROM pool_resolutions").fetchone()
+    finally:
+        store.close()
+    assert count is not None
+    assert count[0] == 0
+    changed = SqliteBarStore(tmp_path / "changed.sqlite", ttl_seconds=ttl, now=lambda: clock["now"])
+    try:
+        clock["now"] = t0
+        _save_pool_at(changed, t0)
+        clock["now"] = t0 + 10
+        _save_pool_at(changed, t0 + 10)
+        moved = changed._conn.execute("SELECT stored_at FROM pool_resolutions").fetchone()
+    finally:
+        changed.close()
+    assert moved == (t0 + 10,)
+
+
+def test_unreadable_birdeye_ledger_is_503_even_when_keyless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.ohlcv.routes as routes
+
+    monkeypatch.delenv("BIRDEYE_API_KEY", raising=False)
+    database = tmp_path / "ohlcv.sqlite"
+    monkeypatch.setattr(routes, "_DEFAULT_DB", database)
+    ledger = database.parent / "birdeye-cu.json"
+    for content in ("{bad", "", "[]"):
+        ledger.write_text(content, encoding="utf-8")
+        client = TestClient(create_app(), raise_server_exceptions=False)
+        responses = (
+            client.get("/ohlcv/jobs/x"),
+            client.post("/ohlcv/jobs", json={"mints": [MINT], "timeframes": ["1h"], "days": 1}),
+        )
+        for response in responses:
+            assert response.status_code == 503, content
+            assert response.json() == {
+                "error": {
+                    "code": "store_unavailable",
+                    "message": "the local store is unavailable",
+                    "path": None,
+                }
+            }
+            assert str(ledger) not in response.text
+            assert "Traceback" not in response.text
+            assert "Internal Server Error" not in response.text
+
+
+def test_cu_ledger_reloads_from_an_atomic_write(tmp_path: Path) -> None:
+    path = tmp_path / "birdeye-cu.json"
+    now = 1_700_000_000
+    first = CuLedger(budget=100, path=path, now=lambda: now)
+    cost = first.reserve(1)
+    first.commit(cost)
+    assert first.used == cost
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    assert loaded == {"period": first.period, "used": cost}
+    second = CuLedger(budget=100, path=path, now=lambda: now)
+    assert second.used == cost
+    assert second.period == first.period
+    assert [item.name for item in tmp_path.iterdir()] == ["birdeye-cu.json"]
+
+
+def test_failed_ledger_replace_removes_the_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "birdeye-cu.json"
+    ledger = CuLedger(budget=100, path=path, now=lambda: 1_700_000_000)
+
+    def fail_replace(_src: str, _dst: str) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("app.ohlcv.adapters.birdeye.os.replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        ledger.commit(25)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_short_history_and_sparse_use_strict_boundaries() -> None:
     start = 1_700_000_000
     bar = Bar(MINT, "1h", start, 1, 1, 1, 1, 1)
@@ -658,6 +752,22 @@ def test_short_history_and_sparse_use_strict_boundaries() -> None:
         window_end=start + 4 * 3600,
     )
     assert "sparse" in thin["flags"]
+
+
+def _save_pool_at(store: SqliteBarStore, resolved_at: int) -> None:
+    store.save_pool(
+        user_id=LOCAL_USER_ID,
+        mint=MINT,
+        address="PoolHigh",
+        dex="Raydium",
+        dex_id="raydium",
+        quote_token="So11111111111111111111111111111111111111112",
+        quote_symbol="SOL",
+        liquidity_usd="50.00",
+        resolved_at=resolved_at,
+        pool_created_at=1_600_000_000,
+        provider="geckoterminal",
+    )
 
 
 def _quiet_source() -> AnyMintSource:
