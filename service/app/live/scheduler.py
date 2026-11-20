@@ -1,20 +1,24 @@
 """Paper scheduler. One background thread, one decision per closed bar.
 
 The thread is not the request event loop. ``GET /health`` does not wait for
-a tick. Each tick asks the feed for new bars, then calls ``step`` once for
-every closed real bar the cursor has not already handled. The cursor is
-``(strategy id, version, last open time)`` in the bar cache. A new scheduler
-on the same file continues after that open time, so a restart does not
-repeat a bar and does not skip one that was committed.
+a tick. Each tick asks the feed for bars the lookback does not already
+hold, then rebuilds runner memory by calling ``step`` from the initial
+state over that lookback, holes included. The cursor stores the grid origin
+and the last open time. It does not store a price.
+
+A new scheduler on the same file continues after the last open time, so a
+restart does not repeat a bar and does not skip one that was committed.
+Memory is rebuilt from the bars still in the cache, not from a saved blob.
 
 Missed slots are logged once the following bar is already closed. Until
 then the tick waits, so a bar that is only a poll late is still decided
 once. A real bar that shows up after the cursor has moved past its open
 time is logged late and is not decided. Synthetic bars are not passed to
-the runner.
+the runner as a close. A hole inside the lookback is stepped, so a cross
+cannot use a close from the other side of the gap.
 
-The book view passed to ``step`` is empty. This module records the decision
-and the runner state. It does not fill, attach an OCO, or send an order.
+The book view passed to ``step`` is empty. This module records the decision.
+It does not fill, attach an OCO, or send an order.
 """
 
 from __future__ import annotations
@@ -44,12 +48,11 @@ from app.runner import (
     BookView,
     OcoDrop,
     OcoTouch,
-    RunnerState,
+    StepResult,
     config_from_document,
     initial_state,
     step,
 )
-from app.runner.core import MemoryState
 
 logger = logging.getLogger("app.live")
 
@@ -138,11 +141,17 @@ class PaperScheduler:
         """Fetch, then decide each new closed bar. Safe to call from a test."""
         with self._lock:
             now = int(self._now())
-            for strategy in self._load():
+            strategies = self._load()
+            if self._stop.is_set():
+                return
+            errors = self._prefetch(strategies, now)
+            if errors is None:
+                return
+            for strategy in strategies:
                 if self._stop.is_set():
                     return
                 try:
-                    self._tick_one(strategy, now)
+                    self._tick_one(strategy, now, errors)
                 except Exception as exc:
                     self._record_error(strategy, 0, exc)
                     logger.warning(
@@ -222,17 +231,26 @@ class PaperScheduler:
             loaded.append(_strategy(strategy_id, version, document))
         return loaded
 
-    def _tick_one(self, strategy: PaperStrategy, now: int) -> None:
+    def _tick_one(
+        self,
+        strategy: PaperStrategy,
+        now: int,
+        fetch_errors: Mapping[tuple[str, str], BaseException],
+    ) -> None:
         step_seconds = TIMEFRAME_SECONDS[strategy.bar_size]
         closed_through = last_closed_open(now, step_seconds)
         if closed_through is None:
             return
+        for _asset_id, mint in strategy.assets:
+            failure = fetch_errors.get((mint, strategy.bar_size))
+            if failure is not None:
+                self._not_ready(strategy, closed_through, failure)
+                return
         cursor = self._store.live_cursor(
             user_id=self._user_id,
             strategy_id=strategy.strategy_id,
             version=strategy.version,
         )
-        self._refresh(strategy, cursor, closed_through, step_seconds)
         bars = self._load_bars(strategy, closed_through + step_seconds)
         asset_ids = tuple(asset_id for asset_id, _mint in strategy.assets)
         if cursor is None:
@@ -240,18 +258,9 @@ class PaperScheduler:
             if origin is None:
                 return
             next_time = origin
-            state = initial_state(asset_ids)
             last_handled: int | None = None
         else:
-            origin, last_handled, state_json = cursor
-            if _state_blank(state_json):
-                origin, state, last_handled, ready = self._rebuild_memory(
-                    strategy, bars, last_handled, step_seconds, now, asset_ids
-                )
-                if not ready:
-                    return
-            else:
-                state = _load_state(state_json, asset_ids)
+            origin, last_handled, _state_json = cursor
             next_time = last_handled + step_seconds
         decided: set[int] = set()
         while next_time <= closed_through:
@@ -262,15 +271,13 @@ class PaperScheduler:
                 break
             if kind == "missing":
                 if _following_closed(next_time, step_seconds, now):
-                    self._advance_skip(strategy, origin, next_time, state, "missed", "missing")
+                    self._advance_skip(strategy, origin, next_time, "missed", "missing")
                     last_handled = next_time
                     next_time += step_seconds
                     continue
                 break
             if kind != "real":
-                self._advance_skip(
-                    strategy, origin, next_time, state, "skipped", "synthetic_bar"
-                )
+                self._advance_skip(strategy, origin, next_time, "skipped", "synthetic_bar")
                 last_handled = next_time
                 next_time += step_seconds
                 continue
@@ -281,30 +288,13 @@ class PaperScheduler:
                 open_time=next_time,
             ):
                 self._note(strategy, next_time, "duplicate", "already evaluated")
-                saved = self._store.live_cursor(
-                    user_id=self._user_id,
-                    strategy_id=strategy.strategy_id,
-                    version=strategy.version,
-                )
-                if saved is not None:
-                    state = _load_state(saved[2], asset_ids)
                 last_handled = next_time
                 next_time += step_seconds
                 continue
             late = _following_closed(next_time, step_seconds, now)
             try:
-                result = step(
-                    config_from_document(strategy.document),
-                    state,
-                    build_window(
-                        strategy.document,
-                        asset_ids,
-                        _real_map(bars, strategy.assets),
-                        origin,
-                        next_time,
-                        step_seconds,
-                    ),
-                    BookView(),
+                result = self._replay(
+                    strategy, bars, asset_ids, next_time, step_seconds
                 )
             except Exception as exc:
                 self._record_error(strategy, next_time, exc)
@@ -315,13 +305,15 @@ class PaperScheduler:
                     next_time,
                 )
                 return
+            if result is None:
+                return
             wrote = self._store.commit_live_step(
                 user_id=self._user_id,
                 strategy_id=strategy.strategy_id,
                 version=strategy.version,
                 origin=origin,
                 open_time=next_time,
-                state_json=_dump_state(result.state),
+                state_json="",
                 decision_json=_dump_decision(result.decision),
                 log_kind="late" if late else None,
                 log_detail="following bar already closed" if late else "",
@@ -335,83 +327,54 @@ class PaperScheduler:
                 )
             if wrote:
                 decided.add(next_time)
-                state = result.state
             else:
                 self._note(strategy, next_time, "duplicate", "already evaluated")
-                saved = self._store.live_cursor(
-                    user_id=self._user_id,
-                    strategy_id=strategy.strategy_id,
-                    version=strategy.version,
-                )
-                if saved is not None:
-                    state = _load_state(saved[2], asset_ids)
             last_handled = next_time
             next_time += step_seconds
         if last_handled is not None:
             self._scan_behind(strategy, bars, last_handled, decided, step_seconds, now)
 
-    def _rebuild_memory(
+    def _replay(
         self,
         strategy: PaperStrategy,
         bars: Mapping[str, Mapping[int, Bar]],
-        last_handled: int,
-        step_seconds: int,
-        now: int,
         asset_ids: Sequence[str],
-    ) -> tuple[int, RunnerState, int, bool]:
-        """Warm up from the closed bars still in the cache.
+        open_time: int,
+        step_seconds: int,
+    ) -> StepResult | None:
+        """Rebuild memory for one bar from the lookback, holes included.
 
-        Returns ``(origin, state, last_handled, ready)``. ``ready`` is false
-        when nothing closed remains and nothing new has arrived, so the tick
-        does not walk the purged gap or step with empty memory.
+        The window starts at the lookback, not at the cursor origin, and
+        every slot up to ``open_time`` is stepped from the initial state.
+        A missing slot is a hole. Nothing carried from before the window
+        is used. ``None`` means the tick was asked to stop.
         """
-        real = _real_times(bars, step_seconds, now)
-        past = [open_time for open_time in real if open_time <= last_handled]
-        future = [open_time for open_time in real if open_time > last_handled]
+        needed = _bars_needed(strategy)
+        window_origin = _lookback_origin(open_time, step_seconds, needed)
         state = initial_state(asset_ids)
-        if past:
-            origin = past[0]
-            for open_time in past:
-                if self._stop.is_set():
-                    return origin, state, last_handled, False
-                result = step(
-                    config_from_document(strategy.document),
-                    state,
-                    build_window(
-                        strategy.document,
-                        asset_ids,
-                        _real_map(bars, strategy.assets),
-                        origin,
-                        open_time,
-                        step_seconds,
-                    ),
-                    BookView(),
-                )
-                state = result.state
-            self._store.replace_live_cursor(
-                user_id=self._user_id,
-                strategy_id=strategy.strategy_id,
-                version=strategy.version,
-                origin=origin,
-                last_open_time=last_handled,
-                state_json=_dump_state(state),
+        config = config_from_document(strategy.document)
+        mapped = _real_map(bars, strategy.assets)
+        result: StepResult | None = None
+        slot = window_origin
+        while slot <= open_time:
+            if self._stop.is_set():
+                return None
+            result = step(
+                config,
+                state,
+                build_window(
+                    strategy.document,
+                    asset_ids,
+                    mapped,
+                    window_origin,
+                    slot,
+                    step_seconds,
+                ),
+                BookView(),
             )
-            return origin, state, last_handled, True
-        if not future:
-            return last_handled, state, last_handled, False
-        origin = future[0]
-        jump = origin - step_seconds
-        if jump < last_handled:
-            jump = last_handled
-        self._store.replace_live_cursor(
-            user_id=self._user_id,
-            strategy_id=strategy.strategy_id,
-            version=strategy.version,
-            origin=origin,
-            last_open_time=jump,
-            state_json="",
-        )
-        return origin, state, jump, True
+            state = result.state
+            slot += step_seconds
+        return result
 
     def _record_error(self, strategy: PaperStrategy, open_time: int, exc: BaseException) -> None:
         message = " ".join(str(exc).split())
@@ -433,32 +396,67 @@ class PaperScheduler:
                 strategy.version,
             )
 
-    def _refresh(
-        self,
-        strategy: PaperStrategy,
-        cursor: tuple[int, int, str] | None,
-        closed_through: int,
-        step_seconds: int,
-    ) -> None:
-        if cursor is None:
-            count = strategy.warmup_bars + 1
-            start = closed_through - (count - 1) * step_seconds
-        else:
-            start = cursor[1]
-        end = closed_through + step_seconds
-        if start < 0:
-            start = 0
-        if start > end:
-            start = end
-        for _asset_id, mint in strategy.assets:
+    def _prefetch(
+        self, strategies: Sequence[PaperStrategy], now: int
+    ) -> dict[tuple[str, str], BaseException] | None:
+        """Fetch each missing lookback once. ``None`` means the tick stopped.
+
+        One call per mint and timeframe. The window is the union of the
+        spans those strategies still need. A provider error is recorded and
+        the strategy later goes not-ready. An empty page is not an error.
+        """
+        spans: dict[tuple[str, str], tuple[int, int]] = {}
+        for strategy in strategies:
+            if self._stop.is_set():
+                return None
+            step_seconds = TIMEFRAME_SECONDS[strategy.bar_size]
+            closed_through = last_closed_open(now, step_seconds)
+            if closed_through is None:
+                continue
+            cursor = self._store.live_cursor(
+                user_id=self._user_id,
+                strategy_id=strategy.strategy_id,
+                version=strategy.version,
+            )
+            bars = self._load_bars(strategy, closed_through + step_seconds)
+            start = _fetch_start(strategy, bars, cursor, closed_through, step_seconds, now)
+            end = closed_through + step_seconds
+            for _asset_id, mint in strategy.assets:
+                key = (mint, strategy.bar_size)
+                previous = spans.get(key)
+                if previous is None:
+                    spans[key] = (start, end)
+                else:
+                    spans[key] = (min(previous[0], start), max(previous[1], end))
+        errors: dict[tuple[str, str], BaseException] = {}
+        for (mint, timeframe), (start, end) in spans.items():
+            if self._stop.is_set():
+                return None
             try:
-                self._feed.fetch(mint, strategy.bar_size, start, end)
-            except SourceError:
+                self._feed.fetch(mint, timeframe, start, end)
+            except SourceError as exc:
+                if self._stop.is_set() or str(exc) == "stopped":
+                    return None
+                errors[(mint, timeframe)] = exc
                 logger.warning(
                     "live feed failed mint=%s timeframe=%s",
                     mint,
-                    strategy.bar_size,
+                    timeframe,
                 )
+        return errors
+
+    def _not_ready(
+        self, strategy: PaperStrategy, open_time: int, exc: BaseException
+    ) -> None:
+        """Record a failed re-fetch. The cursor stays put and no bar is decided."""
+        self._record_error(strategy, open_time, exc)
+        self._note(strategy, open_time, "not_ready", type(exc).__name__)
+        logger.warning(
+            "live feed not ready strategy_id=%s version=%s open_time=%s",
+            strategy.strategy_id,
+            strategy.version,
+            open_time,
+        )
 
     def _load_bars(
         self, strategy: PaperStrategy, end: int
@@ -480,7 +478,6 @@ class PaperScheduler:
         strategy: PaperStrategy,
         origin: int,
         open_time: int,
-        state: RunnerState,
         kind: str,
         detail: str,
     ) -> None:
@@ -490,7 +487,7 @@ class PaperScheduler:
             version=strategy.version,
             origin=origin,
             open_time=open_time,
-            state_json=_dump_state(state),
+            state_json="",
             log_kind=kind,
             log_detail=detail,
         )
@@ -570,22 +567,6 @@ def _closed_bar(bar: Bar, step_seconds: int, now: int) -> bool:
 def _following_closed(open_time: int, step_seconds: int, now: int) -> bool:
     """True once the bar after ``open_time`` is closed, including the grace."""
     return bar_is_closed(open_time + step_seconds, step_seconds, now)
-
-
-def _state_blank(text: str) -> bool:
-    return text.strip() in {"", "null", "[]"}
-
-
-def _real_times(
-    bars: Mapping[str, Mapping[int, Bar]], step_seconds: int, now: int
-) -> list[int]:
-    found: set[int] = set()
-    for by_time in bars.values():
-        for open_time, bar in by_time.items():
-            if bar.synthetic or not _closed_bar(bar, step_seconds, now):
-                continue
-            found.add(open_time)
-    return sorted(found)
 
 
 def _classify(
@@ -672,40 +653,86 @@ def _strategy(strategy_id: str, version: int, document: Mapping[str, Any]) -> Pa
     )
 
 
-def _dump_state(state: RunnerState) -> str:
-    payload = []
-    for asset_id, memory in state.memory:
-        payload.append(
-            {
-                "asset_id": asset_id,
-                "cross_prev": [
-                    [list(path), [left, right]] for path, (left, right) in memory.cross_prev
-                ],
-                "since": [[list(path), count] for path, count in memory.since],
-            }
-        )
-    return json.dumps(payload, separators=(",", ":"))
+def _positive_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 0
+    return value
 
 
-def _load_state(text: str, asset_ids: Sequence[str]) -> RunnerState:
-    raw = json.loads(text)
-    by_id: dict[str, MemoryState] = {}
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            cross = tuple(
-                (tuple(str(part) for part in path), (pair[0], pair[1]))
-                for path, pair in item.get("cross_prev", [])
-            )
-            since = tuple(
-                (tuple(str(part) for part in path), count)
-                for path, count in item.get("since", [])
-            )
-            by_id[str(item.get("asset_id", ""))] = MemoryState(cross, since)
-    return RunnerState(
-        tuple((asset_id, by_id.get(asset_id, MemoryState())) for asset_id in asset_ids)
-    )
+def _series_lookback(spec: Mapping[str, Any]) -> int:
+    """Samples an indicator needs before its previous bar can be finite."""
+    params = spec.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    kind = str(spec.get("indicator") or "")
+    period = _positive_int(params.get("period"))
+    fast = _positive_int(params.get("fast"))
+    slow = _positive_int(params.get("slow"))
+    signal = _positive_int(params.get("signal"))
+    k_period = _positive_int(params.get("k_period"))
+    d_period = _positive_int(params.get("d_period"))
+    if kind == "macd":
+        return slow + signal
+    if kind == "stochastic":
+        return k_period + d_period
+    if kind in {"rsi", "atr"}:
+        return period + 1
+    return max(period, fast, slow, signal, k_period, d_period)
+
+
+def _bars_needed(strategy: PaperStrategy) -> int:
+    """Closed bars required to warm the strategy and one previous bar."""
+    span = strategy.warmup_bars
+    series = strategy.document.get("derived_series")
+    if isinstance(series, list):
+        for spec in series:
+            if isinstance(spec, dict):
+                span = max(span, _series_lookback(spec))
+    return span + 1
+
+
+def _lookback_origin(open_time: int, step_seconds: int, needed: int) -> int:
+    start = open_time - (needed - 1) * step_seconds
+    if start < 0:
+        return 0
+    return start
+
+
+def _slot_real(
+    bars: Mapping[str, Mapping[int, Bar]],
+    asset_id: str,
+    open_time: int,
+    step_seconds: int,
+    now: int,
+) -> bool:
+    bar = bars[asset_id].get(open_time)
+    return bar is not None and not bar.synthetic and _closed_bar(bar, step_seconds, now)
+
+
+def _fetch_start(
+    strategy: PaperStrategy,
+    bars: Mapping[str, Mapping[int, Bar]],
+    cursor: tuple[int, int, str] | None,
+    closed_through: int,
+    step_seconds: int,
+    now: int,
+) -> int:
+    """First open time the provider still needs to cover, once per asset."""
+    needed = _bars_needed(strategy)
+    lookback = _lookback_origin(closed_through, step_seconds, needed)
+    missing: int | None = None
+    for asset_id, _mint in strategy.assets:
+        slot = lookback
+        while slot <= closed_through:
+            if not _slot_real(bars, asset_id, slot, step_seconds, now):
+                missing = slot if missing is None else min(missing, slot)
+                break
+            slot += step_seconds
+    if missing is not None:
+        return missing
+    if cursor is None:
+        return lookback
+    return cursor[1]
 
 
 def _dump_decision(decision: BarDecision) -> str:

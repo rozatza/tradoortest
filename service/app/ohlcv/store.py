@@ -102,10 +102,10 @@ CREATE TABLE IF NOT EXISTS ingest_results (
 
 # Live-feed rows. Payloads, decisions, the bar log, conflicts, and errors
 # are provider data or a copy of a close, so they use the same purge as the
-# bars. ``live_cursors.state_json`` holds runner memory, including previous
-# closes, and expires on that clock too. ``last_open_time`` and the
-# registration stay so a restart does not decide a bar again and does not
-# drop the strategy IR.
+# bars. ``live_cursors.state_json`` is kept blank: the scheduler rebuilds
+# runner memory from bars and does not persist a price on the cursor.
+# ``last_open_time`` and the registration stay so a restart does not decide
+# a bar again and does not drop the strategy IR.
 _LIVE_TABLES = """
 CREATE TABLE IF NOT EXISTS live_payloads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1122,7 +1122,7 @@ class SqliteBarStore:
                     version,
                     origin,
                     open_time,
-                    str(existing[0]),
+                    "",
                     stored_at,
                 )
                 if log_kind:

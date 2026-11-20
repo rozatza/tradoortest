@@ -24,14 +24,16 @@ from app.live.feed import (
     last_closed_open,
 )
 from app.live.scheduler import PaperScheduler, register_paper_strategy
+from app.live.series import build_window
 from app.main import app, create_app
 from app.ohlcv.adapters.birdeye import BirdeyeSource
 from app.ohlcv.adapters.geckoterminal import GeckoTerminalSource
 from app.ohlcv.bars import Bar
-from app.ohlcv.errors import SourceError
+from app.ohlcv.errors import RateLimitExhausted, SourceError
 from app.ohlcv.registry import SOL_MINT
 from app.ohlcv.source import FetchResult
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
+from app.runner import BookView, config_from_document, initial_state
 from app.runner import step as real_step
 
 _STEP = 60
@@ -823,8 +825,7 @@ def test_purged_memory_keeps_no_prices_and_the_next_tick_warms_up(
         scheduler.tick()
         cursor = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
         assert cursor is not None
-        prices = set(re.findall(r"\d+\.\d+", cursor[2]))
-        assert "10.8" in prices
+        assert _cursor_price_floats(tmp_path / "ohlcv.sqlite") == []
         clock["now"] += MAX_CACHE_TTL_SECONDS
         assert (
             store.load(
@@ -840,8 +841,9 @@ def test_purged_memory_keeps_no_prices_and_the_next_tick_warms_up(
         assert kept is not None and kept[1] == last
         assert store.live_registrations(user_id=LOCAL_USER_ID)
         blob = "\n".join(_table_cells(tmp_path / "ohlcv.sqlite"))
-        for price in prices:
-            assert price not in blob
+        for close in closes:
+            assert str(close) not in blob
+        assert _cursor_price_floats(tmp_path / "ohlcv.sqlite") == []
         end = last_closed_open(clock["now"], _STEP)
         assert end is not None and end > last
         opens = [end - index * _STEP for index in range(3, -1, -1)]
@@ -857,6 +859,7 @@ def test_purged_memory_keeps_no_prices_and_the_next_tick_warms_up(
         assert seen[:3] == [0, 1, 2]
         assert any(index >= 3 for index in seen)
         assert all(index >= 3 for index in decided_at)
+        assert _cursor_price_floats(tmp_path / "ohlcv.sqlite") == []
     finally:
         store.close()
 
@@ -1002,6 +1005,365 @@ def test_retry_backoff_waits_on_the_stop_event() -> None:
     assert not worker.is_alive()
     assert calls["n"] < 5
     assert str(outcome["error"]) == "stopped"
+
+
+def _cursor_price_floats(path: Path) -> list[str]:
+    """Decimal tokens stored on the cursor. A blank state has none."""
+    connection = sqlite3.connect(path)
+    try:
+        rows = connection.execute("SELECT state_json FROM live_cursors").fetchall()
+    finally:
+        connection.close()
+    found: list[str] = []
+    for (text,) in rows:
+        found.extend(re.findall(r"\d+\.\d+", "" if text is None else str(text)))
+    return found
+
+
+_ORIGIN = 1_699_920_000
+
+
+def _lit_cross(bar_size: str, threshold: float) -> dict:
+    document = _paper(bar_size)
+    document["signals"] = [
+        {
+            "id": "go",
+            "expr": {
+                "op": "cross_above",
+                "args": [
+                    {"op": "ref", "name": "close"},
+                    {"op": "lit", "value": threshold},
+                ],
+            },
+        }
+    ]
+    return document
+
+
+def _sma_cross(bar_size: str, period: int) -> dict:
+    document = _paper(bar_size)
+    document["engine"]["warmup_bars"] = period
+    document["derived_series"] = [
+        {
+            "id": "sma_slow",
+            "kind": "indicator",
+            "indicator": "sma",
+            "source": "close",
+            "params": {"period": period},
+        }
+    ]
+    document["signals"] = [
+        {
+            "id": "go",
+            "expr": {
+                "op": "cross_above",
+                "args": [
+                    {"op": "ref", "name": "close"},
+                    {"op": "ref", "name": "sma_slow"},
+                ],
+            },
+        }
+    ]
+    return document
+
+
+def _rule_fired(payload: dict) -> bool:
+    return any(rule.get("close") is not None for rule in payload.get("rules", []))
+
+
+def test_a_gap_does_not_fire_a_cross_from_pre_gap_memory(tmp_path: Path) -> None:
+    """1h and 4h outages must not let a both-finite cross use the pre-gap close."""
+    cases = (
+        ("1h", 3600, 30, [10.0, 10.05, 10.1, 10.2, 10.25], 10.3, 11.0),
+        ("4h", 14400, 9, [500.0, 500.01, 500.02], 500.5, 501.0),
+    )
+    for timeframe, step, gap_ticks, closes, threshold, new_close in cases:
+        root = tmp_path / f"lit-{timeframe}"
+        root.mkdir()
+        clock = {"now": _ORIGIN + step + CLOSE_GRACE_SECONDS}
+        store = _store(root, clock)
+        scheduler = _scheduler(store, _Quiet(), clock)
+        register_paper_strategy(scheduler, "sol-paper", 1, _lit_cross(timeframe, threshold))
+        path = root / "ohlcv.sqlite"
+        try:
+            for index, close in enumerate(closes):
+                open_time = _ORIGIN + index * step
+                clock["now"] = open_time + step + CLOSE_GRACE_SECONDS
+                store.upsert(
+                    [_bar(open_time, timeframe=timeframe, close=close)],
+                    user_id=LOCAL_USER_ID,
+                )
+                scheduler.tick()
+                assert _cursor_price_floats(path) == []
+                decided = _decisions(store)
+                assert decided
+                assert _rule_fired(decided[-1][1]) is False
+            for _tick in range(gap_ticks):
+                clock["now"] += step
+                scheduler.tick()
+                assert _cursor_price_floats(path) == []
+            cursor = store.live_cursor(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            assert cursor is not None
+            before = {open_time for open_time, _payload in _decisions(store)}
+            stamp = cursor[1] + step
+            clock["now"] = stamp + step + CLOSE_GRACE_SECONDS
+            store.upsert(
+                [_bar(stamp, timeframe=timeframe, close=new_close)],
+                user_id=LOCAL_USER_ID,
+            )
+            scheduler.tick()
+            assert _cursor_price_floats(path) == []
+            fresh = [
+                payload
+                for open_time, payload in _decisions(store)
+                if open_time not in before
+            ]
+            assert fresh
+            assert all(_rule_fired(payload) is False for payload in fresh)
+            for payload in fresh:
+                assert all(signal["is_true"] is False for signal in payload["signals"])
+        finally:
+            store.close()
+
+    # The sma probe: six rising bars after a 30h 1h gap must not fire either.
+    root = tmp_path / "sma-1h"
+    root.mkdir()
+    step = 3600
+    clock = {"now": _ORIGIN + step + CLOSE_GRACE_SECONDS}
+    store = _store(root, clock)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    register_paper_strategy(scheduler, "sol-paper", 1, _sma_cross("1h", 3))
+    path = root / "ohlcv.sqlite"
+    try:
+        for index, close in enumerate([10.0, 10.2, 10.4, 10.3, 10.25]):
+            open_time = _ORIGIN + index * step
+            clock["now"] = open_time + step + CLOSE_GRACE_SECONDS
+            store.upsert(
+                [_bar(open_time, timeframe="1h", close=close)],
+                user_id=LOCAL_USER_ID,
+            )
+            scheduler.tick()
+            assert _cursor_price_floats(path) == []
+        for _tick in range(30):
+            clock["now"] += step
+            scheduler.tick()
+            assert _cursor_price_floats(path) == []
+        cursor = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert cursor is not None
+        before = {open_time for open_time, _payload in _decisions(store)}
+        for index, close in enumerate([11.0, 11.2, 11.4, 11.5, 11.6, 11.8]):
+            stamp = cursor[1] + (index + 1) * step
+            clock["now"] = stamp + step + CLOSE_GRACE_SECONDS
+            store.upsert(
+                [_bar(stamp, timeframe="1h", close=close)],
+                user_id=LOCAL_USER_ID,
+            )
+        scheduler.tick()
+        assert _cursor_price_floats(path) == []
+        fresh = [payload for open_time, payload in _decisions(store) if open_time not in before]
+        assert fresh
+        assert all(_rule_fired(payload) is False for payload in fresh)
+    finally:
+        store.close()
+
+
+class _History:
+    """Serves a fixed series for whatever window the scheduler asks for."""
+
+    def __init__(self, store: SqliteBarStore, bars: list[Bar], clock: dict[str, int]) -> None:
+        self.store = store
+        self.bars = bars
+        self.clock = clock
+        self.calls: list[tuple[int, int, int]] = []
+
+    def fetch(self, mint: str, timeframe: str, start: int, end: int) -> list[Bar]:
+        self.calls.append((self.clock["now"], start, end))
+        chosen = [
+            bar
+            for bar in self.bars
+            if bar.timeframe == timeframe and start <= bar.open_time < end
+        ]
+        if chosen:
+            self.store.upsert(chosen, user_id=LOCAL_USER_ID)
+        return chosen
+
+    def close(self) -> None:
+        return None
+
+
+def _wave(index: int) -> float:
+    """Deterministic swing so a close can cross its SMA."""
+    if (index // 8) % 2:
+        return 120.0 - (index % 8) * 0.7
+    return 100.0 + (index % 8) * 0.7
+
+
+def _walk_decisions(document: dict, bars: list[Bar], step: int) -> dict[int, object]:
+    """The backtester's per-bar decision: ``step`` from the first bar, holes included."""
+    origin = bars[0].open_time
+    by_time = {bar.open_time: bar for bar in bars}
+    config = config_from_document(document)
+    state = initial_state(("sol",))
+    found: dict[int, object] = {}
+    slot = origin
+    while slot <= bars[-1].open_time:
+        window = build_window(document, ("sol",), {"sol": by_time}, origin, slot, step)
+        result = real_step(config, state, window, BookView())
+        state = result.state
+        found[slot] = result.decision
+        slot += step
+    return found
+
+
+def _decision_signature(decision: object) -> tuple:
+    signals = tuple(
+        (item.signal_id, item.asset_id, item.is_true) for item in decision.signals  # type: ignore[attr-defined]
+    )
+    rules = tuple(
+        (
+            rule.action_id,
+            rule.skip,
+            None if rule.close is None else format(rule.close, "f"),
+        )
+        for rule in decision.rules  # type: ignore[attr-defined]
+    )
+    return signals, rules
+
+
+def _payload_signature(payload: dict) -> tuple:
+    signals = tuple(
+        (item["signal_id"], item["asset_id"], item["is_true"]) for item in payload["signals"]
+    )
+    rules = tuple((item["action_id"], item["skip"], item["close"]) for item in payload["rules"])
+    return signals, rules
+
+
+def test_long_lookback_stays_ready_past_48h_and_matches_the_backtest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.backtest.engine import run_backtest
+
+    cases = (
+        ("1h", 3600, 50, 48),
+        ("4h", 14400, 20, 12),
+    )
+    for timeframe, step, period, extra in cases:
+        total = period + extra
+        bars = [
+            _bar(_ORIGIN + index * step, timeframe=timeframe, close=_wave(index))
+            for index in range(total + 1)
+        ]
+        clock = {"now": _ORIGIN + step + CLOSE_GRACE_SECONDS}
+        root = tmp_path / timeframe
+        root.mkdir()
+        store = _store(root, clock, ttl=MAX_CACHE_TTL_SECONDS)
+        feed = _History(store, bars, clock)
+        scheduler = _scheduler(store, feed, clock)
+        document = _sma_cross(timeframe, period)
+        register_paper_strategy(scheduler, "sol-paper", 1, document)
+        finite = {"late": False}
+        cutoff = _ORIGIN + 48 * 3600
+
+        def spy(config, state, window, view, *, _cutoff=cutoff):
+            value = window.series["sol"]["sma_slow"][window.t]
+            if window.open_time >= _cutoff and value == value and abs(value) != float("inf"):
+                finite["late"] = True
+            return real_step(config, state, window, view)
+
+        monkeypatch.setattr("app.live.scheduler.step", spy)
+        expected = _walk_decisions(document, bars, step)
+        seen: set[int] = set()
+        live_closes: set[int] = set()
+        try:
+            for index in range(total + 1):
+                clock["now"] = _ORIGIN + index * step + step + CLOSE_GRACE_SECONDS
+                scheduler.tick()
+                assert _cursor_price_floats(root / "ohlcv.sqlite") == []
+                for open_time, payload in _decisions(store):
+                    if open_time in seen:
+                        continue
+                    assert _payload_signature(payload) == _decision_signature(expected[open_time])
+                    if _rule_fired(payload):
+                        live_closes.add(open_time)
+                    seen.add(open_time)
+            assert seen == {bar.open_time for bar in bars}
+            result = run_backtest(document, {"sol": bars})
+            for fill in result.fills:
+                if fill.leg == "market":
+                    assert fill.open_time in live_closes
+            assert finite["late"] is True
+            wide = [
+                end - start
+                for now, start, end in feed.calls
+                if now >= _ORIGIN + 24 * 3600 + step
+            ]
+            assert wide
+            assert max(wide) >= period * step
+        finally:
+            monkeypatch.setattr("app.live.scheduler.step", real_step)
+            store.close()
+
+
+class _FailFeed:
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def fetch(self, mint: str, timeframe: str, start: int, end: int) -> list[Bar]:
+        self.calls += 1
+        raise self.exc
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_failed_refetch_is_not_ready_and_decides_nothing(tmp_path: Path) -> None:
+    failures = (
+        SourceError("gecko down"),
+        RateLimitExhausted("Birdeye rate limit exhausted"),
+    )
+    for index, exc in enumerate(failures):
+        root = tmp_path / f"fail-{index}"
+        root.mkdir()
+        step = 3600
+        last = _ORIGIN + 50 * step
+        clock = {"now": last + step + CLOSE_GRACE_SECONDS}
+        store = _store(root, clock)
+        feed = _FailFeed(exc)
+        scheduler = _scheduler(store, feed, clock)
+        register_paper_strategy(scheduler, "sol-paper", 1, _sma_cross("1h", 50))
+        try:
+            scheduler.tick()
+            scheduler.tick()
+            errors = store.live_errors(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            log = store.live_bar_log(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            stored = store.load(
+                user_id=LOCAL_USER_ID,
+                mint=SOL_MINT,
+                timeframe="1h",
+                start=0,
+                end=clock["now"] + step,
+            )
+            cursor = store.live_cursor(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            decided = _decisions(store)
+        finally:
+            store.close()
+        assert decided == []
+        assert feed.calls == 2
+        assert errors
+        assert all(row[1] == type(exc).__name__ for row in errors)
+        assert any(kind == "not_ready" for _open, kind, _detail in log)
+        assert stored == []
+        assert cursor is None
+        assert _cursor_price_floats(root / "ohlcv.sqlite") == []
 
 
 def test_live_package_has_no_broker_or_wallet_code() -> None:
