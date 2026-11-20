@@ -11,6 +11,9 @@ This client does not go faster than 1 request per second, and it refuses
 the next call when the configured budget cannot pay for it. The default
 budget is 30,000. ``padding`` is always false, so empty candles are not
 copied forward. ``outlier`` is false, so a candle is not dropped for us.
+Retries use the same bounded backoff as GeckoTerminal. ``rng`` adds jitter,
+and a numeric ``Retry-After`` on HTTP 429 is honored. Omitting ``rng``
+keeps the unjittered backoff.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import httpx
 from app.ohlcv.adapters.geckoterminal import _Pace
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection
 from app.ohlcv.errors import ComputeBudgetExceeded, RateLimitExhausted, SourceError
+from app.ohlcv.retry import retry_delay
 from app.ohlcv.source import FetchPage, FetchResult
 
 _UNSET = object()
@@ -187,6 +191,8 @@ class BirdeyeSource:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], int] | None = None,
+        rng: Callable[[], float] | None = None,
+        payloads: list[bytes] | None = None,
     ) -> None:
         if isinstance(min_interval, bool) or not isinstance(min_interval, (int, float)):
             raise ValueError("Birdeye pace must be a number of seconds")
@@ -206,6 +212,8 @@ class BirdeyeSource:
         self._client = client
         self._owns_client = client is None
         self._sleep = sleep
+        self._rng = rng
+        self.payloads = payloads
         self._pace = _Pace(float(min_interval), sleep, monotonic)
         self.ledger = CuLedger(budget, path=ledger_path, now=now)
 
@@ -282,14 +290,14 @@ class BirdeyeSource:
             except httpx.TimeoutException as exc:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("Birdeye request timed out") from None
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 del exc
                 continue
             except httpx.TransportError as exc:
                 if isinstance(exc, _NO_RETRY) or attempt == _ATTEMPTS - 1:
                     raise SourceError("Birdeye request failed") from None
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.HTTPError:
@@ -300,7 +308,7 @@ class BirdeyeSource:
                     if response.status_code == 429:
                         raise RateLimitExhausted("Birdeye rate limit exhausted")
                     raise SourceError(f"Birdeye returned HTTP {response.status_code}")
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, response, response.status_code))
                 backoff = min(backoff * 2, 120.0)
                 continue
             if response.status_code != 200:
@@ -311,8 +319,15 @@ class BirdeyeSource:
                 raise SourceError("Birdeye returned a body that is not JSON") from None
             if not isinstance(payload, dict):
                 raise SourceError("Birdeye returned a body that is not a JSON object")
+            if self.payloads is not None:
+                self.payloads.append(bytes(response.content))
             return payload
         raise SourceError(f"Birdeye returned HTTP {last_status}")
+
+    def _retry_sleep(
+        self, backoff: float, response: httpx.Response | None, status: int | None
+    ) -> float:
+        return retry_delay(backoff, rng=self._rng, response=response, status=status)
 
     def begin_run(self) -> contextvars.Token[list[int] | None]:
         """Start a fresh call cap for this ingest. The monthly ledger is not reset."""

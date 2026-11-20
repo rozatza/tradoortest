@@ -1,0 +1,726 @@
+"""Live bar feed and paper scheduler. Sockets stay blocked; feeds are mocks."""
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+import threading
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from app.auth import LOCAL_USER_ID
+from app.live.feed import LiveFeed, bar_is_closed, closed_real_bars, last_closed_open
+from app.live.scheduler import PaperScheduler, register_paper_strategy
+from app.main import app, create_app
+from app.ohlcv.adapters.birdeye import BirdeyeSource
+from app.ohlcv.adapters.geckoterminal import GeckoTerminalSource
+from app.ohlcv.bars import Bar
+from app.ohlcv.errors import SourceError
+from app.ohlcv.registry import SOL_MINT
+from app.ohlcv.source import FetchResult
+from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
+from app.runner import step as real_step
+
+_STEP = 60
+_T0 = 1_700_000_040
+_DAY = 86_400
+_DAY_OPEN = 1_699_920_000
+_KEY = "test-birdeye-key"
+
+
+def _bar(
+    open_time: int,
+    *,
+    synthetic: bool = False,
+    timeframe: str = "1m",
+    close: float = 1.5,
+) -> Bar:
+    if synthetic:
+        return Bar(SOL_MINT, timeframe, open_time, close, close, close, close, 0.0, True)
+    return Bar(SOL_MINT, timeframe, open_time, close, close + 0.1, close - 0.1, close, 2.0, False)
+
+
+def _paper(bar_size: str = "1m") -> dict:
+    return {
+        "ir_version": "1.0",
+        "strategy": {"id": "hand", "name": "Hand"},
+        "engine": {
+            "bar_size": bar_size,
+            "event": "bar_close",
+            "fill_price_mode": "on_close",
+            "warmup_bars": 0,
+        },
+        "capital": {"initial": 10000, "currency": "USDC"},
+        "costs": {"commission_bps": 0, "slippage_bps": 0},
+        "assets": [
+            {
+                "id": "sol",
+                "symbol": "SOL",
+                "chain": "solana",
+                "market": "spot",
+                "quote": "USDC",
+            }
+        ],
+        "derived_series": [],
+        "signals": [{"id": "go", "expr": {"op": "lit", "value": True}}],
+        "actions": [
+            {
+                "id": "enter_sol",
+                "type": "enter",
+                "side": "long",
+                "asset": "sol",
+                "order": {"type": "market"},
+                "sizing": {"mode": "percent_equity", "percent": 100},
+                "risk": {
+                    "type": "oco",
+                    "evaluation": "on_entry_fill",
+                    "movement": "tighten_only",
+                    "take_profit": {"mode": "percent", "percent": 6},
+                    "stop_loss": {"mode": "percent", "percent": 3},
+                },
+            }
+        ],
+        "rules": [{"id": "enter_rule", "when": "go", "do": "enter_sol"}],
+        "portfolio": {
+            "mode": "spot",
+            "direction": "long_only",
+            "chain": "solana",
+            "max_positions": 1,
+            "allow_pyramiding": False,
+            "quote_currency": "USDC",
+        },
+    }
+
+
+class _Quiet:
+    """No HTTP. Bars under test are already in the store."""
+
+    def fetch(self, mint: str, timeframe: str, start: int, end: int) -> list[Bar]:
+        return []
+
+    def close(self) -> None:
+        return None
+
+
+class _Scripted:
+    name = "geckoterminal"
+    enabled = True
+
+    def __init__(
+        self, result: FetchResult | None = None, *, error: BaseException | None = None
+    ) -> None:
+        self._result = result or FetchResult([], [])
+        self._error = error
+        self.calls = 0
+        self.payloads: list[bytes] = []
+
+    def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+        self.calls += 1
+        self.payloads.append(b'{"synthetic":true}')
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+    def close(self) -> None:
+        return None
+
+
+def _store(
+    tmp_path: Path, clock: dict[str, int], *, ttl: int = MAX_CACHE_TTL_SECONDS
+) -> SqliteBarStore:
+    return SqliteBarStore(tmp_path / "ohlcv.sqlite", ttl_seconds=ttl, now=lambda: clock["now"])
+
+
+def _scheduler(store: SqliteBarStore, feed: object, clock: dict[str, int]) -> PaperScheduler:
+    return PaperScheduler(store, feed, now=lambda: clock["now"], interval=3600)
+
+
+def _register(scheduler: PaperScheduler, *, version: int = 1, bar_size: str = "1m") -> None:
+    register_paper_strategy(scheduler, "sol-paper", version, _paper(bar_size))
+
+
+def _decisions(store: SqliteBarStore, version: int = 1) -> list[tuple[int, dict]]:
+    rows = store.live_decisions(
+        user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=version
+    )
+    return [(open_time, json.loads(payload)) for open_time, payload in rows]
+
+
+def _client(handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def _candle(open_time: int, close: float = 1.5) -> list[float]:
+    return [open_time, close, close + 0.1, close - 0.1, close, 2.0]
+
+
+def _gecko_json(candles: list[list[float]]) -> dict:
+    return {"data": {"attributes": {"ohlcv_list": candles}}}
+
+
+def test_closed_bar_rule_uses_the_injected_clock() -> None:
+    step = _STEP
+    assert _T0 % step == 0
+    assert bar_is_closed(_T0, step, _T0 + step)
+    assert not bar_is_closed(_T0, step, _T0 + step - 1)
+    assert last_closed_open(_T0 + 150, step) == _T0 + step
+    forming = _bar(_T0 + 2 * step)
+    closed = _bar(_T0)
+    kept = closed_real_bars([forming, closed, _bar(_T0 + step, synthetic=True)], "1m", _T0 + 150)
+    assert [bar.open_time for bar in kept] == [_T0]
+
+
+def test_gecko_is_primary_and_birdeye_without_a_key_is_not_called(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    called = {"birdeye": 0}
+
+    class _Off(BirdeyeSource):
+        def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+            called["birdeye"] += 1
+            raise AssertionError("birdeye was called")
+
+    disabled = _Off(api_key=None, client=_client(lambda _request: httpx.Response(500)))
+    assert disabled.enabled is False
+    primary = _Scripted(FetchResult([_bar(_T0)], []))
+    feed = LiveFeed(store, primary, disabled, now=lambda: clock["now"])
+    try:
+        bars = feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+        bodies = store.live_payload_bodies(user_id=LOCAL_USER_ID)
+    finally:
+        store.close()
+    assert called["birdeye"] == 0
+    assert primary.calls == 1
+    assert [bar.open_time for bar in bars] == [_T0]
+    assert bodies == ['{"synthetic":true}']
+
+
+def test_disabled_birdeye_is_not_called_when_gecko_fails(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    disabled = BirdeyeSource(api_key="  ", client=_client(lambda _request: httpx.Response(500)))
+    assert disabled.enabled is False
+
+    def boom(mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+        raise AssertionError("birdeye was called")
+
+    disabled.fetch_bars = boom  # type: ignore[method-assign]
+    primary = _Scripted(error=SourceError("GeckoTerminal returned HTTP 503"))
+    feed = LiveFeed(store, primary, disabled, now=lambda: clock["now"])
+    try:
+        with pytest.raises(SourceError, match="HTTP 503"):
+            feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+    finally:
+        store.close()
+    assert primary.calls == 1
+
+
+def test_birdeye_is_the_fallback_only_after_gecko_fails(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        seen["key"] = request.headers.get("X-API-KEY", "")
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "items": [
+                        {
+                            "o": 1.5,
+                            "h": 1.6,
+                            "l": 1.4,
+                            "c": 1.5,
+                            "v": 2.0,
+                            "unix_time": _T0,
+                        }
+                    ]
+                }
+            },
+        )
+
+    fallback = BirdeyeSource(
+        api_key=_KEY,
+        client=_client(handler),
+        min_interval=1,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+        payloads=[],
+    )
+    primary = _Scripted(error=SourceError("GeckoTerminal returned HTTP 503"))
+    feed = LiveFeed(store, primary, fallback, now=lambda: clock["now"])
+    try:
+        bars = feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+        bodies = store.live_payload_bodies(user_id=LOCAL_USER_ID)
+    finally:
+        fallback.close()
+        store.close()
+    assert primary.calls == 1
+    assert seen["host"] == "public-api.birdeye.so"
+    assert seen["key"] == _KEY
+    assert [bar.open_time for bar in bars] == [_T0]
+    assert bodies
+    assert _KEY not in bodies[0]
+    assert _KEY not in repr(fallback)
+
+
+def test_retry_after_and_attempt_cap_are_bounded(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "5"},
+                json={"message": "secret-token-should-not-leak"},
+            )
+        return httpx.Response(200, json=_gecko_json([_candle(_T0)]))
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleeps.append,
+        rng=lambda: 0.0,
+        payloads=[],
+    )
+    feed = LiveFeed(store, source, now=lambda: clock["now"])
+    try:
+        bars = feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+        bodies = store.live_payload_bodies(user_id=LOCAL_USER_ID)
+    finally:
+        source.close()
+        store.close()
+    assert [bar.open_time for bar in bars] == [_T0]
+    assert calls["n"] == 3
+    assert sleeps == [5.0, 5.0]
+    assert bodies
+    assert "secret-token-should-not-leak" not in bodies[0]
+
+
+def test_exhausted_retries_stop_at_five(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "10000"}, text="secret-body")
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleeps.append,
+        rng=lambda: 0.0,
+        payloads=[],
+    )
+    feed = LiveFeed(store, source, now=lambda: clock["now"])
+    try:
+        with pytest.raises(SourceError, match="HTTP 429") as caught:
+            feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+    finally:
+        source.close()
+        store.close()
+    assert calls["n"] == 5
+    assert sleeps == [120.0, 120.0, 120.0, 120.0]
+    assert "secret-body" not in str(caught.value)
+
+
+def test_timeouts_use_jitter_and_stop_at_five(tmp_path: Path) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=sleeps.append,
+        rng=lambda: 0.5,
+        payloads=[],
+    )
+    feed = LiveFeed(store, source, now=lambda: clock["now"])
+    try:
+        with pytest.raises(SourceError, match="timed out"):
+            feed.fetch(SOL_MINT, "1m", _T0, _T0 + _STEP)
+    finally:
+        source.close()
+        store.close()
+    assert calls["n"] == 5
+    assert sleeps == [1.5, 3.0, 6.0, 12.0]
+
+
+def test_bars_and_payloads_are_purged_after_24h_and_the_cursor_remains(tmp_path: Path) -> None:
+    assert _DAY_OPEN % _DAY == 0
+    clock = {"now": _DAY_OPEN + _DAY}
+    store = _store(tmp_path, clock, ttl=MAX_CACHE_TTL_SECONDS)
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=_gecko_json([_candle(_DAY_OPEN, 3.0)]))
+        return httpx.Response(200, json=_gecko_json([]))
+
+    source = GeckoTerminalSource(
+        _client(handler),
+        min_interval=0,
+        sleep=lambda _seconds: None,
+        rng=lambda: 0.0,
+        payloads=[],
+    )
+    feed = LiveFeed(store, source, now=lambda: clock["now"])
+    scheduler = _scheduler(store, feed, clock)
+    _register(scheduler, bar_size="1d")
+    try:
+        scheduler.tick()
+        decided = _decisions(store)
+        assert [open_time for open_time, _payload in decided] == [_DAY_OPEN]
+        assert store.live_payload_bodies(user_id=LOCAL_USER_ID)
+        cursor = store.live_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        )
+        assert cursor is not None
+        assert cursor[1] == _DAY_OPEN
+        clock["now"] += MAX_CACHE_TTL_SECONDS
+        assert (
+            store.load(
+                user_id=LOCAL_USER_ID,
+                mint=SOL_MINT,
+                timeframe="1d",
+                start=0,
+                end=clock["now"],
+            )
+            == []
+        )
+        assert store.live_payload_bodies(user_id=LOCAL_USER_ID) == []
+        assert _decisions(store) == []
+        kept = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert kept is not None and kept[1] == _DAY_OPEN
+        restarted = PaperScheduler(store, feed, now=lambda: clock["now"], interval=3600)
+        restarted.tick()
+        assert _decisions(store) == []
+        again = store.live_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert again is not None and again[1] == _DAY_OPEN
+    finally:
+        source.close()
+        store.close()
+
+
+def test_in_progress_and_synthetic_bars_do_not_reach_the_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = _T0 + 150
+    clock = {"now": now}
+    store = _store(tmp_path, clock)
+    synthetic = _bar(_T0 + _STEP, synthetic=True)
+    forming = _bar(_T0 + 2 * _STEP)
+    store.upsert([synthetic], user_id=LOCAL_USER_ID)
+    primary = _Scripted(FetchResult([_bar(_T0), synthetic, forming], []))
+    feed = LiveFeed(store, primary, now=lambda: clock["now"])
+    scheduler = _scheduler(store, feed, clock)
+    _register(scheduler)
+    seen: list[object] = []
+
+    def spy(config, state, window, view):
+        seen.append((window, view))
+        return real_step(config, state, window, view)
+
+    monkeypatch.setattr("app.live.scheduler.step", spy)
+    try:
+        scheduler.tick()
+        stored = store.load(
+            user_id=LOCAL_USER_ID,
+            mint=SOL_MINT,
+            timeframe="1m",
+            start=0,
+            end=now + _STEP,
+        )
+        decisions = _decisions(store)
+    finally:
+        store.close()
+    assert [bar.open_time for bar in stored if not bar.synthetic] == [_T0]
+    assert any(bar.synthetic and bar.open_time == _T0 + _STEP for bar in stored)
+    assert forming.open_time not in {bar.open_time for bar in stored}
+    assert [open_time for open_time, _payload in decisions] == [_T0]
+    assert len(seen) == 1
+    window, view = seen[0]
+    assert window.open_time == _T0
+    assert window.bars["sol"] is not None
+    assert window.bars["sol"].synthetic is False
+    assert view.entries == ()
+    assert view.ocos == ()
+    payload = decisions[0][1]
+    assert payload["oco"] == []
+    assert payload["rules"][0]["skip"] is None
+    assert payload["rules"][0]["close"] is not None
+
+
+def test_missed_and_late_bars_are_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="app.live")
+    t1 = _T0 + _STEP
+    t2 = _T0 + 2 * _STEP
+    clock = {"now": _T0 + 4 * _STEP}
+    store = _store(tmp_path, clock)
+    store.upsert([_bar(_T0), _bar(t2)], user_id=LOCAL_USER_ID)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    _register(scheduler)
+    try:
+        scheduler.tick()
+        log = store.live_bar_log(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert (t1, "missed", "missing") in [(item[0], item[1], item[2]) for item in log]
+        assert (t2, "late", "following bar already closed") in [
+            (item[0], item[1], item[2]) for item in log
+        ]
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0, t2]
+        assert f"missed bar strategy_id=sol-paper version=1 open_time={t1}" in caplog.text
+        assert f"late bar strategy_id=sol-paper version=1 open_time={t2}" in caplog.text
+        store.upsert([_bar(t1)], user_id=LOCAL_USER_ID)
+        scheduler.tick()
+        log = store.live_bar_log(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        logged = [(item[0], item[1], item[2]) for item in log]
+        assert (t1, "late", "cursor already passed") in logged
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0, t2]
+    finally:
+        store.close()
+
+
+def test_a_bar_is_not_evaluated_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    _register(scheduler)
+    calls = {"n": 0}
+
+    def spy(config, state, window, view):
+        calls["n"] += 1
+        return real_step(config, state, window, view)
+
+    monkeypatch.setattr("app.live.scheduler.step", spy)
+    try:
+        scheduler.tick()
+        scheduler.tick()
+        assert calls["n"] == 1
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0]
+        kinds = {
+            kind
+            for _open_time, kind, _detail in store.live_bar_log(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+        }
+        assert "duplicate" in kinds
+    finally:
+        store.close()
+
+
+def test_restart_does_not_double_fire(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
+    first = _scheduler(store, _Quiet(), clock)
+    _register(first)
+    calls = {"n": 0}
+
+    def spy(config, state, window, view):
+        calls["n"] += 1
+        return real_step(config, state, window, view)
+
+    monkeypatch.setattr("app.live.scheduler.step", spy)
+    try:
+        first.tick()
+        assert calls["n"] == 1
+        second = PaperScheduler(store, _Quiet(), now=lambda: clock["now"], interval=3600)
+        second.tick()
+        assert calls["n"] == 1
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0]
+        clock["now"] = _T0 + 2 * _STEP
+        store.upsert([_bar(_T0 + _STEP)], user_id=LOCAL_USER_ID)
+        second.tick()
+        assert calls["n"] == 2
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0, _T0 + _STEP]
+    finally:
+        store.close()
+
+
+def test_duplicate_and_out_of_order_bars(tmp_path: Path) -> None:
+    t2 = _T0 + 2 * _STEP
+    clock = {"now": _T0 + 4 * _STEP}
+    store = _store(tmp_path, clock)
+    batches = [
+        FetchResult([_bar(t2), _bar(_T0), _bar(_T0)], []),
+        FetchResult([_bar(_T0 - _STEP), _bar(t2)], []),
+    ]
+
+    class _Batches:
+        name = "geckoterminal"
+        payloads: list[bytes]
+
+        def __init__(self) -> None:
+            self.payloads = []
+            self.calls = 0
+
+        def fetch_bars(self, mint: str, timeframe: str, start: int, end: int) -> FetchResult:
+            self.calls += 1
+            self.payloads.append(b"{}")
+            return batches.pop(0)
+
+        def close(self) -> None:
+            return None
+
+    feed = LiveFeed(store, _Batches(), now=lambda: clock["now"])
+    scheduler = _scheduler(store, feed, clock)
+    _register(scheduler)
+    try:
+        scheduler.tick()
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0, t2]
+        stored = store.load(
+            user_id=LOCAL_USER_ID, mint=SOL_MINT, timeframe="1m", start=0, end=clock["now"]
+        )
+        assert [bar.open_time for bar in stored if not bar.synthetic] == [_T0, t2]
+        scheduler.tick()
+        assert [open_time for open_time, _payload in _decisions(store)] == [_T0, t2]
+        log = store.live_bar_log(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert (_T0 - _STEP, "late") in {(item[0], item[1]) for item in log}
+        assert (_T0, "duplicate") in {(item[0], item[1]) for item in log}
+        assert (t2, "duplicate") in {(item[0], item[1]) for item in log}
+    finally:
+        store.close()
+
+
+def test_versions_do_not_share_a_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": _T0 + _STEP}
+    store = _store(tmp_path, clock)
+    store.upsert([_bar(_T0)], user_id=LOCAL_USER_ID)
+    scheduler = _scheduler(store, _Quiet(), clock)
+    _register(scheduler, version=1)
+    _register(scheduler, version=2)
+    calls = {"n": 0}
+
+    def spy(config, state, window, view):
+        calls["n"] += 1
+        return real_step(config, state, window, view)
+
+    monkeypatch.setattr("app.live.scheduler.step", spy)
+    try:
+        scheduler.tick()
+        scheduler.tick()
+        assert calls["n"] == 2
+        assert [open_time for open_time, _payload in _decisions(store, 1)] == [_T0]
+        assert [open_time for open_time, _payload in _decisions(store, 2)] == [_T0]
+    finally:
+        store.close()
+
+
+def test_health_stays_fast_while_the_scheduler_ticks(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow() -> None:
+        entered.set()
+        release.wait(5)
+
+    store = _store(tmp_path, {"now": _T0})
+    scheduler = PaperScheduler(
+        store,
+        _Quiet(),
+        now=lambda: _T0,
+        interval=3600,
+        on_tick=slow,
+    )
+    application = create_app(live=scheduler)
+    try:
+        with TestClient(application) as client:
+            assert entered.wait(2)
+            health: dict[str, object] = {}
+
+            def get_health() -> None:
+                started = time.perf_counter()
+                health["response"] = client.get("/health")
+                health["elapsed"] = time.perf_counter() - started
+
+            checker = threading.Thread(target=get_health)
+            checker.start()
+            checker.join(0.3)
+            blocked = checker.is_alive()
+            release.set()
+            checker.join(2)
+        assert not blocked
+        response = health["response"]
+        assert isinstance(response, httpx.Response)
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert float(health["elapsed"]) < 0.3
+        assert not scheduler.running
+    finally:
+        release.set()
+        scheduler.stop()
+        store.close()
+
+
+def test_scheduler_starts_and_stops_with_lifespan(tmp_path: Path) -> None:
+    store = _store(tmp_path, {"now": _T0})
+    scheduler = PaperScheduler(store, _Quiet(), now=lambda: _T0, interval=3600)
+    application = create_app(live=scheduler)
+    try:
+        with TestClient(application) as client:
+            assert scheduler.running
+            assert client.get("/health").json() == {"status": "ok"}
+        assert not scheduler.running
+    finally:
+        store.close()
+
+
+def test_scheduler_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LIVE_FEED_ENABLED", raising=False)
+    assert app.state.live_scheduler is None
+    fresh = create_app()
+    assert fresh.state.live_scheduler is None
+    for value in ("", "0", "false", "no", "off"):
+        monkeypatch.setenv("LIVE_FEED_ENABLED", value)
+        assert create_app().state.live_scheduler is None
+
+
+def test_enabled_flag_does_not_fetch_before_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OHLCV_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("BIRDEYE_API_KEY", raising=False)
+    application = create_app(live_enabled=True)
+    scheduler = application.state.live_scheduler
+    assert scheduler is not None
+    assert scheduler.running is False
+    scheduler.stop()
+
+
+def test_live_package_has_no_broker_or_wallet_code() -> None:
+    root = Path(__file__).resolve().parents[1] / "app" / "live"
+    forbidden = ("wallet", "private_key", "mnemonic", "keypair", "sign_transaction")
+    for path in root.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for word in forbidden:
+            assert word not in text
+        tree = ast.parse(text)
+        modules: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.append(node.module)
+        assert "app.backtest.engine" not in modules
+        assert "app.backtest" not in modules

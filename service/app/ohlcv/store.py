@@ -100,6 +100,61 @@ CREATE TABLE IF NOT EXISTS ingest_results (
 )
 """
 
+# Live-feed rows. Payloads, decisions, and the bar log are provider data
+# or a copy of a close, so they use the same purge as the bars. The cursor
+# and the registration are not candles: they stay so a restart does not
+# decide a bar again.
+_LIVE_TABLES = """
+CREATE TABLE IF NOT EXISTS live_payloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    mint TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    body TEXT NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS live_registrations (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    document_json TEXT NOT NULL,
+    bar_size TEXT NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version)
+);
+CREATE TABLE IF NOT EXISTS live_cursors (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    origin INTEGER NOT NULL,
+    last_open_time INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version)
+);
+CREATE TABLE IF NOT EXISTS live_decisions (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    decision_json TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    stored_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version, open_time)
+);
+CREATE TABLE IF NOT EXISTS live_bar_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS live_bar_log_once
+ON live_bar_log (user_id, strategy_id, version, open_time, kind);
+"""
+
 _UPSERT = """
 INSERT INTO bars (
     user_id, mint, timeframe, open_time, open, high, low, close, volume,
@@ -732,6 +787,352 @@ class SqliteBarStore:
         return payload
 
     @_serialized
+    def put_live_payloads(
+        self, user_id: str, rows: Sequence[tuple[str, str, str, str]]
+    ) -> None:
+        """Store raw response bodies. ``rows`` is provider, mint, timeframe, body."""
+        self._purge()
+        _owner(user_id)
+        if not rows:
+            return
+        stored_at = int(self._now())
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT INTO live_payloads (
+                    user_id, provider, mint, timeframe, body, stored_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (user_id, provider, mint, timeframe, body, stored_at)
+                    for provider, mint, timeframe, body in rows
+                ],
+            )
+
+    @_serialized
+    def live_payload_bodies(self, *, user_id: str) -> list[str]:
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            "SELECT body FROM live_payloads WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        )
+        return [str(row[0]) for row in cursor]
+
+    @_serialized
+    def save_live_registration(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        document_json: str,
+        bar_size: str,
+    ) -> None:
+        """Insert a version. The same document is a no-op. A different one is refused."""
+        self._purge()
+        _owner(user_id)
+        with self._conn:
+            row = self._conn.execute(
+                """
+                SELECT document_json FROM live_registrations
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                """,
+                (user_id, strategy_id, version),
+            ).fetchone()
+            if row is not None:
+                if str(row[0]) == document_json:
+                    return
+                raise StoreError("strategy version is already registered")
+            self._conn.execute(
+                """
+                INSERT INTO live_registrations (
+                    user_id, strategy_id, version, document_json, bar_size
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, strategy_id, version, document_json, bar_size),
+            )
+
+    @_serialized
+    def live_registrations(self, *, user_id: str) -> list[tuple[str, int, str, str]]:
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT strategy_id, version, document_json, bar_size
+            FROM live_registrations
+            WHERE user_id = ?
+            ORDER BY strategy_id, version
+            """,
+            (user_id,),
+        )
+        return [(str(row[0]), int(row[1]), str(row[2]), str(row[3])) for row in cursor]
+
+    @_serialized
+    def live_cursor(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> tuple[int, int, str] | None:
+        """``(origin, last_open_time, state_json)`` or None when nothing is committed."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT origin, last_open_time, state_json FROM live_cursors
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0]), int(row[1]), str(row[2])
+
+    @_serialized
+    def commit_live_step(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        origin: int,
+        open_time: int,
+        state_json: str,
+        decision_json: str,
+        log_kind: str | None = None,
+        log_detail: str = "",
+    ) -> bool:
+        """Record one decision and move the cursor. False when that bar was already recorded."""
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            existing = self._conn.execute(
+                """
+                SELECT state_json FROM live_decisions
+                WHERE user_id = ? AND strategy_id = ? AND version = ? AND open_time = ?
+                """,
+                (user_id, strategy_id, version, open_time),
+            ).fetchone()
+            if existing is not None:
+                self._advance_live_cursor(
+                    user_id, strategy_id, version, origin, open_time, str(existing[0])
+                )
+                if log_kind:
+                    self._insert_live_log(
+                        user_id,
+                        strategy_id,
+                        version,
+                        open_time,
+                        log_kind,
+                        log_detail,
+                        stored_at,
+                    )
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO live_decisions (
+                    user_id, strategy_id, version, open_time,
+                    decision_json, state_json, stored_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    strategy_id,
+                    version,
+                    open_time,
+                    decision_json,
+                    state_json,
+                    stored_at,
+                ),
+            )
+            self._advance_live_cursor(
+                user_id, strategy_id, version, origin, open_time, state_json
+            )
+            if log_kind:
+                self._insert_live_log(
+                    user_id, strategy_id, version, open_time, log_kind, log_detail, stored_at
+                )
+        return True
+
+    @_serialized
+    def commit_live_skip(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        origin: int,
+        open_time: int,
+        state_json: str,
+        log_kind: str,
+        log_detail: str,
+    ) -> None:
+        """Move the cursor past a slot that was not decided, and log why."""
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            self._advance_live_cursor(
+                user_id, strategy_id, version, origin, open_time, state_json
+            )
+            self._insert_live_log(
+                user_id, strategy_id, version, open_time, log_kind, log_detail, stored_at
+            )
+
+    @_serialized
+    def has_live_decision(
+        self, *, user_id: str, strategy_id: str, version: int, open_time: int
+    ) -> bool:
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM live_decisions
+            WHERE user_id = ? AND strategy_id = ? AND version = ? AND open_time = ?
+            """,
+            (user_id, strategy_id, version, open_time),
+        ).fetchone()
+        return row is not None
+
+    @_serialized
+    def live_decision_times(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> set[int]:
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time FROM live_decisions
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        )
+        return {int(row[0]) for row in cursor}
+
+    @_serialized
+    def live_decisions(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[int, str]]:
+        """``(open_time, decision_json)`` in open-time order."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time, decision_json FROM live_decisions
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY open_time
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [(int(row[0]), str(row[1])) for row in cursor]
+
+    @_serialized
+    def log_live_bar(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        open_time: int,
+        kind: str,
+        detail: str,
+    ) -> None:
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            self._insert_live_log(
+                user_id, strategy_id, version, open_time, kind, detail, stored_at
+            )
+
+    @_serialized
+    def live_bar_logged(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        open_time: int,
+        kind: str,
+    ) -> bool:
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM live_bar_log
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+              AND open_time = ? AND kind = ?
+            """,
+            (user_id, strategy_id, version, open_time, kind),
+        ).fetchone()
+        return row is not None
+
+    @_serialized
+    def live_bar_log(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[int, str, str]]:
+        """``(open_time, kind, detail)`` in insert order."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time, kind, detail FROM live_bar_log
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [(int(row[0]), str(row[1]), str(row[2])) for row in cursor]
+
+    def _advance_live_cursor(
+        self,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        origin: int,
+        open_time: int,
+        state_json: str,
+    ) -> None:
+        """Move the cursor forward. The caller holds the transaction."""
+        self._conn.execute(
+            """
+            INSERT INTO live_cursors (
+                user_id, strategy_id, version, origin, last_open_time, state_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, strategy_id, version) DO UPDATE SET
+                last_open_time = CASE
+                    WHEN excluded.last_open_time > live_cursors.last_open_time
+                    THEN excluded.last_open_time
+                    ELSE live_cursors.last_open_time
+                END,
+                state_json = CASE
+                    WHEN excluded.last_open_time > live_cursors.last_open_time
+                    THEN excluded.state_json
+                    ELSE live_cursors.state_json
+                END
+            """,
+            (user_id, strategy_id, version, origin, open_time, state_json),
+        )
+
+    def _insert_live_log(
+        self,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        open_time: int,
+        kind: str,
+        detail: str,
+        stored_at: int,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO live_bar_log (
+                user_id, strategy_id, version, open_time, kind, detail, stored_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, strategy_id, version, open_time, kind, detail, stored_at),
+        )
+
+    @_serialized
     def _ensure_schema(self) -> None:
         self._conn.executescript(_CREATE)
         bars = {row[1] for row in self._conn.execute("PRAGMA table_info(bars)")}
@@ -752,6 +1153,7 @@ class SqliteBarStore:
         if pool_cols and "dex_id" not in pool_cols:
             self._conn.execute("DROP TABLE pool_resolutions")
         self._conn.executescript(_PROVIDER_TABLES)
+        self._conn.executescript(_LIVE_TABLES)
         self._conn.commit()
 
     @_serialized
@@ -767,6 +1169,9 @@ class SqliteBarStore:
                 (cutoff, cutoff),
             )
             self._conn.execute("DELETE FROM ingest_results WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM live_payloads WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM live_decisions WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM live_bar_log WHERE stored_at <= ?", (cutoff,))
 
     def _rewrite_synthetics(self, user_id: str, mint: str, start: int, end: int) -> None:
         """Rebuild 1m synthetic bars on every fetched span that touches the window.

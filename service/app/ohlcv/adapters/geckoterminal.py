@@ -7,7 +7,11 @@ calls 12 seconds apart and never sends ``include_empty_intervals`` (that
 flag copies the previous close forward). Empty minutes stay missing.
 HTTP 429, HTTP 5xx, timeouts, and transport errors (connect, read, write,
 and remote protocol) retry with a bounded backoff. After five attempts the
-call is a ``SourceError``. Other 4xx responses are not retried. A bad
+call is a ``SourceError``. When ``rng`` is set, each retry sleep is the
+backoff plus ``rng() * backoff``. A numeric ``Retry-After`` on HTTP 429 is
+used when it is longer. The sleep is capped at 120 seconds. Callers that
+omit ``rng`` keep the unjittered backoff. Other 4xx responses are not
+retried. A bad
 proxy, an unsupported URL scheme, and a local protocol error are not
 retried either. The public API only serves about 180 days; a 401 is
 reported as that limit.
@@ -36,6 +40,7 @@ import httpx
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar, BarRejection, validate_bar
 from app.ohlcv.errors import SourceError, UnknownMint
 from app.ohlcv.registry import BONK_MINT, JTO_MINT, JUP_MINT, SOL_MINT, WIF_MINT
+from app.ohlcv.retry import retry_delay
 from app.ohlcv.source import FetchPage, FetchResult
 
 # path segment, aggregate. GeckoTerminal native candles, not a 1m resample.
@@ -125,6 +130,8 @@ class GeckoTerminalSource:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         pace: _Pace | None = None,
+        rng: Callable[[], float] | None = None,
+        payloads: list[bytes] | None = None,
     ) -> None:
         if page_limit < 1 or page_limit > _PAGE_LIMIT:
             raise ValueError("page_limit must be from 1 to 1000")
@@ -133,6 +140,8 @@ class GeckoTerminalSource:
         self._pools = POOLS if pools is None else pools
         self._page_limit = page_limit
         self._sleep = sleep
+        self._rng = rng
+        self.payloads = payloads
         # A shared pace keeps the pool lookup and the candle calls on one clock.
         self._pace = _Pace(min_interval, sleep, monotonic) if pace is None else pace
 
@@ -287,7 +296,7 @@ class GeckoTerminalSource:
             except httpx.TimeoutException as exc:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request timed out") from exc
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.TransportError as exc:
@@ -299,7 +308,7 @@ class GeckoTerminalSource:
                     raise SourceError("GeckoTerminal request failed") from exc
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError("GeckoTerminal request failed") from exc
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.HTTPError as exc:
@@ -312,7 +321,7 @@ class GeckoTerminalSource:
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == _ATTEMPTS - 1:
                     raise SourceError(f"GeckoTerminal returned HTTP {response.status_code}")
-                self._sleep(backoff)
+                self._sleep(self._retry_sleep(backoff, response, response.status_code))
                 backoff = min(backoff * 2, 120.0)
                 continue
             if response.status_code != 200:
@@ -323,8 +332,15 @@ class GeckoTerminalSource:
                 raise SourceError("GeckoTerminal returned a body that is not JSON") from exc
             if not isinstance(payload, dict):
                 raise SourceError("GeckoTerminal returned a body that is not a JSON object")
+            if self.payloads is not None:
+                self.payloads.append(bytes(response.content))
             return payload
         raise SourceError(f"GeckoTerminal returned HTTP {last_status}")
+
+    def _retry_sleep(
+        self, backoff: float, response: httpx.Response | None, status: int | None
+    ) -> float:
+        return retry_delay(backoff, rng=self._rng, response=response, status=status)
 
     def _http(self) -> httpx.Client:
         if self._client is None:
