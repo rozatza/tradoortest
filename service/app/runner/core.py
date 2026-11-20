@@ -27,8 +27,8 @@ class ClosedSeries(Sequence[float]):
     """Bars ``0 .. end-1`` of a longer buffer. Index ``end`` raises.
 
     The tail stays on the buffer the caller owns. This sequence does not
-    return it, does not slice into it, and does not offer a public handle
-    to it.
+    return it and does not offer a public handle to it. A slice is bars
+    ``0 .. end-1``. One that would read index ``end`` raises.
     """
 
     __slots__ = ("_end", "_values")
@@ -56,16 +56,45 @@ class ClosedSeries(Sequence[float]):
         return self._values[index]
 
     def _slice(self, index: slice) -> tuple[float, ...]:
+        """Bars inside the closed end. Index ``end`` is bar ``t + 1`` and raises.
+
+        Negative bounds count back from ``end``, as an index does. Defaults
+        follow ``slice.indices``. A step that would visit ``end`` raises
+        instead of reading the buffer tail.
+        """
         if index.step == 0:
             raise ValueError("slice step cannot be zero")
-        start = 0 if index.start is None else index.start
-        stop = self._end if index.stop is None else index.stop
+        end = self._end
         step = 1 if index.step is None else index.step
-        if start < 0 or stop < 0:
+        if isinstance(step, bool) or not isinstance(step, int):
+            raise TypeError("series index must be an integer")
+        start = self._slice_bound(index.start, end)
+        stop = self._slice_bound(index.stop, end)
+        if step > 0:
+            if start is None:
+                start = 0
+            if stop is None:
+                stop = end
+        else:
+            if start is None:
+                start = end - 1
+            if stop is None:
+                stop = -1
+        picked = list(range(start, stop, step))
+        if any(i < 0 or i >= end for i in picked):
             raise IndexError("bar is outside the closed window")
-        if start > self._end or stop > self._end:
+        return tuple(self._values[i] for i in picked)
+
+    @staticmethod
+    def _slice_bound(bound: int | None, end: int) -> int | None:
+        if bound is None:
+            return None
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise TypeError("series index must be an integer")
+        resolved = bound + end if bound < 0 else bound
+        if resolved < 0 or resolved > end:
             raise IndexError("bar is outside the closed window")
-        return tuple(self._values[i] for i in range(start, stop, step))
+        return resolved
 
 
 @dataclass(frozen=True, slots=True)

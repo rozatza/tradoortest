@@ -13,7 +13,28 @@ resolved on first use, which is still before any bar is walked.
 from __future__ import annotations
 
 import importlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.backtest.engine import (  # noqa: F401
+        BacktestResult,
+        EquityPoint,
+        Fill,
+        OpenPosition,
+        SkippedOrder,
+        move_oco,
+        run_backtest,
+    )
+    from app.backtest.errors import BacktestError  # noqa: F401
+    from app.backtest.log import (  # noqa: F401
+        METRIC_COLUMNS,
+        TRADE_COLUMNS,
+        metrics_csv,
+        metrics_json,
+        trade_log_csv,
+        trade_log_json,
+    )
+    from app.backtest.metrics import Metrics, Trade  # noqa: F401
 
 __all__ = [
     "METRIC_COLUMNS",
@@ -61,3 +82,8 @@ def __getattr__(name: str) -> Any:
     value = getattr(importlib.import_module(module_name), name)
     globals()[name] = value
     return value
+
+
+def __dir__() -> list[str]:
+    """Public names are visible before the first use of each one."""
+    return sorted(set(globals()) | set(__all__))

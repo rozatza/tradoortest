@@ -145,8 +145,9 @@ _DANGEROUS = frozenset(
 )
 _LOOP_CAP = 256
 _SITE: ContextVar[str] = ContextVar("strategy_corpus_site", default="")
-# The service forbids a bare eval, exec, or compile call. These are the same
-# builtins, used only to run strategy constructors already in the test suite.
+# The service forbids a bare eval, exec, or compile call, including one
+# fetched from builtins. test_expr.py allowlists these three lines only.
+# They run strategy constructors that already live in the test suite.
 _EXEC = getattr(builtins, "exec")
 _EVAL = getattr(builtins, "eval")
 _COMPILE = getattr(builtins, "compile")

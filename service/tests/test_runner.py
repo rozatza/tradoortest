@@ -430,6 +430,77 @@ def test_a_closed_series_longer_than_this_bar_is_rejected() -> None:
         step(config, initial_state(("sol",)), window, BookView())
 
 
+def _slice_oracle(
+    prefix: tuple[float, ...], start: int | None, stop: int | None, step: int | None
+) -> tuple[float, ...] | None:
+    """The closed-prefix slice, or None when a bound or a visited index is outside it.
+
+    ``None`` means the slice must raise. A returned tuple is also what
+    ``prefix[start:stop:step]`` produces when every visited index is inside
+    the prefix. A negative step that starts at ``len(prefix)`` visits bar
+    ``t + 1`` and is outside.
+    """
+    end = len(prefix)
+
+    def resolve(bound: int | None) -> int | None:
+        if bound is None:
+            return None
+        resolved = bound + end if bound < 0 else bound
+        if resolved < 0 or resolved > end:
+            raise ValueError("outside")
+        return resolved
+
+    try:
+        resolved_start = resolve(start)
+        resolved_stop = resolve(stop)
+    except ValueError:
+        return None
+    stride = 1 if step is None else step
+    if stride > 0:
+        if resolved_start is None:
+            resolved_start = 0
+        if resolved_stop is None:
+            resolved_stop = end
+    else:
+        if resolved_start is None:
+            resolved_start = end - 1
+        if resolved_stop is None:
+            resolved_stop = -1
+    indexes = list(range(resolved_start, resolved_stop, stride))
+    if any(i < 0 or i >= end for i in indexes):
+        return None
+    return tuple(prefix[i] for i in indexes)
+
+
+def test_every_slice_bound_stays_inside_the_closed_prefix() -> None:
+    """Every start, stop, and step is either the prefix slice or an IndexError.
+
+    Lengths are several values of ``t + 1``. Bounds cover negatives, positives,
+    and None. A value from the buffer tail is never returned, and index
+    ``t + 1`` is never a visited index.
+    """
+    for end in (0, 1, 2, 4):
+        prefix = tuple(float(i + 1) for i in range(end))
+        series = ClosedSeries([*prefix, 999.0, 998.0], end)
+        with pytest.raises(IndexError):
+            series[end]
+        bounds: list[int | None] = [None, *range(-end - 3, end + 4)]
+        for start in bounds:
+            for stop in bounds:
+                for stride in (None, 1, 2, 3, -1, -2, -3):
+                    expected = _slice_oracle(prefix, start, stop, stride)
+                    if expected is None:
+                        with pytest.raises(IndexError):
+                            series[start:stop:stride]
+                        continue
+                    got = series[start:stop:stride]
+                    assert got == expected
+                    assert got == tuple(prefix[start:stop:stride])
+                    assert 999.0 not in got and 998.0 not in got
+                    visited = range(*slice(start, stop, stride).indices(end))
+                    assert all(0 <= i < end for i in visited)
+
+
 def test_an_oco_attached_on_this_bar_is_not_a_touch() -> None:
     """The attachment bar is not a touch. The same wick on a later bar is.
 

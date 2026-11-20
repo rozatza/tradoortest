@@ -27,7 +27,7 @@
 
 **Determinism.** The same config, state, window, and view always produce the same result. Nothing in the decision reads the wall clock or a random source. Asset order and rule order are the IR order, not hash order.
 
-**No look-ahead.** The decision on bar `t` sees series values at indexes `0..t` and the candle at `t`. Index `t + 1` is not on the window: reading it raises `IndexError`. A series longer than `t + 1` is rejected. A later bar cannot change this bar's decision.
+**No look-ahead.** The decision on bar `t` sees series values at indexes `0..t` and the candle at `t`. Index `t + 1` is not on the window: reading it raises `IndexError`, and so does a slice that would visit that index. A slice that stays inside `0..t` matches the same slice of that prefix, including a reverse step. A series longer than `t + 1` is rejected. A later bar cannot change this bar's decision.
 
 **Stepping equals batch.** Calling `step` once per bar, passing each returned state into the next call, returns the same results as `run` on those windows and views.
 
