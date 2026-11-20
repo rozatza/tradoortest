@@ -2,13 +2,12 @@
 
 The cells are the strings already on the result. Nothing here recomputes a
 ratio, a fill, or an equity mark. JSON exports match ``trade_log_json`` and
-``metrics_json``. CSV exports match ``trade_log_csv`` and ``metrics_csv``
-except for a text-typed cell whose first character is ``=``, ``+``, ``-``,
-``@``, a tab, or a carriage return. That cell is written with a leading
-apostrophe so a spreadsheet does not treat it as a formula. Numeric columns
-are written exactly, including a leading minus on a decimal such as
-``-12.34``. The column kind comes from the trade-log and metrics schemas,
-not from the first character of the cell.
+``metrics_json`` and are not formula-escaped. Every CSV cell, trades and
+metrics, goes through :func:`csv_cell`. A cell is copied raw only when it
+matches the strict decimal grammar, or when it is a declared integer or ISO
+timestamp column whose text matches that format. Any other cell that starts
+with ``=``, ``+``, ``-``, ``@``, a tab, or a carriage return is written with
+a leading apostrophe. A new column has no raw exception.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import asyncio
 import csv
 import io
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -34,22 +34,56 @@ class ExportError(ValueError):
     """The stored result is missing a trade-log or metrics cell."""
 
 
-# Text and boolean words. A number, a timestamp, and a count are not here.
-TEXT_TRADE_COLUMNS = frozenset(
+# Same text as ``DECIMAL_MARK`` in web/lib/backtest.ts and ``format(Decimal, "f")``:
+# optional minus, no exponent, no leading zeros, optional fraction.
+_DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)")
+_ISO_TIMESTAMP = re.compile(
+    r"[+-]?[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+)
+
+# Unix seconds and counts. A match is still required; the name alone is not raw.
+INTEGER_COLUMNS = frozenset(
     {
-        "trade_id",
-        "asset_id",
-        "status",
-        "limit_below_low",
-        "overlaps_suspect_outage",
+        "entry_time",
+        "exit_time",
+        "synthetic_bars",
+        "missing_bars",
+        "long_no_trade_bars",
+        "long_no_trade_minutes",
+        "suspect_outage_bars",
+        "suspect_outage_minutes",
     }
 )
+
+# No current export column is an ISO timestamp. A later column is raw only
+# when its text matches ``_ISO_TIMESTAMP``.
+TIMESTAMP_COLUMNS: frozenset[str] = frozenset()
 
 _FORMULA_LEAD = frozenset("=+-@\t\r")
 
 
-def csv_text_cell(value: str) -> str:
-    """Neutralise a text cell that a spreadsheet would treat as a formula."""
+def _strict_decimal(value: str) -> bool:
+    """True only for the decimal grammar. Always-true would publish formulas."""
+    return _DECIMAL.fullmatch(value) is not None
+
+
+def csv_cell(column: str, value: str | None) -> str:
+    """Write one CSV cell. This is the only CSV cell writer.
+
+    Raw when ``value`` is a strict decimal, or when ``column`` is a declared
+    integer or ISO timestamp column and ``value`` matches that format.
+    Otherwise a leading ``= + - @`` tab or CR is prefixed with an apostrophe.
+    ``None`` is an empty cell. An unknown column cannot skip the apostrophe.
+    """
+    if value is None:
+        return ""
+    if _strict_decimal(value):
+        return value
+    if column in INTEGER_COLUMNS and _INTEGER.fullmatch(value):
+        return value
+    if column in TIMESTAMP_COLUMNS and _ISO_TIMESTAMP.fullmatch(value):
+        return value
     if value[:1] in _FORMULA_LEAD:
         return "'" + value
     return value
@@ -86,17 +120,8 @@ def _trades_csv(result: Mapping[str, Any]) -> str:
     writer = csv.DictWriter(buffer, fieldnames=TRADE_COLUMNS, lineterminator="\n")
     writer.writeheader()
     for row in _trade_rows(result):
-        writer.writerow({key: _csv_trade_cell(key, value) for key, value in row.items()})
+        writer.writerow({key: csv_cell(key, value) for key, value in row.items()})
     return buffer.getvalue()
-
-
-def _csv_trade_cell(column: str, value: str | None) -> str:
-    """Write one trade cell. Numeric columns stay exact. Text columns are neutralised."""
-    if value is None:
-        return ""
-    if column in TEXT_TRADE_COLUMNS:
-        return csv_text_cell(value)
-    return value
 
 
 def _trades_json(result: Mapping[str, Any]) -> str:
@@ -105,17 +130,12 @@ def _trades_json(result: Mapping[str, Any]) -> str:
 
 
 def _metrics_csv(result: Mapping[str, Any]) -> str:
-    """Ratio columns are numeric. A leading minus is part of the stored decimal."""
+    """The same :func:`csv_cell` path as the trade log."""
     values = _metric_values(result)
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=METRIC_COLUMNS, lineterminator="\n")
     writer.writeheader()
-    writer.writerow(
-        {
-            column: "" if values[column] is None else values[column]
-            for column in METRIC_COLUMNS
-        }
-    )
+    writer.writerow({column: csv_cell(column, values[column]) for column in METRIC_COLUMNS})
     return buffer.getvalue()
 
 
