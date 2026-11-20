@@ -22,7 +22,7 @@ from starlette.requests import Request
 from app.auth import CurrentUser, get_current_user
 from app.indicators import sma
 from app.jobs.analysis import WEEKDAYS, trade_timing
-from app.jobs.chart import CHART_SLOT_CAP, _window
+from app.jobs.chart import CHART_SLOT_CAP, _window, chart_documents
 from app.jobs.queue import JobQueue
 from app.jobs.routes import _analysis_document, _bars_document, _indicators_document
 from app.main import create_app
@@ -230,7 +230,11 @@ def test_chart_reads_do_not_parse_the_result_row(
         queue.close()
 
 
-def test_analysis_uses_utc_entry_time_and_is_unavailable_when_empty(tmp_path: Path) -> None:
+def test_analysis_uses_utc_entry_time_and_is_unavailable_when_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    time.tzset()
     queue = JobQueue(tmp_path / "jobs.sqlite")
     client = _client(queue)
     quiet = _strategy(signals=[{"id": "go", "expr": {"op": "lit", "value": False}}])
@@ -284,6 +288,8 @@ def test_analysis_uses_utc_entry_time_and_is_unavailable_when_empty(tmp_path: Pa
         assert hostile["hours"] == [{"hour_utc": 0, "count": 1}]
     finally:
         queue.close()
+        monkeypatch.undo()
+        time.tzset()
 
 
 def test_a_chart_build_failure_is_visible_and_the_job_still_succeeds(
@@ -488,6 +494,42 @@ def test_health_answers_while_bars_are_read(
     finally:
         release.set()
         queue.close()
+
+
+def test_tiny_and_crossing_prices_are_plain_decimals() -> None:
+    """A BONK-scale close and a series that crosses 0.0001 stay decimal text."""
+    tiny = 2.2e-05
+    below = 9.99e-05
+    above = 0.00022
+    document = _strategy(
+        derived_series=[
+            {
+                "id": "sma_2",
+                "kind": "indicator",
+                "indicator": "sma",
+                "source": "close",
+                "params": {"period": 2},
+            }
+        ]
+    )
+    bars, indicators = chart_documents(
+        {"ir": document, "bars": {"sol": [_row(0, tiny), _row(60, below), _row(120, above)]}},
+        {"trades": []},
+    )
+    asset = bars["assets"][0]
+    assert asset["rejected"] == 0
+    closes = [bar["close"] for bar in asset["bars"]]
+    assert closes == ["0.000022", "0.0000999", "0.00022"]
+    for close in closes:
+        assert "e" not in close.lower()
+    assert indicators["available"] is True
+    for point in indicators["series"][0]["points"]:
+        value = point["value"]
+        if value is None:
+            continue
+        body = value[1:] if value.startswith("-") else value
+        assert "e" not in body.lower()
+        assert body.replace(".", "", 1).isdigit()
 
 
 def test_another_user_gets_404_on_bars_indicators_and_analysis(tmp_path: Path) -> None:

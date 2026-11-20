@@ -13,10 +13,11 @@ does not implement SMA, EMA, RSI, ATR, MACD, Bollinger, or Stochastic.
 
 from __future__ import annotations
 
-import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
+from decimal import Decimal
 from typing import Any
 
 from app.backtest.engine import MAX_GRID_BARS
@@ -227,15 +228,26 @@ def _is_number(value: object) -> bool:
     )
 
 
+# Same grammar as DECIMAL_MARK in web/lib/backtest.ts. ASCII digits only.
+_DECIMAL_MARK = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+
+
 def _spell(value: object) -> str:
-    """The characters JSON would use for this number. No extra digits."""
+    """Plain decimal text for one finite number. No exponent.
+
+    ``json.dumps`` spells a float under ``1e-4`` as ``2.2e-05``. The chart
+    grammar rejects that, so a real BONK price would be dropped. A float is
+    ``format(Decimal(repr(value)), "f")`` instead. An integer keeps its digits.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("not a number")
     if isinstance(value, int):
         return str(value)
-    spelled = json.dumps(value, allow_nan=False)
-    if spelled in {"NaN", "Infinity", "-Infinity"}:
+    if not math.isfinite(value):
         raise ValueError("not finite")
+    spelled = format(Decimal(repr(value)), "f")
+    if _DECIMAL_MARK.fullmatch(spelled) is None:
+        raise ValueError("not a decimal")
     return spelled
 
 

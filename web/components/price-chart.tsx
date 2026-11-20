@@ -38,7 +38,15 @@ export function PriceChart({
   }, [asset?.assetId]);
 
   if (!asset || asset.bars.length === 0) {
-    return <p>Price chart unavailable</p>;
+    const notes = asset
+      ? chartNotes(0, asset.dropped + asset.rejected, asset.shown, asset.total, "bars shown")
+      : [];
+    return (
+      <p>
+        Price chart unavailable
+        {notes.length > 0 ? ` · ${notes.join(" · ")}` : ""}
+      </p>
+    );
   }
   const at = replayIndex(index, asset.bars.length);
   const revealed = asset.bars.slice(0, at + 1);
@@ -51,9 +59,12 @@ export function PriceChart({
       : [];
   const overlays = series.filter((item) => item.overlay);
   const separate = series.filter((item) => !item.overlay);
+  const atLast = at >= asset.bars.length - 1;
+  const dropsNow =
+    asset.droppedAt.filter((time) => atLast || time <= through).length + asset.untimedDrops;
   const candleNotes = chartNotes(
-    asset.bars.length,
-    asset.bars.length + asset.dropped + asset.rejected,
+    revealed.length,
+    revealed.length + dropsNow + (atLast ? asset.rejected : 0),
     asset.shown,
     asset.total,
     "bars shown",
@@ -118,10 +129,16 @@ export function PriceChart({
       </div>
       <CandleCanvas candles={revealed} overlays={overlays} markers={placed.markers} />
       {overlays.map((item) => (
-        <SeriesNote key={item.id} series={item} through={through} />
+        <SeriesNote key={item.id} series={item} through={through} includeRest={atLast} />
       ))}
       {separate.map((item, offset) => (
-        <IndicatorPane key={`${item.id}:${item.output ?? ""}`} series={item} through={through} color={SEPARATE_COLORS[offset % SEPARATE_COLORS.length]!} />
+        <IndicatorPane
+          key={`${item.id}:${item.output ?? ""}`}
+          series={item}
+          through={through}
+          includeRest={atLast}
+          color={SEPARATE_COLORS[offset % SEPARATE_COLORS.length]!}
+        />
       ))}
       {indicators && !indicators.available ? <p>{indicators.reason}</p> : null}
       {indicators && indicators.available && series.length === 0 ? <p>No indicators</p> : null}
@@ -155,8 +172,16 @@ export function PriceChart({
   );
 }
 
-function SeriesNote({ series, through }: { series: IndicatorSeries; through: number }) {
-  const note = seriesNote(series, through);
+function SeriesNote({
+  series,
+  through,
+  includeRest,
+}: {
+  series: IndicatorSeries;
+  through: number;
+  includeRest: boolean;
+}) {
+  const note = seriesNote(series, through, includeRest);
   return (
     <p className="bar-readout">
       {seriesLabel(series)}
@@ -169,13 +194,15 @@ function SeriesNote({ series, through }: { series: IndicatorSeries; through: num
 function IndicatorPane({
   series,
   through,
+  includeRest,
   color,
 }: {
   series: IndicatorSeries;
   through: number;
+  includeRest: boolean;
   color: string;
 }) {
-  const note = seriesNote(series, through);
+  const note = seriesNote(series, through, includeRest);
   const revealed = useMemo(
     () => series.points.filter((point) => point.time <= through),
     [series.points, through],
@@ -192,12 +219,18 @@ function IndicatorPane({
   );
 }
 
-function seriesNote(series: IndicatorSeries, through: number): { caption: string | null; notes: string[] } {
+function seriesNote(
+  series: IndicatorSeries,
+  through: number,
+  includeRest: boolean,
+): { caption: string | null; notes: string[] } {
   const finite = series.points.filter((point) => point.valueText !== null && point.time <= through);
   const inWindow = series.points.filter((point) => point.time <= through);
+  const drops =
+    series.droppedAt.filter((time) => includeRest || time <= through).length + series.untimedDrops;
   const notes = chartNotes(
     finite.length,
-    inWindow.length + series.dropped,
+    inWindow.length + drops,
     series.shown,
     series.total,
     "points shown",
@@ -237,7 +270,9 @@ function CandleCanvas({
   const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const candleKey = candles.map((candle) => `${candle.open_time}:${candle.close}`).join(",");
+  const candleKey = candles
+    .map((candle) => `${candle.open_time}:${candle.open}:${candle.high}:${candle.low}:${candle.close}`)
+    .join(",");
   const markerKey = markers.map((marker) => `${marker.kind}:${marker.time}`).join(",");
   const overlayKey = overlays.map((series) => series.id).join(",");
   useEffect(() => {
@@ -255,6 +290,8 @@ function CandleCanvas({
           return;
         }
         chart = lib.createChart(ref.current, chartOptions());
+        const last = candles[candles.length - 1]?.open_time ?? 0;
+        const format = priceFormat(priceSpellings(candles, overlays, last));
         const series = chart.addSeries(lib.CandlestickSeries, {
           upColor: "#1f6b3a",
           downColor: "#8a2e24",
@@ -262,8 +299,8 @@ function CandleCanvas({
           borderDownColor: "#8a2e24",
           wickUpColor: "#1f6b3a",
           wickDownColor: "#8a2e24",
+          priceFormat: format,
         });
-        const last = candles[candles.length - 1]?.open_time ?? 0;
         series.setData(
           candles.map((candle) => ({
             time: candle.open_time,
@@ -279,6 +316,7 @@ function CandleCanvas({
             lineWidth: 2,
             priceLineVisible: false,
             lastValueVisible: false,
+            priceFormat: format,
           });
           added.setData(lineData(line, last));
         });
@@ -338,12 +376,16 @@ function LineCanvas({ points, color }: { points: IndicatorSeries["points"]; colo
         if (cancelled || !ref.current) {
           return;
         }
+        const format = priceFormat(
+          points.flatMap((point) => (point.valueText === null ? [] : [point.valueText])),
+        );
         chart = lib.createChart(ref.current, chartOptions());
         const series = chart.addSeries(lib.LineSeries, {
           color,
           lineWidth: 2,
           priceLineVisible: false,
           lastValueVisible: false,
+          priceFormat: format,
         });
         series.setData(
           points.map((point) =>
@@ -381,6 +423,43 @@ function lineData(series: IndicatorSeries, through: number): object[] {
   return series.points
     .filter((point) => point.time <= through)
     .map((point) => (point.value === null ? { time: point.time } : { time: point.time, value: point.value }));
+}
+
+type PriceFormat = { type: "price"; precision: number; minMove: number; base?: number };
+
+/** Digits after the decimal in the spellings actually drawn. Sub-cent prices stay off 0.00. */
+function priceFormat(spellings: readonly string[]): PriceFormat {
+  let precision = 0;
+  for (const spelling of spellings) {
+    const text = spelling.startsWith("-") ? spelling.slice(1) : spelling;
+    const dot = text.indexOf(".");
+    const digits = dot < 0 ? 0 : text.length - dot - 1;
+    if (digits > precision) {
+      precision = digits;
+    }
+  }
+  if (precision > 16) {
+    precision = 16;
+  }
+  if (precision === 0) {
+    return { type: "price", precision: 0, minMove: 1 };
+  }
+  return { type: "price", precision, minMove: 10 ** -precision, base: 10 ** precision };
+}
+
+function priceSpellings(candles: Candle[], overlays: IndicatorSeries[], through: number): string[] {
+  const spellings: string[] = [];
+  for (const candle of candles) {
+    spellings.push(candle.open, candle.high, candle.low, candle.close);
+  }
+  for (const series of overlays) {
+    for (const point of series.points) {
+      if (point.time <= through && point.valueText !== null) {
+        spellings.push(point.valueText);
+      }
+    }
+  }
+  return spellings;
 }
 
 function chartOptions(): object {

@@ -144,7 +144,7 @@ describe("price chart", () => {
     );
     expect(await screen.findByText(/Bar 1 of 2/)).toBeTruthy();
     expect(screen.getByText(/2 of 4 bars shown/)).toBeTruthy();
-    expect(screen.getByText(/2 of 4 points valid/)).toBeTruthy();
+    expect(screen.queryByText(/2 of 4 points valid/)).toBeNull();
     expect(document.querySelector("[data-marker-time='1700000000']")?.getAttribute("data-marker-kind")).toBe(
       "entry",
     );
@@ -160,6 +160,7 @@ describe("price chart", () => {
     fireEvent.click(screen.getByRole("button", { name: "Step forward" }));
     expect(screen.getByText(/Bar 2 of 2/)).toBeTruthy();
     expect(screen.getByText(/close 20/)).toBeTruthy();
+    expect(screen.getByText(/2 of 4 points valid/)).toBeTruthy();
     const exit = document.querySelector("[data-marker-time='1700000060']");
     expect(exit?.getAttribute("data-marker-kind")).toBe("exit");
     expect(exit?.textContent).toBe("exit 1700000060");
@@ -297,5 +298,79 @@ describe("price chart", () => {
     );
     expect(closes).toEqual([10]);
     expect(values).toEqual([15]);
+  });
+});
+
+describe("tiny prices stay on the chart", () => {
+  it("shows the drop count when every bar is an exponent", () => {
+    const parsed = parseBars({
+      schema: "tradoortest.backtest_bars.v1",
+      available: true,
+      bar_size: "1m",
+      slots_total: 2,
+      slots_shown: 2,
+      assets: [
+        {
+          asset_id: "bonk",
+          total: 2,
+          shown: 2,
+          rejected: 0,
+          bars: [candle(1_700_000_000, "2.2e-05"), candle(1_700_000_060, "9.99e-05")],
+        },
+      ],
+    });
+    if (!parsed || !parsed.available) {
+      throw new Error("parse");
+    }
+    render(<PriceChart bars={parsed} indicators={null} trades={[]} />);
+    expect(screen.getByText(/Price chart unavailable/)).toBeTruthy();
+    expect(screen.getByText(/0 of 2 points valid/)).toBeTruthy();
+  });
+
+  it("draws a plain 0.000022 close and a series that crosses 0.0001", async () => {
+    const formats: Array<{ precision?: number; minMove?: number; type?: string }> = [];
+    createChart.mockImplementation(() => ({
+      addSeries: (_definition: unknown, options: { priceFormat?: { precision?: number; minMove?: number; type?: string } }) => {
+        if (options.priceFormat) {
+          formats.push(options.priceFormat);
+        }
+        return { setData: vi.fn() };
+      },
+      remove: vi.fn(),
+      timeScale: () => ({ fitContent: vi.fn() }),
+    }));
+    const below = "0.0000999";
+    const above = "0.00022";
+    const parsed = parseBars({
+      schema: "tradoortest.backtest_bars.v1",
+      available: true,
+      bar_size: "1m",
+      slots_total: 2,
+      slots_shown: 2,
+      assets: [
+        {
+          asset_id: "bonk",
+          total: 2,
+          shown: 2,
+          rejected: 0,
+          bars: [candle(1_700_000_000, "0.000022"), candle(1_700_000_060, below), candle(1_700_000_120, above)],
+        },
+      ],
+    });
+    if (!parsed || !parsed.available) {
+      throw new Error("parse");
+    }
+    expect(parsed.assets[0]?.dropped).toBe(0);
+    expect(parsed.assets[0]?.bars.map((bar) => bar.close)).toEqual(["0.000022", below, above]);
+    render(<PriceChart bars={parsed} indicators={null} trades={[]} />);
+    expect(screen.getByText(/close 0\.000022/)).toBeTruthy();
+    expect(screen.queryByText(/Price chart unavailable/)).toBeNull();
+    expect(screen.queryByText(/points valid/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Last bar" }));
+    expect(screen.getByText(/close 0\.00022/)).toBeTruthy();
+    await waitFor(() => expect(formats.length).toBeGreaterThan(0));
+    expect(formats[0]?.type).toBe("price");
+    expect(formats[0]?.precision).toBeGreaterThanOrEqual(6);
+    expect(formats[0]?.minMove).toBeLessThan(0.01);
   });
 });

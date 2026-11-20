@@ -32,6 +32,10 @@ export type BarAsset = {
   rejected: number;
   bars: Candle[];
   dropped: number;
+  /** Times of candles the grammar rejected. Replay counts only those up to the cursor. */
+  droppedAt: number[];
+  /** Rejected candles with no usable time. They are counted at every cursor. */
+  untimedDrops: number;
 };
 
 export type BarsPayload =
@@ -59,6 +63,10 @@ export type IndicatorSeries = {
   shown: number;
   points: LinePoint[];
   dropped: number;
+  /** Times of points the grammar rejected. Replay counts only those up to the cursor. */
+  droppedAt: number[];
+  /** Rejected points with no usable time. They are counted at every cursor. */
+  untimedDrops: number;
   overlay: boolean;
 };
 
@@ -279,20 +287,23 @@ function parseAsset(asset: unknown): BarAsset | null {
     return null;
   }
   const bars: Candle[] = [];
-  let dropped = 0;
+  const droppedAt: number[] = [];
+  let untimedDrops = 0;
   for (const bar of asset.bars) {
     const candle = parseCandle(bar);
     if (candle) {
       bars.push(candle);
+    } else if (isRecord(bar) && exactUnix(bar.open_time) !== null) {
+      droppedAt.push(exactUnix(bar.open_time)!);
     } else {
-      dropped += 1;
+      untimedDrops += 1;
     }
   }
   bars.sort((left, right) => left.open_time - right.open_time);
   const unique: Candle[] = [];
   for (const candle of bars) {
     if (unique.length > 0 && unique[unique.length - 1]!.open_time === candle.open_time) {
-      dropped += 1;
+      droppedAt.push(candle.open_time);
       continue;
     }
     unique.push(candle);
@@ -303,7 +314,9 @@ function parseAsset(asset: unknown): BarAsset | null {
     shown,
     rejected,
     bars: unique,
-    dropped,
+    dropped: droppedAt.length + untimedDrops,
+    droppedAt,
+    untimedDrops,
   };
 }
 
@@ -340,13 +353,17 @@ function parseSeries(item: unknown): IndicatorSeries | null {
     return null;
   }
   const points: LinePoint[] = [];
-  let dropped = 0;
+  const droppedAt: number[] = [];
+  let untimedDrops = 0;
   for (const point of item.points) {
+    const time = isRecord(point) ? exactUnix(point.open_time) : null;
     const parsed = parsePoint(point);
     if (parsed) {
       points.push(parsed);
+    } else if (time === null) {
+      untimedDrops += 1;
     } else {
-      dropped += 1;
+      droppedAt.push(time);
     }
   }
   points.sort((left, right) => left.time - right.time);
@@ -358,7 +375,9 @@ function parseSeries(item: unknown): IndicatorSeries | null {
     total,
     shown,
     points,
-    dropped,
+    dropped: droppedAt.length + untimedDrops,
+    droppedAt,
+    untimedDrops,
     overlay: OVERLAY.has(item.indicator),
   };
 }
@@ -412,7 +431,10 @@ function whole(value: unknown): number | null {
   return value;
 }
 
-/** The equity-curve spelling. Hex, exponent, blank, and whitespace are not prices. */
+/** The equity-curve spelling. Hex, exponent, blank, and whitespace are not prices.
+
+A real price under 0.0001 is a plain decimal from the backend, not an exponent.
+*/
 function finiteSpell(value: unknown): string | null {
   if (!isStoredMark(value)) {
     return null;

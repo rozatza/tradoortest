@@ -89,7 +89,7 @@ The request body is still deleted when the job finishes, so the raw series is no
 
 `bars_json` and `indicators_json` are deleted with the job, on the same 24 hour pass, including a chart row whose job is already gone. The purge checkpoints the WAL, and `secure_delete` is on, so the candle text does not stay in the database file or the WAL after that pass.
 
-Indicator points are the lists from `app.indicators`, called on the same grid the engine uses (a missing slot is NaN). The chart route does not recompute them in the browser. A non-finite indicator value is JSON `null`. `valid` counts the finite points in the window. `shown` is the window length. `total` is the full grid length for a series, and the full present-candle count for an asset. `rejected` on an asset is a present candle in the window that was not encoded.
+Candle OHLC, volume, and indicator values are plain decimal strings from `format(Decimal, "f")`. A price under 0.0001 is `0.000022`, not `2.2e-05`. The chart grammar rejects an exponent, so the backend does not emit one. Indicator points are the lists from `app.indicators`, called on the same grid the engine uses (a missing slot is NaN). The chart route does not recompute them in the browser. A non-finite indicator value is JSON `null`. `valid` counts the finite points in the window. `shown` is the window length. `total` is the full grid length for a series, and the full present-candle count for an asset. `rejected` on an asset is a present candle in the window that was not encoded.
 
 These reads do not parse `result_json` in Python. Bars and indicators are the chart columns. Analysis asks SQLite for `json_extract(result_json, '$.trades')` and parses that array only. The equity curve stays in the result row.
 
