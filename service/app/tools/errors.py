@@ -20,6 +20,7 @@ _HTTP = {
     "not_found": 404,
     "strategy_archived": 404,
     "version_conflict": 409,
+    "no_changes": 409,
     "conflict": 409,
     "expired": 410,
     "payload_too_large": 413,

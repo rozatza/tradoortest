@@ -1,6 +1,6 @@
 # Agent tools
 
-The tool layer is the typed surface a later author agent calls. It does not call a model, and it does not hold a wallet, a key, or a swap path. Those are out of scope. The model client is a later change. This layer only wraps services that already exist.
+The tool layer is the typed surface the author loop calls. It does not call a model itself, and it does not hold a wallet, a key, or a swap path. The model client is `service/app/agent`. This layer only wraps services that already exist.
 
 Code lives in `service/app/tools/`. `create_app()` mounts `GET /tools` and `POST /tools/{tool_name}`.
 
@@ -45,7 +45,7 @@ A tool that ran and failed uses the same envelope and an HTTP status taken from 
 
 A bad HTTP body, a body over 1 MiB, or a tool name that is not the catalog uses the existing `{error: {code, message, path}}` envelope. An unknown catalog name is HTTP 404 `unknown_tool`. `NaN`, `Infinity`, and a NUL byte in the raw body are HTTP 422 `invalid_json` or `invalid_string` and never reach a handler.
 
-Every input and output schema is JSON Schema draft 2020-12. Every object schema sets `additionalProperties` to false. The dispatcher rejects unknown fields, a bool used as an integer, non-finite numbers, NUL, a string over 100000 characters, a payload over 1 MiB, and a document deeper than the IR depth cap. `user_id` and `owner_id` are not arguments. Sending either is a schema error.
+Every input and output schema is JSON Schema draft 2020-12. Every object schema sets `additionalProperties` to false. Patterns use ECMA-262, so `$` matches only the end of the text. A trailing newline does not pass. Exported schemas keep `$` and do not contain the Python-only `\Z` anchor. The dispatcher rejects unknown fields, a bool used as an integer, non-finite numbers, NUL, a string over 100000 characters, a payload over 1 MiB, and a document deeper than the IR depth cap. `user_id` and `owner_id` are not arguments. Sending either is a schema error.
 
 ## Auth
 
@@ -60,7 +60,8 @@ A strategy or job owned by any other id is `not_found`. The response does not in
 | `not_found` | 404 | no | Missing strategy, version, or job, including another owner's row. |
 | `strategy_archived` | 404 | no | The strategy is archived. |
 | `unknown_tool` | 404 | no | The name is not in the catalog. |
-| `version_conflict` | 409 | no | `expected_version` or `expected_ir_hash` is not the latest row. |
+| `version_conflict` | 409 | no | `expected_version` or `expected_ir_hash` is not the row just read. |
+| `no_changes` | 409 | no | Apply was asked to store a candidate identical to that row. |
 | `conflict` | 409 | no | `request_key` was already used with a different backtest body. |
 | `expired` | 410 | no | The backtest result is past the 24 hour TTL. |
 | `payload_too_large` | 413 | no | The body, or one string, is over the cap. |
@@ -83,9 +84,11 @@ Messages are single-line and capped. They do not include a traceback, an excepti
 
 Preview returns `mutated: false`, `from_version`, `to_version` (`from_version + 1`), both hashes, `changed`, `dsl_diff`, and `ir_diff`. It does not insert a version and it does not change `updated_at`. `confirm` and `expected_version` are ignored in this mode.
 
-`mode: "apply"` writes only when `confirm` is true and `expected_version` is present. Optional `expected_ir_hash` must match the latest row too. `StrategyStore.add_version` compares those inside the same `BEGIN IMMEDIATE` transaction that inserts the next version. A mismatch raises `VersionConflict`, rolls back, and returns `version_conflict` with the owner's current version and hash. Two overlapping applies with the same `expected_version` produce one new version and one conflict.
+`mode: "apply"` writes only when `confirm` is true and `expected_version` is the version just read. Optional `expected_ir_hash` must match that same row. The check runs before the diff is built and before `add_version`. A stale `expected_version` cannot return a diff for version 1 while a later version is committed. `StrategyStore.add_version` compares the same pair again inside the `BEGIN IMMEDIATE` transaction that inserts the next version. A mismatch raises `VersionConflict`, rolls back, and returns `version_conflict` with the owner's current version and hash. The response `from_version`, `from_ir_hash`, `dsl_diff`, and `ir_diff` describe that predecessor. Two overlapping applies with the same `expected_version` produce one new version and one conflict.
 
-`PUT /strategies/{strategy_id}` does not send `expected_version` or `expected_ir_hash`. Omitting both keeps that route appending the next version, which is the ROZ-75 behavior.
+When the candidate DSL and IR are both identical to that predecessor, apply returns `no_changes` and does not append a version.
+
+`PUT /strategies/{strategy_id}` does not send `expected_version` or `expected_ir_hash`, and it does not use the `no_changes` guard. Omitting both keeps that route appending the next version, which is the ROZ-75 behavior. The author loop's accept path is separate and is described in `docs/agent-loop.md`.
 
 ## Tools
 
@@ -97,7 +100,7 @@ Preview returns `mutated: false`, `from_version`, `to_version` (`from_version + 
 
 `validate` uses that same compile path and does not touch the store.
 
-`backtest_start` accepts a saved `strategy_id` (optional `version`) or inline `dsl` or `ir`, plus `bars` and an optional `request_key`. The body is prepared by `app.jobs.routes._prepare` and started on `JobQueue`. A missing `request_key` is a new id. The same key and body returns the original job. A different body for that key is `conflict`. `backtest_status` and `backtest_get` read that job for the current user. `started_at` and `finished_at` are null because the queue does not store them. `created_at` and `expires_at` come from the row and the 24 hour result TTL. A finished job's bars are not kept. Results live only in the job result row until that TTL. The backtest engine is unchanged.
+`backtest_start` accepts a saved `strategy_id` (optional `version`) or inline `dsl` or `ir`, plus `bars` and an optional `request_key`. The author loop pins the version it validated before this tool runs; see `docs/agent-loop.md`. The body is prepared by `app.jobs.routes._prepare` and started on `JobQueue`. A missing `request_key` is a new id. The same key and body returns the original job. A different body for that key is `conflict`. `backtest_status` and `backtest_get` read that job for the current user. `started_at` and `finished_at` are null because the queue does not store them. `created_at` and `expires_at` come from the row and the 24 hour result TTL. A finished job's bars are not kept. Results live only in the job result row until that TTL. The backtest engine is unchanged.
 
 `add_chart` checks a symbol, mint, or asset against the major registry or `require_mint`, and checks `timeframe` against `BAR_SIZES`. A symbol that is not a major is `unknown_symbol`. That code comes from the chart and indicator directive helpers, not from `search_asset`. It returns a `directive_type` of `chart` and `directive_version` `"1.0"`. It stores nothing.
 
@@ -105,7 +108,7 @@ Preview returns `mutated: false`, `from_version`, `to_version` (`from_version + 
 
 ## What this layer does not do
 
-- No model call and no model API key.
+- No model call of its own. The author loop in `service/app/agent` is the model client. This layer still does not read an API key.
 - No wallet, signing, swap, or order routing.
 - No second user, signup, or sharing.
 - No change to backtest fill math, the ROZ-72/73 performance guards, or the 24 hour TTL constants.
