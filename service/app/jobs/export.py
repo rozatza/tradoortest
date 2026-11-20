@@ -7,6 +7,7 @@ ratio, a fill, or an equity mark. The bytes match ``trade_log_csv``,
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -28,7 +29,12 @@ class ExportError(ValueError):
 
 
 def render_export(name: str, result: Mapping[str, Any]) -> str:
-    """Return the file body for one allowlisted export name."""
+    """Return the file body for one allowlisted export name.
+
+    Call this off the event loop. A running loop on this thread means the
+    request handler rendered the file inline.
+    """
+    _refuse_event_loop()
     if name == "trades.csv":
         return _trades_csv(result)
     if name == "trades.json":
@@ -38,6 +44,14 @@ def render_export(name: str, result: Mapping[str, Any]) -> str:
     if name == "metrics.json":
         return _metrics_json(result)
     raise ExportError(name)
+
+
+def _refuse_event_loop() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError("export render is on the event loop")
 
 
 def _trades_csv(result: Mapping[str, Any]) -> str:

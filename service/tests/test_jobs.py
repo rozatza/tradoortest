@@ -6,6 +6,7 @@ job database.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -14,6 +15,7 @@ import time
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1035,14 +1037,11 @@ def _result_schema() -> dict:
     return next(item for item in variants if item.get("type") == "object")
 
 
-def test_the_result_schema_accepts_the_engine_equity_curve() -> None:
+def test_the_tool_result_schema_has_no_equity_curve() -> None:
     schema = _result_schema()
-    curve = schema["properties"]["equity_curve"]
-    assert "equity_curve" in schema["required"]
-    assert curve["maxItems"] == MAX_GRID_BARS == 200_000
-    point = curve["items"]
-    assert point["additionalProperties"] is False
-    assert point["required"] == ["open_time", "equity", "cash"]
+    assert "equity_curve" not in schema["properties"]
+    assert "equity_curve" not in schema["required"]
+    assert schema["additionalProperties"] is False
 
 
 def test_results_include_the_engine_curve_and_exports_match(tmp_path: Path) -> None:
@@ -1202,4 +1201,142 @@ def test_a_corrupt_result_is_422_not_500(tmp_path: Path) -> None:
         assert exported.status_code == 422
         assert exported.json()["error"]["code"] == "invalid_result"
     finally:
+        queue.close()
+
+
+def test_a_legacy_result_without_a_curve_still_exports(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    bars = [_row(0, 100), _row(60, 110), _row(120, 130)]
+    posted = _payload("legacy", bars=bars)
+    try:
+        created = client.post("/backtests", json=posted)
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        prepared = _prepare(posted)
+        engine = run_backtest(
+            prepared["ir"],
+            {
+                asset_id: _bars(asset_id, rows, prepared["ir"]["engine"]["bar_size"])
+                for asset_id, rows in prepared["bars"].items()
+            },
+            long_no_trade_minutes=prepared["long_no_trade_minutes"],
+        )
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            row = conn.execute(
+                "SELECT result_json FROM job_results WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            assert "equity_curve" in stored
+            del stored["equity_curve"]
+            conn.execute(
+                "UPDATE job_results SET result_json = ? WHERE job_id = ?",
+                (json.dumps(stored), job_id),
+            )
+        results = client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 200
+        assert "equity_curve" not in results.json()
+        expected = {
+            "trades.csv": trade_log_csv(engine.trades),
+            "trades.json": trade_log_json(engine.trades),
+            "metrics.csv": metrics_csv(engine.metrics),
+            "metrics.json": metrics_json(engine.metrics),
+        }
+        for name, text in expected.items():
+            exported = client.get(f"/backtests/{job_id}/exports/{name}")
+            assert exported.status_code == 200
+            assert exported.text == text
+    finally:
+        queue.close()
+
+
+def test_render_export_refuses_the_event_loop() -> None:
+    values = {column: "1" for column in METRIC_COLUMNS}
+    result = {"metrics": {"values": values, "undefined": {}}, "trades": []}
+
+    async def on_the_loop() -> None:
+        render_export("metrics.json", result)
+
+    with pytest.raises(RuntimeError, match="event loop"):
+        asyncio.run(on_the_loop())
+    assert "1" in render_export("metrics.json", result)
+
+
+def test_health_answers_while_a_max_size_export_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trade = {column: "1" for column in TRADE_COLUMNS}
+    values = {column: "0.1000000000" for column in METRIC_COLUMNS}
+    huge = {
+        "trades": [trade] * 50_000,
+        "metrics": {"values": values, "undefined": {}},
+        "equity_curve": [
+            {"open_time": index, "equity": "1.00", "cash": "1.00"} for index in range(200_000)
+        ],
+    }
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: huge)
+    client = _client(queue)
+    started = threading.Event()
+    release = threading.Event()
+    rendered_on: list[threading.Thread] = []
+    real_render = render_export
+
+    def wrapped(name: str, result: dict) -> str:
+        rendered_on.append(threading.current_thread())
+        started.set()
+        text = real_render(name, result)
+        assert release.wait(5)
+        return text
+
+    monkeypatch.setattr("app.jobs.routes.render_export", wrapped)
+    try:
+        created = client.post("/backtests", json=_payload("huge"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        deadline = time.monotonic() + 30
+        status = "queued"
+        while time.monotonic() < deadline and status not in {"succeeded", "failed"}:
+            status = client.get(f"/backtests/{job_id}").json()["status"]
+            time.sleep(0.02)
+        assert status == "succeeded"
+        application = create_app(jobs=queue)
+
+        async def probe() -> None:
+            loop_thread = threading.current_thread()
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                timeout=30,
+            ) as http:
+                warm = await http.get("/health")
+                assert warm.status_code == 200
+                export_task = asyncio.create_task(
+                    http.get(f"/backtests/{job_id}/exports/trades.csv")
+                )
+                seen = time.monotonic() + 15
+                while not started.is_set() and time.monotonic() < seen:
+                    await asyncio.sleep(0.01)
+                assert started.is_set()
+                health_started = time.monotonic()
+                health = await http.get("/health")
+                elapsed = time.monotonic() - health_started
+                release.set()
+                exported = await export_task
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            assert elapsed < 0.1
+            assert exported.status_code == 200
+            assert exported.text.startswith("trade_id,")
+            assert len(exported.content) > 1_000_000
+            assert rendered_on
+            assert rendered_on[0] is not loop_thread
+
+        asyncio.run(probe())
+    finally:
+        release.set()
         queue.close()

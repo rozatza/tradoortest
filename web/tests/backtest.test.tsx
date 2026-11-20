@@ -187,7 +187,7 @@ describe("backtest results", () => {
     expect(screen.getByRole("cell", { name: "1480.52" }).getAttribute("title")).toBe("1480.52");
   });
 
-  it("says the curve is unavailable when the result has fills but no curve", async () => {
+  it("shows Equity curve unavailable for a legacy result without the curve", async () => {
     const body = resultBody();
     delete body.equity_curve;
     body.fills = [{ equity_after: "1.11", price: "9.99" }];

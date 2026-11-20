@@ -27,9 +27,12 @@ from app.main import create_app
 from app.strategies.compile import compile_body
 from app.strategies.store import StrategyStore
 from app.tools.dispatch import Dispatcher
+from app.tools.errors import ToolError
 from app.tools.registry import BY_NAME
 from app.tools.routes import MAX_BODY_BYTES
 from app.tools.runtime import ToolRuntime
+from app.tools.specs import OUTPUTS
+from app.tools.strict import validate_schema
 from test_backtest import _START, _strategy
 
 _USER = CurrentUser(user_id=LOCAL_USER_ID)
@@ -514,6 +517,7 @@ def test_backtest_tools_wrap_the_queue(tmp_path: Path) -> None:
         assert loaded["data"]["ready"] is True
         assert loaded["data"]["result"]["schema"] == "tradoortest.backtest_result.v1"
         assert loaded["data"]["result"]["final_equity"] == "10600.00"
+        assert "equity_curve" not in loaded["data"]["result"]
         replay = _invoke(
             dispatcher,
             "backtest_start",
@@ -550,6 +554,77 @@ def test_backtest_tools_wrap_the_queue(tmp_path: Path) -> None:
         assert "bars" not in tables
         assert bodies is not None
         assert int(bodies[0]) == 0
+    finally:
+        store.close()
+        jobs.close()
+
+
+def test_backtest_get_omits_a_large_stored_curve_and_rejects_one(tmp_path: Path) -> None:
+    dispatcher, store, jobs = _runtime(tmp_path)
+    marker = "CURVE-ONLY-99191"
+    try:
+        started = _invoke(
+            dispatcher,
+            "backtest_start",
+            {"ir": _strategy(), "bars": _bars(), "request_key": "curve"},
+        )
+        assert started["ok"] is True
+        job_id = started["data"]["job_id"]
+        assert _wait(dispatcher, job_id)["data"]["status"] == "succeeded"
+        curve = [
+            {
+                "open_time": index,
+                "equity": marker if index == 0 else "1.00",
+                "cash": "1.00",
+            }
+            for index in range(10_000)
+        ]
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            row = conn.execute(
+                "SELECT result_json FROM job_results WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            stored["equity_curve"] = curve
+            conn.execute(
+                "UPDATE job_results SET result_json = ? WHERE job_id = ?",
+                (json.dumps(stored, separators=(",", ":")), job_id),
+            )
+        loaded = _invoke(dispatcher, "backtest_get", {"job_id": job_id})
+        assert loaded["ok"] is True
+        result = loaded["data"]["result"]
+        assert "equity_curve" not in result
+        assert marker not in json.dumps(loaded)
+        validate_schema(OUTPUTS["backtest_get"], loaded["data"])
+        poisoned = json.loads(json.dumps(loaded["data"]))
+        poisoned["result"]["equity_curve"] = curve[:1]
+        with pytest.raises(ToolError) as caught:
+            validate_schema(OUTPUTS["backtest_get"], poisoned)
+        refusal = json.dumps(
+            {
+                "message": caught.value.message,
+                "path": caught.value.path,
+                "details": caught.value.details,
+            }
+        )
+        assert "equity_curve" in refusal
+        application = create_app(jobs=jobs)
+        client = TestClient(application)
+        http_result = client.get(f"/backtests/{job_id}/results")
+        assert http_result.status_code == 200
+        assert http_result.json()["equity_curve"][0]["equity"] == marker
+        tool_http = client.post("/tools/backtest_get", json={"job_id": job_id})
+        assert tool_http.status_code == 200
+        assert "equity_curve" not in tool_http.json()["data"]["result"]
+        assert marker not in tool_http.text
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            kept = conn.execute(
+                "SELECT result_json FROM job_results WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        assert kept is not None
+        assert marker in kept[0]
     finally:
         store.close()
         jobs.close()

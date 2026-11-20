@@ -58,7 +58,7 @@ Validation runs before the job is stored. A bad document, a lone surrogate (incl
 `GET /backtests/{job_id}/results` is HTTP 200 when the job succeeded. The body is `tradoortest.backtest_result.v1`:
 
 - `final_equity` and `final_cash` are decimal strings
-- `equity_curve` is one point per grid slot, in order: `open_time` (integer unix second), `equity` and `cash` (decimal strings). Those are the engine's cent marks. A reader does not recompute them
+- `equity_curve` is one point per grid slot, in order: `open_time` (integer unix second), `equity` and `cash` (decimal strings). Those are the engine's cent marks. A reader does not recompute them. `backtest_get` removes this field before the tool result is returned. A stored result that has no curve is still HTTP 200, and the four exports below are still HTTP 200
 - `metrics.values` is one decimal string or null per ratio
 - `metrics.undefined` maps a null ratio to its reason (`docs/metrics.md`)
 - `metrics` also carries the grid, missing, synthetic, and suspect-outage counts, the in-position twins, and `take_profit_limit_below_low`

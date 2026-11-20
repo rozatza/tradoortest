@@ -107,17 +107,13 @@ async def backtest_export(
     request: Request,
     user: CurrentUserDep,
 ) -> Response:
-    """Serve one stored export. SQLite work stays off the event loop."""
+    """Serve one stored export. The read and the file render stay off the event loop."""
     if name not in EXPORT_NAMES:
         return error_response(404, "not_found", "export was not found", None)
-    loaded = await run_in_threadpool(_load_result, request, user.user_id, job_id)
-    if isinstance(loaded, JSONResponse):
-        return loaded
-    try:
-        body = render_export(name, loaded)
-    except ExportError:
-        return error_response(422, "invalid_result", "backtest result could not be exported", None)
-    media = "text/csv; charset=utf-8" if name.endswith(".csv") else "application/json"
+    rendered = await run_in_threadpool(_render_export, request, user.user_id, job_id, name)
+    if isinstance(rendered, JSONResponse):
+        return rendered
+    body, media = rendered
     return Response(
         content=body,
         media_type=media,
@@ -126,6 +122,24 @@ async def backtest_export(
             "content-disposition": f'attachment; filename="{name}"',
         },
     )
+
+
+def _render_export(
+    request: Request,
+    user_id: str,
+    job_id: str,
+    name: str,
+) -> tuple[str, str] | JSONResponse:
+    """Load the stored result and render one export. Both steps are synchronous."""
+    loaded = _load_result(request, user_id, job_id)
+    if isinstance(loaded, JSONResponse):
+        return loaded
+    try:
+        body = render_export(name, loaded)
+    except ExportError:
+        return error_response(422, "invalid_result", "backtest result could not be exported", None)
+    media = "text/csv; charset=utf-8" if name.endswith(".csv") else "application/json"
+    return body, media
 
 
 def _load_result(request: Request, user_id: str, job_id: str) -> dict[str, Any] | JSONResponse:

@@ -92,6 +92,8 @@ def backtest_get(
         ) from None
     if not isinstance(result, dict):
         raise ToolError("service_unavailable", "the job database is unavailable", retryable=True)
+    # The curve stays in the job row for the UI routes. It is not a tool field.
+    result.pop("equity_curve", None)
     body["ready"] = True
     body["error"] = None
     body["result"] = result
