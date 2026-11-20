@@ -12,6 +12,8 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import fields
@@ -30,8 +32,10 @@ from app.runner import (
     BarWindow,
     BookView,
     OcoLevels,
+    OcoTouch,
     RuleAttempt,
     RunnerConfig,
+    SignalTruth,
     initial_state,
     make_window,
     run,
@@ -409,6 +413,88 @@ def test_a_window_that_still_holds_the_future_is_rejected() -> None:
     config = config_from_document(_strategy())
     with pytest.raises(BacktestError, match="after 0"):
         step(config, initial_state(("sol",)), window, BookView())
+
+
+def test_a_closed_series_longer_than_this_bar_is_rejected() -> None:
+    """A ClosedSeries whose end is past ``t + 1`` is a future window.
+
+    A raw list is already rejected because it is not a closed series. This
+    is the series a caller can build by hand: length ``t + 2``, still typed
+    as a closed series. Bar 0 must not be allowed to read the 999.
+    """
+    bar = _bar(0, 100)
+    longer = ClosedSeries([100.0, 999.0], 2)
+    window = BarWindow(0, bar.open_time, {"sol": {"close": longer}}, {"sol": bar})
+    config = config_from_document(_strategy(signals=[{"id": "go", "expr": _gt("close", 50)}]))
+    with pytest.raises(BacktestError, match="after 0"):
+        step(config, initial_state(("sol",)), window, BookView())
+
+
+def test_an_oco_attached_on_this_bar_is_not_a_touch() -> None:
+    """The attachment bar is not a touch. The same wick on a later bar is.
+
+    ``step`` sees the book the caller passes. A paper runner can attach and
+    then ask about that same bar. The backtester's own view is from before
+    the fill, so this path is not the one that view takes.
+    """
+    bar = _bar(0, 100, high=110, low=90)
+    window = make_window(0, bar.open_time, {"sol": {"close": [100.0]}}, {"sol": bar})
+    config = config_from_document(_strategy())
+    state = initial_state(config.asset_ids)
+    same_bar = BookView(
+        (("sol", Decimal("100")),),
+        (("sol", OcoLevels(Decimal("120"), Decimal("95"), bar.open_time)),),
+    )
+    held = step(config, state, window, same_bar)
+    assert held.decision.oco == ()
+    previous = BookView(
+        (("sol", Decimal("100")),),
+        (("sol", OcoLevels(Decimal("120"), Decimal("95"), bar.open_time - 60)),),
+    )
+    touched = step(config, state, window, previous)
+    assert touched.decision.oco == (OcoTouch("sol", "stop_loss", Decimal("95"), False),)
+
+
+def test_two_rules_on_one_signal_are_one_signal_truth() -> None:
+    """``(signal, asset)`` is evaluated once. A second rule does not repeat it."""
+    config = config_from_document(
+        _strategy(
+            rules=[
+                {"id": "enter_rule", "when": "go", "do": "enter_sol"},
+                {"id": "enter_again", "when": "go", "do": "enter_sol"},
+            ]
+        )
+    )
+    assert config.pairs == (("go", "sol"),)
+    bar = _bar(0, 100)
+    window = make_window(0, bar.open_time, {"sol": {"close": [100.0]}}, {"sol": bar})
+    outcome = step(config, initial_state(config.asset_ids), window, BookView())
+    assert outcome.decision.signals == (SignalTruth("go", "sol", True),)
+
+
+def test_a_fresh_interpreter_imports_the_runner_before_the_backtest() -> None:
+    """``from app.runner import step`` is the paper-runner import.
+
+    The process has not imported ``app.backtest`` first. A second process
+    imports the backtest package on its own.
+    """
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    for code in (
+        "import app.runner; from app.runner import step, run",
+        "import app.backtest",
+    ):
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
 
 
 def test_warmup_updates_memory_and_does_not_attempt_an_order() -> None:

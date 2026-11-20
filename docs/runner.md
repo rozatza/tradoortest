@@ -1,6 +1,6 @@
 # Shared runner
 
-`service/app/runner` decides one bar. The backtester applies the decision to a simulated book. A paper runner calls the same function once per bar. The runner does not send an order, hold a wallet, or sign anything. It does not read a clock, draw a random number, open a file, or use the network.
+`service/app/runner` decides one bar. The backtester applies the decision to a simulated book. A paper runner calls the same function once per bar, starting from `from app.runner import step` in a process that has not imported the backtester. The runner does not send an order, hold a wallet, or sign anything. It does not read a clock, draw a random number, open a file, or use the network.
 
 ## Interface
 
@@ -32,3 +32,9 @@
 **Stepping equals batch.** Calling `step` once per bar, passing each returned state into the next call, returns the same results as `run` on those windows and views.
 
 **Real bars only.** The runner does not invent candles. A simulated fill is the caller's job, and only an attempt with a close — a real, non-synthetic bar — is one. A synthetic bar and a hole are skips, not orders queued for a later bar.
+
+## Cost
+
+The series buffers are not copied. Each bar still builds a closed window over those buffers, checks that the window stops at that bar, and returns a new decision and a new memory object. That is the paper-runner interface.
+
+On the example EMA-cross, remapped to `1m` and run for 3000 bars, three timed calls after one warmup took 0.054s on the engine from `e56685c` and 0.085s through this runner (about 58% slower). The PM dig of the same shape recorded 0.050s and 0.084s. A profile of the slower run put the extra time in `make_window`, the future-window check, and `step`'s decision and memory objects, not in a second copy of the bars. Removing those objects would change what `step` returns. The walk was left as it is, so those timings are the before and the after.
