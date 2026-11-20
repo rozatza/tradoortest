@@ -29,6 +29,7 @@ from app.dsl.format import format_strategy
 from app.ir.canonical import ir_hash
 from app.ir.validate import REPO_ROOT
 from app.jobs.queue import JobQueue
+from app.jobs.routes import _prepare
 from app.ohlcv.adapters.any_mint import AnyMintSource
 from app.ohlcv.routes import OhlcvRuntime
 from app.ohlcv.store import SqliteBarStore
@@ -900,5 +901,99 @@ def test_model_context_omits_bars_and_backtest_results(tmp_path: Path) -> None:
         assert result["status"] == "completed", result
         assert state["checked_args"] is True
         assert state["checked_result"] is True
+    finally:
+        world.close()
+
+
+def test_a_curve_canary_stays_out_of_the_model_and_the_agent_store(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    try:
+        bars = [
+            {
+                "open_time": _START + index * 3600,
+                "open": 100 + (index % 17),
+                "high": 120,
+                "low": 90,
+                "close": 100 + (index % 17),
+                "volume": 1,
+            }
+            for index in range(240)
+        ]
+        prepared = _prepare({"ir": _strategy(), "bars": {"sol": bars}})
+        started = world.jobs.start(
+            user_id=LOCAL_USER_ID,
+            request_key="curve-canary",
+            body=prepared,
+        )
+        deadline = time.monotonic() + 20
+        status = ""
+        while time.monotonic() < deadline:
+            status = world.jobs.get(LOCAL_USER_ID, started.job_id).status
+            if status in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+        assert status == "succeeded"
+        with sqlite3.connect(world.jobs_path) as conn:
+            row = conn.execute(
+                "SELECT result_json FROM job_results WHERE job_id = ?",
+                (started.job_id,),
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            assert len(stored["equity_curve"]) > 3
+            stored["equity_curve"][3]["cash"] = "ZZCURVECANARY"
+            conn.execute(
+                "UPDATE job_results SET result_json = ? WHERE job_id = ?",
+                (json.dumps(stored), started.job_id),
+            )
+        provider = StubProvider(
+            [
+                _tool("backtest_get", {"job_id": started.job_id}, "g1"),
+                _reply("ok"),
+            ]
+        )
+        result = world.turn(provider, "go")
+        assert result["status"] == "completed", result
+        tool_msgs = [
+            message.content
+            for request in provider.requests
+            for message in request.messages
+            if message.role == "tool"
+        ]
+        assert tool_msgs
+        allowed = {
+            "result_omitted",
+            "job_id",
+            "status",
+            "ready",
+            "created_at",
+            "expires_at",
+            "error",
+        }
+        for text in tool_msgs:
+            parsed = json.loads(text)
+            inner = parsed.get("data", parsed)
+            assert isinstance(inner, dict)
+            assert inner.get("result_omitted") is True
+            assert set(inner) <= allowed, inner
+            for bad in (
+                "net_return",
+                "sharpe",
+                "trades",
+                "fills",
+                "equity",
+                "ZZCURVECANARY",
+                "final_cash",
+            ):
+                assert bad not in text, bad
+        dumped = json.dumps(result)
+        for bad in ("net_return", "ZZCURVECANARY", "equity_curve"):
+            assert bad not in dumped, bad
+        world.close()
+        raw = _sqlite_blob(tmp_path / "agent.sqlite")
+        for bad in ("net_return", "sharpe", "ZZCURVECANARY", "equity_curve", "final_equity"):
+            assert bad not in raw, bad
+        job_text = _sqlite_blob(world.jobs_path)
+        assert "ZZCURVECANARY" in job_text
     finally:
         world.close()

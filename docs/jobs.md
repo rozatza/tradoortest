@@ -58,10 +58,24 @@ Validation runs before the job is stored. A bad document, a lone surrogate (incl
 `GET /backtests/{job_id}/results` is HTTP 200 when the job succeeded. The body is `tradoortest.backtest_result.v1`:
 
 - `final_equity` and `final_cash` are decimal strings
+- `equity_curve` is one point per grid slot, in order: `open_time` (integer unix second), `equity` and `cash` (decimal strings). Those are the engine's cent marks. A reader does not recompute them. `backtest_get` removes this field before the tool result is returned. A stored result that has no curve is still HTTP 200, and the four exports below are still HTTP 200
 - `metrics.values` is one decimal string or null per ratio
 - `metrics.undefined` maps a null ratio to its reason (`docs/metrics.md`)
 - `metrics` also carries the grid, missing, synthetic, and suspect-outage counts, the in-position twins, and `take_profit_limit_below_low`
 - `trades` and `fills` use the same decimal strings as the trade log
+
+## Export
+
+These four reads encode the stored result. They do not run the engine again and they do not recompute a ratio:
+
+| Path | Body |
+| --- | --- |
+| `GET /backtests/{job_id}/exports/trades.csv` | `trade_log_csv` of the stored trades |
+| `GET /backtests/{job_id}/exports/trades.json` | `trade_log_json` of the stored trades |
+| `GET /backtests/{job_id}/exports/metrics.csv` | `metrics_csv` of the stored ratios |
+| `GET /backtests/{job_id}/exports/metrics.json` | `metrics_json` of the stored ratios |
+
+A cell that is not already a string or null is HTTP 422 `invalid_result`. The status codes otherwise match `/results`: 200, 409 `not_ready`, 422 for a failed job, 404, and 410 `expired` when that read is the one that deletes the row. An unknown file name is HTTP 404 `not_found` and does not read the job. `cache-control` is `no-store`.
 
 No field is NaN or infinite. A job that is still `queued` or `running` is HTTP 409 `not_ready`. A `failed` job is HTTP 422 with the stored error. Unknown jobs are HTTP 404. A job past the retention window is HTTP 410 `expired` when that read is the one that deletes it. 410 is best-effort: if a start, another read, or startup already purged the row, the response is 404.
 

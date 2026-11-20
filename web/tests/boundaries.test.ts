@@ -9,6 +9,8 @@ const FORBIDDEN = [
   "localStorage",
   "sessionStorage",
   "indexedDB",
+  "caches",
+  "CacheStorage",
   "NEXT_PUBLIC_",
   "privateKey",
   "signTransaction",

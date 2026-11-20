@@ -2,9 +2,10 @@
 
 ``POST /backtests`` starts a job. The same ``request_key`` returns that job
 again. ``GET /backtests/{job_id}`` is the status. ``GET /backtests/{job_id}/results``
-is the persisted result. Concurrency and the per-minute cap return 429.
-Validation, a too-large time grid, a too-deep document, and a failed run
-return 4xx. None of these routes is a 500 for those failures.
+is the persisted result. ``GET /backtests/{job_id}/exports/{name}`` is the
+trade log or the ratio file for that result. Concurrency and the per-minute
+cap return 429. Validation, a too-large time grid, a too-deep document, and
+a failed run return 4xx. None of these routes is a 500 for those failures.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import CurrentUserDep
 from app.backtest.engine import MAX_GRID_BARS, grid_bar_count
@@ -28,6 +30,7 @@ from app.expr.errors import ExprError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError, check_json_value, lone_surrogate_at
 from app.ir.validate import validate_ir
+from app.jobs.export import EXPORT_NAMES, ExportError, render_export
 from app.jobs.queue import JobExpired, JobQueue, JobRecord, KeyReused, LimitReached, QueueBusy
 
 router = APIRouter()
@@ -91,12 +94,62 @@ def backtest_status(job_id: str, request: Request, user: CurrentUserDep) -> JSON
 
 @router.get("/backtests/{job_id}/results")
 def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSONResponse:
+    loaded = _load_result(request, user.user_id, job_id)
+    if isinstance(loaded, JSONResponse):
+        return loaded
+    return JSONResponse(status_code=200, content=loaded)
+
+
+@router.get("/backtests/{job_id}/exports/{name}")
+async def backtest_export(
+    job_id: str,
+    name: str,
+    request: Request,
+    user: CurrentUserDep,
+) -> Response:
+    """Serve one stored export. The read and the file render stay off the event loop."""
+    if name not in EXPORT_NAMES:
+        return error_response(404, "not_found", "export was not found", None)
+    rendered = await run_in_threadpool(_render_export, request, user.user_id, job_id, name)
+    if isinstance(rendered, JSONResponse):
+        return rendered
+    body, media = rendered
+    return Response(
+        content=body,
+        media_type=media,
+        headers={
+            "cache-control": "no-store",
+            "content-disposition": f'attachment; filename="{name}"',
+        },
+    )
+
+
+def _render_export(
+    request: Request,
+    user_id: str,
+    job_id: str,
+    name: str,
+) -> tuple[str, str] | JSONResponse:
+    """Load the stored result and render one export. Both steps are synchronous."""
+    loaded = _load_result(request, user_id, job_id)
+    if isinstance(loaded, JSONResponse):
+        return loaded
+    try:
+        body = render_export(name, loaded)
+    except ExportError:
+        return error_response(422, "invalid_result", "backtest result could not be exported", None)
+    media = "text/csv; charset=utf-8" if name.endswith(".csv") else "application/json"
+    return body, media
+
+
+def _load_result(request: Request, user_id: str, job_id: str) -> dict[str, Any] | JSONResponse:
+    """The stored result for this owner, or the same error the results route uses."""
     try:
         queue = _queue(request)
     except QueueBusy:
         return _busy()
     try:
-        job = queue.get(user.user_id, job_id)
+        job = queue.get(user_id, job_id)
     except JobExpired:
         return _expired()
     except KeyError:
@@ -111,12 +164,18 @@ def backtest_results(job_id: str, request: Request, user: CurrentUserDep) -> JSO
         }
         return JSONResponse(status_code=422, content={"error": error})
     try:
-        text = queue.result_json(user.user_id, job_id)
+        text = queue.result_json(user_id, job_id)
     except JobExpired:
         return _expired()
     if text is None:
         return error_response(409, "not_ready", "backtest results are not ready", None)
-    return JSONResponse(status_code=200, content=json.loads(text))
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    if not isinstance(payload, dict):
+        return error_response(422, "invalid_result", "backtest result could not be read", None)
+    return payload
 
 
 async def _start(request: Request, user_id: str) -> JSONResponse:

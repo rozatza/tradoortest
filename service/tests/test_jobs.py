@@ -6,6 +6,7 @@ job database.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sqlite3
@@ -14,19 +15,25 @@ import time
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.backtest import metrics_csv, metrics_json, run_backtest, trade_log_csv, trade_log_json
 from app.backtest.engine import MAX_GRID_BARS
+from app.backtest.log import METRIC_COLUMNS, TRADE_COLUMNS
 from app.dsl import format_strategy, parse_strategy
 from app.dsl.errors import StrategyError
 from app.indicators.errors import IndicatorError
 from app.ir.canonical import canonicalize
 from app.ir.depth import JsonShapeError
 from app.ir.validate import validate_ir
+from app.jobs.export import ExportError, render_export
 from app.jobs.queue import JobQueue, QueueBusy
-from app.jobs.run import run_backtest_job
+from app.jobs.routes import _prepare
+from app.jobs.run import _bars, run_backtest_job
 from app.main import create_app
+from app.tools.specs import OUTPUTS
 from test_backtest import _START, _risk, _strategy
 
 _LOCAL = "local-user"
@@ -1023,3 +1030,313 @@ def test_parse_strategy_rejects_a_lone_surrogate_with_a_position() -> None:
     assert error.line == 2
     assert error.column >= 1
     assert "surrogate" in error.message
+
+
+def _result_schema() -> dict:
+    variants = OUTPUTS["backtest_get"]["properties"]["result"]["anyOf"]
+    return next(item for item in variants if item.get("type") == "object")
+
+
+def test_the_tool_result_schema_has_no_equity_curve() -> None:
+    schema = _result_schema()
+    assert "equity_curve" not in schema["properties"]
+    assert "equity_curve" not in schema["required"]
+    assert schema["additionalProperties"] is False
+
+
+def test_results_include_the_engine_curve_and_exports_match(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    bars = [_row(0, 100), _row(60, 110), _row(120, 130)]
+    posted = _payload("curve", bars=bars)
+    try:
+        created = client.post("/backtests", json=posted)
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        results = client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 200
+        payload = results.json()
+        prepared = _prepare(posted)
+        engine = run_backtest(
+            prepared["ir"],
+            {
+                asset_id: _bars(asset_id, rows, prepared["ir"]["engine"]["bar_size"])
+                for asset_id, rows in prepared["bars"].items()
+            },
+            long_no_trade_minutes=prepared["long_no_trade_minutes"],
+        )
+        assert payload["equity_curve"] == [
+            {
+                "open_time": point.open_time,
+                "equity": format(point.equity, "f"),
+                "cash": format(point.cash, "f"),
+            }
+            for point in engine.equity_curve
+        ]
+        trades_csv = client.get(f"/backtests/{job_id}/exports/trades.csv")
+        trades_json = client.get(f"/backtests/{job_id}/exports/trades.json")
+        metrics_csv_body = client.get(f"/backtests/{job_id}/exports/metrics.csv")
+        metrics_json_body = client.get(f"/backtests/{job_id}/exports/metrics.json")
+        assert trades_csv.status_code == 200
+        assert trades_csv.text == trade_log_csv(engine.trades)
+        assert trades_csv.headers["content-type"].startswith("text/csv")
+        assert trades_csv.headers["cache-control"] == "no-store"
+        assert trades_csv.headers["content-disposition"] == 'attachment; filename="trades.csv"'
+        assert trades_json.text == trade_log_json(engine.trades)
+        assert trades_json.headers["content-type"].startswith("application/json")
+        assert metrics_csv_body.text == metrics_csv(engine.metrics)
+        assert metrics_json_body.text == metrics_json(engine.metrics)
+        stored = payload["metrics"]["values"]["net_return"]
+        assert stored in metrics_json_body.text
+        assert stored in metrics_csv_body.text
+        unknown = client.get(f"/backtests/{job_id}/exports/trades.txt")
+        assert unknown.status_code == 404
+        assert unknown.json()["error"]["code"] == "not_found"
+    finally:
+        queue.close()
+
+
+def test_export_copies_stored_strings_and_rejects_a_computed_cell() -> None:
+    values = {column: "0.0000000000" for column in METRIC_COLUMNS}
+    values["net_return"] = "9.9999999999"
+    values["sharpe"] = None
+    trade = {column: "stored" for column in TRADE_COLUMNS}
+    trade["exit_time"] = None
+    trade["exit_price"] = None
+    result = {
+        "metrics": {
+            "values": values,
+            "undefined": {"sharpe": "too_few_returns"},
+        },
+        "trades": [trade],
+    }
+    metrics_text = render_export("metrics.json", result)
+    assert "9.9999999999" in metrics_text
+    assert "too_few_returns" in metrics_text
+    assert "0.5" not in metrics_text
+    parsed = json.loads(metrics_text)
+    assert parsed["values"]["net_return"] == "9.9999999999"
+    assert parsed["values"]["sharpe"] is None
+    assert render_export("metrics.csv", result).splitlines()[1].split(",")[0] == "9.9999999999"
+    assert render_export("trades.csv", result).splitlines()[1].startswith("stored,stored,stored,")
+    trades = json.loads(render_export("trades.json", result))
+    assert trades["schema"] == "tradoortest.trade_log.v1"
+    assert trades["trades"][0]["exit_time"] is None
+    assert trades["trades"][0]["realized_pnl"] == "stored"
+    broken = {
+        "metrics": {"values": {**values, "net_return": 0.5}, "undefined": {}},
+        "trades": [trade],
+    }
+    with pytest.raises(ExportError):
+        render_export("metrics.json", broken)
+
+
+def test_export_for_another_user_or_a_running_job_is_not_the_result(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(body: dict) -> dict:
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("runner was not released")
+        return run_backtest_job(body)
+
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=slow)
+    client = _client(queue)
+    try:
+        other = queue.start(
+            user_id="someone-else",
+            request_key="theirs",
+            body={"ir": _strategy(), "bars": {"sol": [_row(0, 1)]}},
+        )
+        hidden = client.get(f"/backtests/{other.job_id}/exports/trades.csv")
+        assert hidden.status_code == 404
+        assert hidden.json()["error"]["code"] == "not_found"
+        created = client.post("/backtests", json=_payload("running"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert started.wait(5)
+        waiting = client.get(f"/backtests/{job_id}/exports/metrics.json")
+        assert waiting.status_code == 409
+        assert waiting.json()["error"]["code"] == "not_ready"
+    finally:
+        release.set()
+        queue.close()
+
+
+def test_export_of_a_failed_job_is_the_stored_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RecursionError("nested")
+
+    monkeypatch.setattr("app.jobs.run.run_backtest", boom)
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("export-failed"))
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "failed"
+        exported = client.get(f"/backtests/{job_id}/exports/trades.json")
+        assert exported.status_code == 422
+        assert exported.json()["error"]["code"] == "expr_too_deep"
+    finally:
+        queue.close()
+
+
+def test_a_corrupt_result_is_422_not_500(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: {"marker": "1"})
+    client = _client(queue)
+    try:
+        created = client.post("/backtests", json=_payload("corrupt"))
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            conn.execute("UPDATE job_results SET result_json = ?", ("{",))
+        results = client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 422
+        assert results.json()["error"]["code"] == "invalid_result"
+        exported = client.get(f"/backtests/{job_id}/exports/trades.csv")
+        assert exported.status_code == 422
+        assert exported.json()["error"]["code"] == "invalid_result"
+    finally:
+        queue.close()
+
+
+def test_a_legacy_result_without_a_curve_still_exports(tmp_path: Path) -> None:
+    queue = JobQueue(tmp_path / "jobs.sqlite")
+    client = _client(queue)
+    bars = [_row(0, 100), _row(60, 110), _row(120, 130)]
+    posted = _payload("legacy", bars=bars)
+    try:
+        created = client.post("/backtests", json=posted)
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
+        prepared = _prepare(posted)
+        engine = run_backtest(
+            prepared["ir"],
+            {
+                asset_id: _bars(asset_id, rows, prepared["ir"]["engine"]["bar_size"])
+                for asset_id, rows in prepared["bars"].items()
+            },
+            long_no_trade_minutes=prepared["long_no_trade_minutes"],
+        )
+        with sqlite3.connect(tmp_path / "jobs.sqlite") as conn:
+            row = conn.execute(
+                "SELECT result_json FROM job_results WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            assert row is not None
+            stored = json.loads(row[0])
+            assert "equity_curve" in stored
+            del stored["equity_curve"]
+            conn.execute(
+                "UPDATE job_results SET result_json = ? WHERE job_id = ?",
+                (json.dumps(stored), job_id),
+            )
+        results = client.get(f"/backtests/{job_id}/results")
+        assert results.status_code == 200
+        assert "equity_curve" not in results.json()
+        expected = {
+            "trades.csv": trade_log_csv(engine.trades),
+            "trades.json": trade_log_json(engine.trades),
+            "metrics.csv": metrics_csv(engine.metrics),
+            "metrics.json": metrics_json(engine.metrics),
+        }
+        for name, text in expected.items():
+            exported = client.get(f"/backtests/{job_id}/exports/{name}")
+            assert exported.status_code == 200
+            assert exported.text == text
+    finally:
+        queue.close()
+
+
+def test_render_export_refuses_the_event_loop() -> None:
+    values = {column: "1" for column in METRIC_COLUMNS}
+    result = {"metrics": {"values": values, "undefined": {}}, "trades": []}
+
+    async def on_the_loop() -> None:
+        render_export("metrics.json", result)
+
+    with pytest.raises(RuntimeError, match="event loop"):
+        asyncio.run(on_the_loop())
+    assert "1" in render_export("metrics.json", result)
+
+
+def test_health_answers_while_a_max_size_export_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trade = {column: "1" for column in TRADE_COLUMNS}
+    values = {column: "0.1000000000" for column in METRIC_COLUMNS}
+    huge = {
+        "trades": [trade] * 50_000,
+        "metrics": {"values": values, "undefined": {}},
+        "equity_curve": [
+            {"open_time": index, "equity": "1.00", "cash": "1.00"} for index in range(200_000)
+        ],
+    }
+    queue = JobQueue(tmp_path / "jobs.sqlite", runner=lambda _body: huge)
+    client = _client(queue)
+    started = threading.Event()
+    release = threading.Event()
+    rendered_on: list[threading.Thread] = []
+    real_render = render_export
+
+    def wrapped(name: str, result: dict) -> str:
+        rendered_on.append(threading.current_thread())
+        started.set()
+        text = real_render(name, result)
+        assert release.wait(5)
+        return text
+
+    monkeypatch.setattr("app.jobs.routes.render_export", wrapped)
+    try:
+        created = client.post("/backtests", json=_payload("huge"))
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        deadline = time.monotonic() + 30
+        status = "queued"
+        while time.monotonic() < deadline and status not in {"succeeded", "failed"}:
+            status = client.get(f"/backtests/{job_id}").json()["status"]
+            time.sleep(0.02)
+        assert status == "succeeded"
+        application = create_app(jobs=queue)
+
+        async def probe() -> None:
+            loop_thread = threading.current_thread()
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                timeout=30,
+            ) as http:
+                warm = await http.get("/health")
+                assert warm.status_code == 200
+                export_task = asyncio.create_task(
+                    http.get(f"/backtests/{job_id}/exports/trades.csv")
+                )
+                seen = time.monotonic() + 15
+                while not started.is_set() and time.monotonic() < seen:
+                    await asyncio.sleep(0.01)
+                assert started.is_set()
+                health_started = time.monotonic()
+                health = await http.get("/health")
+                elapsed = time.monotonic() - health_started
+                release.set()
+                exported = await export_task
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            assert elapsed < 0.1
+            assert exported.status_code == 200
+            assert exported.text.startswith("trade_id,")
+            assert len(exported.content) > 1_000_000
+            assert rendered_on
+            assert rendered_on[0] is not loop_thread
+
+        asyncio.run(probe())
+    finally:
+        release.set()
+        queue.close()

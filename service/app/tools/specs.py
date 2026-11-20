@@ -294,7 +294,15 @@ def _result() -> dict[str, Any]:
             "trades": {"type": "array", "items": _trade()},
             "fills": {"type": "array", "items": _fill()},
         },
-        ["schema", "final_equity", "final_cash", "lints", "metrics", "trades", "fills"],
+        [
+            "schema",
+            "final_equity",
+            "final_cash",
+            "lints",
+            "metrics",
+            "trades",
+            "fills",
+        ],
     )
 
 

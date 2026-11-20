@@ -91,6 +91,14 @@ def _payload(result: BacktestResult) -> dict[str, Any]:
         "schema": _RESULT_SCHEMA,
         "final_equity": _decimal(result.final_equity),
         "final_cash": _decimal(result.final_cash),
+        "equity_curve": [
+            {
+                "open_time": point.open_time,
+                "equity": _decimal(point.equity),
+                "cash": _decimal(point.cash),
+            }
+            for point in result.equity_curve
+        ],
         "lints": list(result.lints),
         "metrics": {
             "values": values,

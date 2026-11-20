@@ -154,6 +154,7 @@ p {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.7rem;
 }
@@ -251,7 +252,18 @@ button:focus-visible {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(18rem, 0.95fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 0.9rem;
+}
+
+.workspace > .chat {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.workspace > .editor {
+  grid-column: 2;
+  grid-row: 1;
 }
 
 .editor {
@@ -334,6 +346,118 @@ button:focus-visible {
   font-weight: 600;
 }
 
+h3 {
+  margin: 0.7rem 0 0.3rem;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.results {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  min-width: 0;
+  max-height: 18rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  border: 1px solid #d5ddd0;
+  border-radius: 0.6rem;
+  background: #fff;
+  padding: 0.85rem 0.95rem;
+}
+
+.results-form {
+  display: grid;
+  gap: 0.35rem;
+  justify-items: start;
+}
+
+.results-form input {
+  font: inherit;
+  width: 100%;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid #c5cfc0;
+  border-radius: 0.4rem;
+  background: #fff;
+  color: inherit;
+}
+
+.results-form input:focus-visible {
+  outline: 2px solid #1f6b3a;
+  outline-offset: 2px;
+}
+
+.equity {
+  margin: 0;
+}
+
+.equity-chart {
+  width: 100%;
+  height: 8rem;
+  display: block;
+  background: #f7f8f5;
+  border-radius: 0.35rem;
+}
+
+.equity figcaption {
+  margin-top: 0.3rem;
+  color: #3d4638;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.35rem 0.75rem;
+  margin: 0;
+}
+
+.metrics div {
+  min-width: 0;
+}
+
+.metrics dt {
+  color: #5c6656;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.metrics dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.lints {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.trade-scroll {
+  overflow: auto;
+  max-width: 100%;
+  max-height: 16rem;
+}
+
+.trade-log {
+  border-collapse: collapse;
+  width: max-content;
+  min-width: 100%;
+  font-size: 0.78rem;
+}
+
+.trade-log th,
+.trade-log td {
+  border-bottom: 1px solid #d5ddd0;
+  padding: 0.2rem 0.45rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
 @media (max-width: 60rem) {
   html,
   body {
@@ -375,6 +499,11 @@ button:focus-visible {
   }
 
   .editor {
+    overflow: visible;
+  }
+
+  .results {
+    max-height: none;
     overflow: visible;
   }
 }
