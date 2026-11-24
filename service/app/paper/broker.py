@@ -12,6 +12,15 @@ after its open and not stretched to the bar size. A tick that is still inside
 that window fills. A later tick expires the order and does not fill it. The
 scheduler's close grace is 60 seconds, so a prompt tick fills. A daily bar
 does not get a longer life: the five minutes start when that bar closes.
+
+A closed bar that is not in the store yet does not move the cursor. The tick
+stops on that open time, the same way the scheduler's ``not_ready`` path
+leaves the cursor put, and the next tick can see the bar after the feed
+stores it. The wait lasts until ``now`` is past that bar's close plus
+``ORDER_TTL_SECONDS``, the same bound as a late fill. A failed fetch keeps
+waiting after that bound. Only then is the empty slot a hole: the tick
+appends ``BAR_MISSED`` and steps it with no fill. Nothing here invents a
+candle.
 """
 
 from __future__ import annotations
@@ -19,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
@@ -154,21 +163,33 @@ class PaperBroker:
         self._marks: dict[tuple[str, int], dict[str, Decimal]] = {}
         self._origin: dict[tuple[str, int], int] = {}
         self._stepped: dict[tuple[str, int], int | None] = {}
+        self._hold: frozenset[tuple[str, str]] = frozenset()
 
-    def tick(self) -> None:
-        """Fill new closed bars for every registration. Decisions are not read."""
-        now = int(self._now())
-        rows = self._store.live_registrations(user_id=self._user_id)
-        for strategy_id, version, document_json, _bar_size in rows:
-            try:
-                document = json.loads(document_json)
-                self._tick_one(strategy_id, version, document, now)
-            except Exception:
-                logger.exception(
-                    "paper tick failed strategy_id=%s version=%s",
-                    strategy_id,
-                    version,
-                )
+    def tick(self, *, hold: Collection[tuple[str, str]] | None = None) -> None:
+        """Fill new closed bars for every registration. Decisions are not read.
+
+        ``hold`` is the ``(mint, timeframe)`` pairs whose feed fetch failed
+        on this tick. An unstored bar for one of those pairs does not move
+        the cursor, including after the order TTL. A successful fetch that
+        omitted the slot waits until ``now`` is past the bar's close plus
+        ``ORDER_TTL_SECONDS``, then steps the hole with no fill.
+        """
+        self._hold = frozenset(hold or ())
+        try:
+            now = int(self._now())
+            rows = self._store.live_registrations(user_id=self._user_id)
+            for strategy_id, version, document_json, _bar_size in rows:
+                try:
+                    document = json.loads(document_json)
+                    self._tick_one(strategy_id, version, document, now)
+                except Exception:
+                    logger.exception(
+                        "paper tick failed strategy_id=%s version=%s",
+                        strategy_id,
+                        version,
+                    )
+        finally:
+            self._hold = frozenset()
 
     def _tick_one(
         self, strategy_id: str, version: int, document: Mapping[str, Any], now: int
@@ -213,8 +234,17 @@ class PaperBroker:
         start = origin if cursor is None else max(cursor + step_seconds, origin)
         expire_ids, expire_events = self._due_orders(strategy_id, version, now)
         blocked = self._blocked(strategy_id, version, now)
+        held = _fetch_held(self._hold, assets, bar_size)
         slot = start
         while slot <= closed_through:
+            # Do not commit this open time while the bar can still arrive.
+            # ``held`` is a failed fetch and waits past the order TTL. A
+            # successful omit waits until the same bound as a late fill.
+            missed = not _slot_stored(bars, asset_ids, slot)
+            close_time = slot + step_seconds
+            if missed and (held or now <= close_time + ORDER_TTL_SECONDS):
+                self._wait_for_bar(strategy_id, version, slot)
+                break
             self._runner[key] = self._one_slot(
                 strategy_id,
                 version,
@@ -231,6 +261,7 @@ class PaperBroker:
                 blocked,
                 expire_ids,
                 expire_events,
+                missed=missed,
             )
             expire_ids = ()
             expire_events = []
@@ -267,6 +298,7 @@ class PaperBroker:
         blocked: bool,
         expire_ids: Sequence[int],
         expire_events: Sequence[Mapping[str, object]],
+        missed: bool = False,
     ) -> RunnerState:
         key = (strategy_id, version)
         marks = self._marks.setdefault(key, {})
@@ -284,7 +316,7 @@ class PaperBroker:
                 positions=[],
                 orders=[],
                 fills=[],
-                events=expire_events,
+                events=_with_miss(expire_events, open_time, missed),
                 expire_order_ids=expire_ids,
                 cash=_money(book.cash),
             )
@@ -302,7 +334,7 @@ class PaperBroker:
                 positions=[],
                 orders=orders,
                 fills=[],
-                events=[*expire_events, *events],
+                events=_with_miss([*expire_events, *events], open_time, missed),
                 expire_order_ids=expire_ids,
                 cash=_money(book.cash),
             )
@@ -318,7 +350,7 @@ class PaperBroker:
             positions=positions,
             orders=orders,
             fills=fills,
-            events=[*expire_events, *events],
+            events=_with_miss([*expire_events, *events], open_time, missed),
             expire_order_ids=expire_ids,
             cash=_money(book.cash),
         )
@@ -410,6 +442,31 @@ class PaperBroker:
             )
             loaded[asset_id] = {bar.open_time: bar for bar in rows}
         return loaded
+
+    def _wait_for_bar(self, strategy_id: str, version: int, open_time: int) -> None:
+        """Leave the cursor on the previous bar. The missing bar is not skipped."""
+        logger.warning(
+            "paper bar not stored strategy_id=%s version=%s open_time=%s",
+            strategy_id,
+            version,
+            open_time,
+        )
+        if self._store.live_bar_logged(
+            user_id=self._user_id,
+            strategy_id=strategy_id,
+            version=version,
+            open_time=open_time,
+            kind="not_ready",
+        ):
+            return
+        self._store.log_live_bar(
+            user_id=self._user_id,
+            strategy_id=strategy_id,
+            version=version,
+            open_time=open_time,
+            kind="not_ready",
+            detail="bar not stored",
+        )
 
 
 def _replay_memory(
@@ -796,6 +853,40 @@ def _has_real(decision: BarDecision) -> bool:
     if any(isinstance(item, OcoTouch) for item in decision.oco):
         return True
     return any(attempt.skip is None for attempt in decision.rules)
+
+
+def _slot_stored(
+    bars: Mapping[str, Mapping[int, Bar]], asset_ids: Sequence[str], open_time: int
+) -> bool:
+    """True when every asset has a stored bar at ``open_time``.
+
+    A synthetic bar counts. A missing open time does not. The cursor does
+    not move past a slot this rejects until the order TTL after its close,
+    or at all when this tick's fetch failed.
+    """
+    for asset_id in asset_ids:
+        if bars[asset_id].get(open_time) is None:
+            return False
+    return True
+
+
+def _with_miss(
+    events: Sequence[Mapping[str, object]], open_time: int, missed: bool
+) -> list[Mapping[str, object]]:
+    """Append ``BAR_MISSED`` when this step is a hole. No fill is added."""
+    rows = list(events)
+    if missed:
+        rows.append(_event(open_time, "BAR_MISSED", {"reason": "ttl"}))
+    return rows
+
+
+def _fetch_held(
+    hold: Collection[tuple[str, str]],
+    assets: Sequence[tuple[str, str]],
+    bar_size: str,
+) -> bool:
+    """True when this tick's fetch failed for one of the strategy's mints."""
+    return any((mint, bar_size) in hold for _asset_id, mint in assets)
 
 
 def _note_marks(

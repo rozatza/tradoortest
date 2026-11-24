@@ -49,7 +49,7 @@ Run the API locally, after `make install`:
 
 Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Any other Solana mint is `--mints`. GeckoTerminal stays the primary source. Birdeye is an optional fallback and stays off unless `BIRDEYE_API_KEY` is set in the environment. Details, rate limits, and the gap report are in `docs/ohlcv.md`. A local live check, not part of CI, is `scripts/acceptance_roz92.py`.
 
-`LIVE_FEED_ENABLED` starts a background scheduler that polls closed bars for those majors and records one runner decision per strategy version. It is off when the variable is unset. It does not send orders. See `docs/live-feed.md`. The simulated book is a separate tick, `PaperBroker.tick` in `app.paper`. It is not started by the flag. See `docs/paper.md`.
+`LIVE_FEED_ENABLED` starts a background scheduler that polls closed bars for those majors and records one runner decision per strategy version. It is off when the variable is unset. It does not send orders. See `docs/live-feed.md`. When the flag is on, the same tick stores the fetched bars and then runs `PaperBroker.tick` for simulated fills. `POST /strategies/{strategy_id}/versions/{version}/paper` deploys one saved version. `DELETE` on that path undeploys it. The running-paper cap defaults to 3 (`PAPER_MAX_RUNNING`). See `docs/paper.md`.
 
 ```bash
 .venv/bin/python -m app.ohlcv.backfill --days 90

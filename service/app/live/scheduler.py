@@ -20,7 +20,14 @@ the runner as a close. A hole inside the lookback is stepped, so a cross
 cannot use a close from the other side of the gap.
 
 The book view passed to ``step`` is empty. This module records the decision.
-It does not fill, attach an OCO, or send an order.
+It does not attach an OCO from that decision and it does not send an order.
+
+Each tick's order is fixed: the feed fetches, the store writes the closed
+bars, the decision walk runs, then ``PaperBroker.tick`` reads that store.
+The broker does not read the decisions recorded here. A fetch that raises
+is passed to the broker as ``hold`` so an unstored bar is not skipped. A
+successful page that omits a slot does not let the broker pass it until
+the order TTL after that bar's close.
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar
 from app.ohlcv.errors import SourceError
 from app.ohlcv.registry import BY_SYMBOL
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
+from app.paper.broker import PaperBroker
 from app.runner import (
     BarDecision,
     BookView,
@@ -85,8 +93,19 @@ def register_paper_strategy(
     version: int,
     document: Mapping[str, Any],
 ) -> None:
-    """Register one strategy version. There is no HTTP deploy route."""
+    """Register one strategy version.
+
+    HTTP deploy uses the same validation and the same registration row.
+    This helper does not apply the running-paper cap.
+    """
     scheduler.register(strategy_id, version, document)
+
+
+def require_paper_strategy(
+    strategy_id: str, version: int, document: Mapping[str, Any]
+) -> PaperStrategy:
+    """Validate a saved version for paper. ``ValueError`` means it cannot run."""
+    return _strategy(strategy_id, version, document)
 
 
 def live_feed_enabled(raw: str | None = None) -> bool:
@@ -112,11 +131,15 @@ class PaperScheduler:
         owns_feed: bool = False,
         join_timeout: float = 5.0,
         stop_event: threading.Event | None = None,
+        broker: PaperBroker | None = None,
     ) -> None:
         self._store = store
         self._feed = feed
         self._now = (lambda: int(time.time())) if now is None else now
         self._user_id = user_id
+        self._broker = (
+            PaperBroker(store, now=self._now, user_id=user_id) if broker is None else broker
+        )
         self._interval = interval
         self._on_tick = on_tick
         self._owns_store = owns_store
@@ -140,8 +163,18 @@ class PaperScheduler:
                 bar_size=strategy.bar_size,
             )
 
+    @property
+    def store(self) -> SqliteBarStore:
+        """Bar cache this scheduler fetches into and the broker reads."""
+        return self._store
+
     def tick(self) -> None:
-        """Fetch, then decide each new closed bar. Safe to call from a test."""
+        """Fetch, store, decide, then let the broker fill. Safe to call from a test.
+
+        The broker runs only after ``_prefetch`` has returned. A stopped
+        fetch does not tick the broker. Failed mints are held so the broker
+        does not move its cursor past a bar the feed did not store.
+        """
         with self._lock:
             now = int(self._now())
             strategies = self._load()
@@ -162,6 +195,9 @@ class PaperScheduler:
                         strategy.strategy_id,
                         strategy.version,
                     )
+            if self._stop.is_set():
+                return
+            self._broker.tick(hold=frozenset(errors))
 
     def start(self) -> None:
         """Start the worker thread. A second call while it is alive does nothing."""

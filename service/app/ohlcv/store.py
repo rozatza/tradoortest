@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Protocol
 
 from app.ohlcv.bars import Bar, BarRejection, validate_bar
-from app.ohlcv.errors import IngestExpired, StoreError
+from app.ohlcv.errors import IngestExpired, RegistrationRefused, StoreError
 from app.ohlcv.gaps import spans_touching
 from app.ohlcv.synthetic import synthetic_minutes
 
@@ -1116,30 +1116,46 @@ class SqliteBarStore:
         version: int,
         document_json: str,
         bar_size: str,
-    ) -> None:
-        """Insert a version. The same document is a no-op. A different one is refused."""
+        limit: int | None = None,
+    ) -> tuple[int, bool]:
+        """Insert a version. The same document is a no-op. A different one is refused.
+
+        Returns ``(registered_at, created)``. ``limit`` is the running-paper
+        cap for this user. ``None`` does not cap, which is what the
+        scheduler helper uses. A new row at the cap raises
+        ``RegistrationRefused``. The same document does not consume a slot.
+        """
         self._purge()
         _owner(user_id)
         with self._conn:
             row = self._conn.execute(
                 """
-                SELECT document_json FROM live_registrations
+                SELECT document_json, registered_at FROM live_registrations
                 WHERE user_id = ? AND strategy_id = ? AND version = ?
                 """,
                 (user_id, strategy_id, version),
             ).fetchone()
             if row is not None:
                 if str(row[0]) == document_json:
-                    return
+                    return int(row[1]), False
                 raise StoreError("strategy version is already registered")
+            if limit is not None:
+                count = self._conn.execute(
+                    "SELECT COUNT(*) FROM live_registrations WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                if int(count[0]) >= limit:
+                    raise RegistrationRefused("limit")
+            registered_at = int(self._now())
             self._conn.execute(
                 """
                 INSERT INTO live_registrations (
                     user_id, strategy_id, version, document_json, bar_size, registered_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, strategy_id, version, document_json, bar_size, int(self._now())),
+                (user_id, strategy_id, version, document_json, bar_size, registered_at),
             )
+        return registered_at, True
 
     @_serialized
     def live_registrations(self, *, user_id: str) -> list[tuple[str, int, str, str]]:
@@ -1615,6 +1631,114 @@ class SqliteBarStore:
         return [(int(row[0]), int(row[1]), str(row[2]), int(row[3])) for row in cursor]
 
     @_serialized
+    def undeploy_paper(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+    ) -> tuple[int, str] | None:
+        """Stop evaluation for one registered version.
+
+        Deletes the registration, sets open orders to ``canceled``, and
+        appends ``ORDER_CANCELED`` plus ``STRATEGY_UNDEPLOYED``. The wallet,
+        the position rows, the paper cursor, and the fills are not written.
+        No fill row is inserted. ``None`` means the version is not registered.
+        The pair is ``(orders_canceled, position_state)``. ``position_state``
+        is ``open_unmanaged`` when any qty is still set, otherwise ``flat``.
+        """
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            found = self._conn.execute(
+                """
+                SELECT 1 FROM live_registrations
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                """,
+                (user_id, strategy_id, version),
+            ).fetchone()
+            if found is None:
+                return None
+            open_orders = self._conn.execute(
+                """
+                SELECT id, open_time, asset_id FROM paper_orders
+                WHERE user_id = ? AND strategy_id = ? AND version = ? AND status = 'open'
+                ORDER BY id
+                """,
+                (user_id, strategy_id, version),
+            ).fetchall()
+            open_qty = self._conn.execute(
+                """
+                SELECT 1 FROM paper_positions
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                  AND qty IS NOT NULL
+                LIMIT 1
+                """,
+                (user_id, strategy_id, version),
+            ).fetchone()
+            position_state = "open_unmanaged" if open_qty is not None else "flat"
+            cursor = self._conn.execute(
+                """
+                SELECT last_open_time FROM paper_cursors
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                """,
+                (user_id, strategy_id, version),
+            ).fetchone()
+            marked_at = 0 if cursor is None else int(cursor[0])
+            for order_id, open_time, asset_id in open_orders:
+                self._conn.execute(
+                    """
+                    UPDATE paper_orders SET status = 'canceled'
+                    WHERE id = ? AND user_id = ? AND status = 'open'
+                    """,
+                    (int(order_id), user_id),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO paper_events (
+                        user_id, strategy_id, version, open_time, kind, detail, stored_at
+                    ) VALUES (?, ?, ?, ?, 'ORDER_CANCELED', ?, ?)
+                    """,
+                    (
+                        user_id,
+                        strategy_id,
+                        version,
+                        int(open_time),
+                        _paper_detail({"asset_id": str(asset_id), "reason": "undeploy"}),
+                        stored_at,
+                    ),
+                )
+            self._conn.execute(
+                """
+                INSERT INTO paper_events (
+                    user_id, strategy_id, version, open_time, kind, detail, stored_at
+                ) VALUES (?, ?, ?, ?, 'STRATEGY_UNDEPLOYED', ?, ?)
+                """,
+                (
+                    user_id,
+                    strategy_id,
+                    version,
+                    marked_at,
+                    _paper_detail(
+                        {
+                            "orders_canceled": len(open_orders),
+                            "position_state": position_state,
+                        }
+                    ),
+                    stored_at,
+                ),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM live_registrations
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                """,
+                (user_id, strategy_id, version),
+            )
+        return len(open_orders), position_state
+
+    @_serialized
     def insert_paper_order(
         self,
         *,
@@ -1972,6 +2096,11 @@ class SqliteBarStore:
 def _owner(user_id: str) -> None:
     if not isinstance(user_id, str) or user_id == "":
         raise StoreError("user_id is required")
+
+
+def _paper_detail(body: Mapping[str, object]) -> str:
+    """Stable event JSON. No price fields belong in an undeploy event."""
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
 def _row(user_id: str, bar: Bar, stored_at: int) -> tuple[object, ...]:
