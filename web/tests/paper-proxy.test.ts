@@ -26,7 +26,7 @@ function stub() {
 describe("paper proxy", () => {
   it("reads the paper book and does not forward a caller credential", async () => {
     const calls = stub();
-    const response = await getPaper();
+    const response = await getPaper(new Request("http://chat.local/api/paper"));
     expect(response.status).toBe(200);
     expect(calls[0]?.url).toBe("http://127.0.0.1:8000/paper");
     expect(calls[0]?.init.method).toBe("GET");
@@ -63,5 +63,22 @@ describe("paper proxy", () => {
     );
     expect(rejected.status).toBe(422);
     expect(calls).toHaveLength(2);
+  });
+
+  it("forwards the event page and drops every other query key", async () => {
+    const calls = stub();
+    const response = await getPaper(
+      new Request("http://chat.local/api/paper?events_limit=10&events_since=4&wallet=no"),
+    );
+    expect(response.status).toBe(200);
+    expect(calls[0]?.url).toBe("http://127.0.0.1:8000/paper?events_limit=10&events_since=4");
+    const rejected = await getPaper(new Request("http://chat.local/api/paper?events_limit=0"));
+    expect(rejected.status).toBe(422);
+    expect(calls).toHaveLength(1);
+    const duplicated = await getPaper(
+      new Request("http://chat.local/api/paper?events_since=1&events_since=2"),
+    );
+    expect(duplicated.status).toBe(422);
+    expect(calls).toHaveLength(1);
   });
 });

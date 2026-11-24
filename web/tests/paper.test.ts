@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { paperDeployPath, paperPnl, readSnapshot, type PaperPosition } from "@/lib/paper";
+import {
+  formatPaperAmount,
+  paperDeployPath,
+  paperPnl,
+  readSnapshot,
+  type PaperPosition,
+} from "@/lib/paper";
 
 const ID = "a".repeat(32);
 
@@ -71,8 +77,14 @@ function body(positionState: PaperPosition["state"] = "open") {
               },
       },
     ],
+    events_cursor: 7,
+    events_has_more: false,
+    drift_threshold: "0.01",
+    drift_threshold_name: "PAPER_DRIFT_THRESHOLD",
+    drift: [],
     events: [
       {
+        id: 7,
         strategy_id: ID,
         version: 1,
         open_time: 1_700_000_100,
@@ -104,7 +116,19 @@ describe("paper snapshot", () => {
     expect(JSON.stringify(snapshot)).not.toContain("wallet");
     expect(JSON.stringify(snapshot)).not.toContain("cash");
     expect(snapshot.events[0]?.kind).toBe("BAR_MISSED");
+    expect(snapshot.events[0]?.id).toBe(7);
+    expect(snapshot.eventsCursor).toBe(7);
+    expect(snapshot.driftThresholdName).toBe("PAPER_DRIFT_THRESHOLD");
     expect(snapshot.events[0]?.detail).toBe('{"reason":"ttl"}');
+  });
+
+  it("renders a stored fraction as a decimal", () => {
+    expect(formatPaperAmount("-250749/50")).toBe("-5014.98");
+    expect(formatPaperAmount("1/2")).toBe("0.50");
+    expect(formatPaperAmount("41/2")).toBe("20.50");
+    expect(formatPaperAmount("4/1")).toBe("4.00");
+    expect(formatPaperAmount("1/3")).toBe("0.33333333");
+    expect(formatPaperAmount("0/1")).toBe("0.00");
   });
 
   it("prices an open book as stored realized plus qty times the mark minus basis", () => {

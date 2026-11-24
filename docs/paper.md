@@ -69,10 +69,36 @@ One book has one order in status `open`. A market fill or an expiry finishes the
 `GET /paper` is the book the dashboard shows. The caller is the local user. The body is `mode` `paper` and `simulated` true, then three lists:
 
 - `strategies`: each running registration (`strategy_id`, `version`, `name`, `bar_size`, `registered_at`, `status` `running`). A version that is not registered is not in this list.
-- `positions`: each stored position row. `state` is `open` when qty is set and the version is running, `open_unmanaged` when qty is set and it is not, and `flat` when qty is null. `realized` is the stored text. `mark` is null, or `{label: "mark", price, open_time, timeframe, source: "last_stored_close"}` for the newest stored bar that is not synthetic. A flat row has no mark. The response has no cash field and no combined P&L field.
-- `events`: each `paper_events` row still inside the 24-hour TTL, including `BAR_MISSED` and `STRATEGY_UNDEPLOYED`. `detail` is the stored text.
+- `positions`: each stored position row. `state` is `open` when qty is set and the version is running, `open_unmanaged` when qty is set and it is not, and `flat` when qty is null. `realized` is the stored fraction text. The dashboard renders that fraction as a decimal (half-even, at most 8 places, at least 2), so `-250749/50` is shown as `-5014.98`. `mark` is null, or `{label: "mark", price, open_time, timeframe, source: "last_stored_close"}` for the newest stored bar that is not synthetic. A flat row has no mark. The response has no cash field and no combined P&L field. Combined P&L is still computed in the browser from the stored realized, qty, basis, and mark, and it is rendered with the same decimal rule.
+- `events`: a page of `paper_events` rows still inside the 24-hour TTL, including `BAR_MISSED` and `STRATEGY_UNDEPLOYED`. Each row has its `id`. `detail` is the stored text. `events_limit` defaults to 100 and must be a whole number from 1 to 200. Omit `events_since` to get the newest page, oldest id first within that page. `events_since` returns rows with a greater id, up to `events_limit`. `events_cursor` is the last id in the page, or the cursor you sent when the page is empty. `events_has_more` is true when another retained row was left out of this page.
+- `drift`: one report per running registration. See below. `drift_threshold` and `drift_threshold_name` name the flag cutoff. The report is not a stored row.
 
-The web app polls `GET /api/paper`, which proxies that route. Deploy and undeploy from the dashboard are the same `POST` and `DELETE` as above, proxied at `/api/strategies/{strategy_id}/versions/{version}/paper`.
+The web app polls `GET /api/paper?events_limit=100`, then later polls with `events_since` set to `events_cursor`, and appends those events. Strategies, positions, and the drift report are replaced on each poll. The proxy forwards only `events_limit` and `events_since`. Deploy and undeploy from the dashboard are the same `POST` and `DELETE` as above, proxied at `/api/strategies/{strategy_id}/versions/{version}/paper`.
+
+## Drift
+
+For each running registration, `GET /paper` calls `run_backtest` on the pinned document and the stored closed bars whose close is after `registered_at` and whose open time is at or before the paper cursor. Costs are that document's `commission_bps` and `slippage_bps`. Bars the cursor has not reached are outside the window. The engine is not modified.
+
+The report is computed on that read. It is not inserted, and the bars are not written back. There is no cache. A later read sees only rows the 24-hour purge has kept. The wallet and the position are not used to rebuild a fill that has aged out.
+
+`PAPER_DRIFT_THRESHOLD` is an absolute quote-currency amount. The default is `0.01`. Blank keeps the default. A whole or decimal number from 0 to 1000000, with at most 8 decimal places, overrides it. Anything else is HTTP 503 `service_unavailable`. The report is flagged when any of these is true:
+
+- the paper fill count and the backtest fill count differ
+- a fill is unpaired, or a paired fill differs in side or open time
+- the widest absolute fill-price difference is greater than the threshold
+- the absolute realized P&L difference is greater than the threshold
+
+An equal difference is not flagged. Realized P&L is the stored position total against the sum of the backtest trade realized amounts. The amounts in the report are decimals under the same rule as the dashboard.
+
+`status` is `ok` when nothing above is true, and `drift` when the report is flagged. `flagged` is the boolean. A missing window is neither. `status` is `insufficient_data`, `flagged` is false, and `fill_count`, `side_time_mismatches`, `price_delta`, and `realized_pnl` are null. `reason` is one of:
+
+| Reason | When |
+| --- | --- |
+| `bar_missed` | A `BAR_MISSED` event is still inside the TTL, or the cursor span has a hole while some of that span is still stored |
+| `purged_fills` | Replaying the retained fills does not land on the stored cash and quantity |
+| `window_before_retained` | `registered_at` is at or before the retention cutoff, or the cursor span has no stored bars left |
+
+That read does not halt the strategy.
 
 ## Event log
 

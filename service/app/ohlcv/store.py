@@ -1702,6 +1702,80 @@ class SqliteBarStore:
         ]
 
     @_serialized
+    def paper_event_page(
+        self,
+        *,
+        user_id: str,
+        since_id: int | None,
+        limit: int,
+    ) -> tuple[list[tuple[int, str, int, int, str, str]], bool]:
+        """One page of events still inside the TTL.
+
+        Each row is ``(id, strategy_id, version, open_time, kind, detail)``,
+        in id order. ``since_id`` ``None`` is the newest ``limit`` rows.
+        An integer keeps rows with a greater id. The bool is true when this
+        page left another retained row out.
+        """
+        self._purge()
+        _owner(user_id)
+        if since_id is None:
+            cursor = self._conn.execute(
+                """
+                SELECT id, strategy_id, version, open_time, kind, detail
+                FROM paper_events
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, limit + 1),
+            )
+            fetched = cursor.fetchall()
+            has_more = len(fetched) > limit
+            chosen = list(reversed(fetched[:limit]))
+        else:
+            cursor = self._conn.execute(
+                """
+                SELECT id, strategy_id, version, open_time, kind, detail
+                FROM paper_events
+                WHERE user_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (user_id, since_id, limit + 1),
+            )
+            fetched = cursor.fetchall()
+            has_more = len(fetched) > limit
+            chosen = fetched[:limit]
+        rows = [
+            (int(row[0]), str(row[1]), int(row[2]), int(row[3]), str(row[4]), str(row[5]))
+            for row in chosen
+        ]
+        return rows, has_more
+
+    @_serialized
+    def paper_has_kind(
+        self, *, user_id: str, strategy_id: str, version: int, kind: str
+    ) -> bool:
+        """True when this version still has one event of ``kind`` inside the TTL."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM paper_events
+            WHERE user_id = ? AND strategy_id = ? AND version = ? AND kind = ?
+            LIMIT 1
+            """,
+            (user_id, strategy_id, version, kind),
+        ).fetchone()
+        return row is not None
+
+    @_serialized
+    def retention_cutoff(self) -> int:
+        """A row stored at or before this instant is outside the 24-hour window."""
+        self._purge()
+        return int(self._now()) - self._ttl
+
+    @_serialized
     def latest_real_close(
         self, *, user_id: str, mint: str, timeframe: str
     ) -> tuple[int, float] | None:

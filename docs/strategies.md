@@ -134,5 +134,6 @@ Commented placeholders live in `.env.example`. None of them have a value.
 | `STRATEGIES_MAX_BODY_BYTES` | `65536` | Body cap. Integer from 1 to 1048576. Read on each `POST` and `PUT`, including validate. |
 | `STRATEGIES_BUSY_TIMEOUT_MS` | `5000` | Busy timeout. Integer from 0 to 60000. Read when the file is opened. |
 | `PAPER_MAX_RUNNING` | `3` | Cap on running paper versions for this user. Integer from 1 to 100. Read on each paper deploy. See `docs/paper.md`. |
+| `PAPER_DRIFT_THRESHOLD` | `0.01` | Absolute quote delta that flags a paper-versus-backtest report. A number from 0 to 1000000 with at most 8 decimal places. Read on each `GET /paper`. See `docs/paper.md`. |
 
 An out-of-range value is HTTP 503 `store_unavailable`. It is not stored on `app.state`. The next request reads the environment again.

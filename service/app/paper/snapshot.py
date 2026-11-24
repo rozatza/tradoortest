@@ -24,11 +24,26 @@ def paper_snapshot(
     bars: SqliteBarStore,
     strategies: StrategyStore,
     user_id: str,
+    *,
+    events_since: int | None,
+    events_limit: int,
 ) -> dict[str, Any]:
-    """Running registrations, position rows, and the event log for one user."""
+    """Running registrations, position rows, and one page of the event log.
+
+    ``events_since`` ``None`` is the newest page. An integer returns events
+    with a greater id. The page is still only rows inside the 24-hour TTL.
+    """
     registrations = bars.list_live_registrations(user_id=user_id)
     positions = bars.list_paper_positions(user_id=user_id)
-    events = bars.list_paper_events(user_id=user_id)
+    events, has_more = bars.paper_event_page(
+        user_id=user_id, since_id=events_since, limit=events_limit
+    )
+    if events:
+        cursor = events[-1][0]
+    elif events_since is None:
+        cursor = 0
+    else:
+        cursor = events_since
     running = {(strategy_id, version) for strategy_id, version, _doc, _size, _at in registrations}
     documents = _documents(registrations, positions, strategies, user_id)
     marks = _marks(bars, user_id, positions, documents)
@@ -41,14 +56,17 @@ def paper_snapshot(
         ],
         "events": [
             {
+                "id": event_id,
                 "strategy_id": strategy_id,
                 "version": version,
                 "open_time": open_time,
                 "kind": kind,
                 "detail": detail,
             }
-            for strategy_id, version, open_time, kind, detail in events
+            for event_id, strategy_id, version, open_time, kind, detail in events
         ],
+        "events_cursor": cursor,
+        "events_has_more": has_more,
     }
 
 

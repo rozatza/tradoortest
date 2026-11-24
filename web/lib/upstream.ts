@@ -81,6 +81,49 @@ export function pageQuery(request: Request): string | Response {
   return text === "" ? "" : `?${text}`;
 }
 
+const PAPER_EVENT_QUERY = ["events_limit", "events_since"] as const;
+const MAX_EVENT_CURSOR = BigInt("9007199254740991");
+
+/**
+ * Keep `events_limit` and `events_since` only. Other query keys are dropped.
+ * The service applies the default limit when `events_limit` is omitted.
+ */
+export function paperEventsQuery(request: Request): string | Response {
+  const url = new URL(request.url);
+  const params = new URLSearchParams();
+  for (const name of PAPER_EVENT_QUERY) {
+    const values = url.searchParams.getAll(name);
+    if (values.length === 0) {
+      continue;
+    }
+    if (values.length > 1) {
+      return jsonError(422, "invalid_query", `${name} must be sent once`);
+    }
+    const value = values[0] ?? "";
+    if (!isEventWhole(value)) {
+      return jsonError(422, "invalid_query", `${name} is invalid`);
+    }
+    if (name === "events_limit") {
+      const parsed = Number(value);
+      if (parsed < 1 || parsed > 200) {
+        return jsonError(422, "invalid_query", "events_limit must be a whole number from 1 to 200");
+      }
+    } else if (BigInt(value) > MAX_EVENT_CURSOR) {
+      return jsonError(422, "invalid_query", "events_since is invalid");
+    }
+    params.set(name, value);
+  }
+  const text = params.toString();
+  return text === "" ? "" : `?${text}`;
+}
+
+function isEventWhole(value: string): boolean {
+  if (!/^[0-9]+$/.test(value) || value.length > 16) {
+    return false;
+  }
+  return value.length === 1 || !value.startsWith("0");
+}
+
 export async function forwardJson(
   path: string,
   request: Request,

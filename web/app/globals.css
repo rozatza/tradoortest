@@ -655,6 +655,17 @@ main.paper {
   min-width: 12rem;
 }
 
+.paper-note {
+  margin: 0 0 0.6rem;
+  color: #3d4638;
+  font-size: 0.85rem;
+}
+
+.paper-flagged {
+  color: #8a2b2b;
+  font-weight: 700;
+}
+
 .paper-log {
   max-height: 18rem;
   overflow: auto;
