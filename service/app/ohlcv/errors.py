@@ -27,6 +27,18 @@ class StoreError(RuntimeError):
     """The local bar store refused a write."""
 
 
+class RegistrationRefused(StoreError):
+    """A new paper registration was not stored.
+
+    ``code`` is ``limit`` when the running-paper cap is already full.
+    The message is that code and nothing else.
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 class IngestExpired(StoreError):
     """A stored ingest result reached the 24-hour TTL and was deleted."""
 

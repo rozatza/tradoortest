@@ -21,6 +21,8 @@ Importing the app and `GET /health` do not create the database. The first strate
 | `GET /strategies/{strategy_id}/versions/{version}` | One version, including DSL and IR. |
 | `GET /strategies/{strategy_id}/diff?from=1&to=2` | DSL unified diff, structural IR diff, and both hashes. |
 | `POST /strategies/{strategy_id}/validate` | Compile the body and write nothing. HTTP 200 `{valid, strategy_id, name, ir_hash}` when it passes. |
+| `POST /strategies/{strategy_id}/versions/{version}/paper` | Deploy that saved version to paper. The body is ignored. HTTP 201, or 200 when it is already running. |
+| `DELETE /strategies/{strategy_id}/versions/{version}/paper` | Undeploy that version. HTTP 200. |
 
 `strategy_id` is 32 lowercase hex characters generated for the row. It is not `strategy.id` from the IR. The IR id is `ir_strategy_id` and can change on a later version. The URL id does not change.
 
@@ -131,5 +133,6 @@ Commented placeholders live in `.env.example`. None of them have a value.
 | `STRATEGIES_DB_PATH` | `data/strategies.sqlite` | SQLite file. A relative path is from the process working directory. |
 | `STRATEGIES_MAX_BODY_BYTES` | `65536` | Body cap. Integer from 1 to 1048576. Read on each `POST` and `PUT`, including validate. |
 | `STRATEGIES_BUSY_TIMEOUT_MS` | `5000` | Busy timeout. Integer from 0 to 60000. Read when the file is opened. |
+| `PAPER_MAX_RUNNING` | `3` | Cap on running paper versions for this user. Integer from 1 to 100. Read on each paper deploy. See `docs/paper.md`. |
 
 An out-of-range value is HTTP 503 `store_unavailable`. It is not stored on `app.state`. The next request reads the environment again.

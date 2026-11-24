@@ -1,6 +1,6 @@
 # Live bar feed
 
-Near-real-time bars for SOL and the four other native majors (JUP, JTO, BONK, WIF), and a scheduler that calls the shared runner once per closed bar. This is paper state only. The scheduler records the decision. It does not persist a price, fill, attach an OCO, sign, or send an order. There is no deploy route; a strategy version is registered with `register_paper_strategy`.
+Near-real-time bars for SOL and the four other native majors (JUP, JTO, BONK, WIF), and a scheduler that calls the shared runner once per closed bar. This is paper state only. The scheduler records the decision. It does not persist a price, sign, or send an order. Deploy is `POST /strategies/{strategy_id}/versions/{version}/paper`. `register_paper_strategy` is the in-process helper and does not apply the running cap. See `docs/paper.md`.
 
 The runner is `app.runner.step`. The book view passed in is empty, so a decision cannot arm an OCO. The paper broker in `docs/paper.md` does not apply these decisions. It keeps its own book and does not fill a bar that closed at or before registration, including the bars this scheduler back-decides on the first tick.
 
@@ -24,11 +24,11 @@ The worker is a daemon thread started from the app lifespan and stopped on shutd
 
 `LIVE_FEED_ENABLED` turns it on (`1`, `true`, `yes`, `on`). Unset or any other value leaves it off. Tests leave it off. With no registrations the thread still starts when the flag is on, and it does not fetch until a version is registered.
 
-Each tick, for each registered `(strategy id, version)`:
+Each tick is ordered. The feed runs to completion and the store has the closed bars before the broker starts. A stopped fetch does not tick the broker.
 
-1. Fetch the majors in that strategy, one call per mint and timeframe, for the missing lookback or the new bars.
-2. If that fetch raises, including a 429 after the bounded retries, record `not_ready` and an error row (exception type and a short message, no response body). Do not decide a bar and do not move the cursor, so the next tick can try again. No bar is invented to fill the gap.
-3. Walk closed open times after the cursor, in order.
+1. Fetch the majors in that strategy, one call per mint and timeframe, for the missing lookback or the new bars. The store writes those closed bars before anything is decided or filled.
+2. If that fetch raises, including a 429 after the bounded retries, record `not_ready` and an error row (exception type and a short message, no response body). Do not decide a bar and do not move the cursor, so the next tick can try again. No bar is invented to fill the gap. The mint is held for the broker on this tick, so the paper cursor does not move past an unstored bar either.
+3. Walk closed open times after the decision cursor, in order.
 4. For a real closed bar this version has not already decided, rebuild runner memory from the initial state by calling `step` on every slot in the lookback window, including holes. The window is the previous bar when warmup is 0 and the IR has no indicator, and the convergence window above when the IR uses a recursive indicator. Then persist the decision. The cursor write stores an empty `state_json`. It does not store a close or an indicator value.
 5. A hole is stepped as a missing bar. Memory from before the hole is not carried into the next real bar, so a `cross_*` cannot fire from a pre-gap close.
 
@@ -37,6 +37,8 @@ A missing open time is left alone until the following bar is already closed, usi
 A bar that any registered version has already decided is not overwritten. If a later fetch, including a Birdeye fallback, returns a different candle for that open time, the stored candle stays and the feed logs a warning and a conflict row. The conflict row expires with the cache.
 
 A per-strategy failure is written to `live_errors` as the exception type and a short message. The message does not include the response body. That row expires with the cache. The cursor is not moved past a bar whose `step` raised, so the next tick can try it again.
+
+After that walk, `PaperBroker.tick` runs on the same store. It does not read the decisions. It fills from the bars the fetch just stored. The order is feed fetch, then store, then broker. See `docs/paper.md` for the cursor wait and for deploy.
 
 Two versions do not share a cursor. The same open time is decided once per version.
 

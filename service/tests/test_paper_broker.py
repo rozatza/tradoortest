@@ -15,6 +15,7 @@ from app.backtest import run_backtest
 from app.live.feed import CLOSE_GRACE_SECONDS
 from app.live.scheduler import PaperScheduler, register_paper_strategy
 from app.ohlcv.bars import Bar
+from app.ohlcv.errors import SourceError
 from app.ohlcv.registry import JUP_MINT, SOL_MINT
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
 from app.paper.broker import ORDER_TTL_SECONDS, PaperBroker, reconcile_book
@@ -352,6 +353,181 @@ def test_fixture_matches_the_backtester_and_survives_the_fill_purge(
     finally:
         store.close()
     assert "paper tick failed" not in caplog.text
+
+
+def test_a_late_closed_bar_is_stored_after_the_tick_and_matches_backtest(
+    tmp_path: Path,
+) -> None:
+    """Probe C. The tick that should decide a closed bar does not pass it.
+
+    The bar is not in the store yet, and the following bar is still open, so
+    the cursor stays on the previous bar. Once the bar is stored, the next
+    tick fills it and the fill matches ``run_backtest``.
+    """
+    prior = _bar(_T, 40, high=41, low=39)
+    late = _bar(_T + _STEP, 100, high=101, low=99)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, _document())
+    store.upsert([prior], user_id=LOCAL_USER_ID)
+    broker = _broker(store, clock)
+    try:
+        clock["now"] = _T + 2 * _STEP + _GRACE
+        broker.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+        log = store.live_bar_log(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+        assert (_T + _STEP, "not_ready", "bar not stored") in log
+
+        store.upsert([late], user_id=LOCAL_USER_ID)
+        broker.tick()
+        _assert_fills_match([prior, late], store)
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T + _STEP
+    finally:
+        store.close()
+
+
+def test_a_failed_fetch_does_not_advance_past_an_unstored_bar(tmp_path: Path) -> None:
+    """``hold`` is the scheduler's not_ready path. The hole is not skipped."""
+    prior = _bar(_T, 40, high=41, low=39)
+    late = _bar(_T + _STEP, 100, high=101, low=99)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, _document())
+    store.upsert([prior], user_id=LOCAL_USER_ID)
+    broker = _broker(store, clock)
+    try:
+        clock["now"] = _T + _STEP + _GRACE
+        broker.tick()
+        # The following bar is closed, which would otherwise be a hole.
+        clock["now"] = _T + 4 * _STEP + _GRACE
+        broker.tick(hold={(SOL_MINT, "1m")})
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+
+        store.upsert([late], user_id=LOCAL_USER_ID)
+        broker.tick()
+        _assert_fills_match([prior, late], store)
+    finally:
+        store.close()
+
+
+def test_a_confirmed_hole_is_not_a_fill(tmp_path: Path) -> None:
+    """Once the next bar is closed, an empty slot is stepped and not filled."""
+    entered = _bar(_T, 100, high=101, low=99)
+    after = _bar(_T + 2 * _STEP, 110, high=112, low=100)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, _document())
+    broker = _broker(store, clock)
+    try:
+        store.upsert([entered], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + _STEP + _GRACE
+        broker.tick()
+        store.upsert([after], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + 4 * _STEP + _GRACE
+        broker.tick()
+        assert [fill[0] for fill in _fills(store)] == [_T]
+        _assert_fills_match([entered, after], store)
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T + 2 * _STEP
+    finally:
+        store.close()
+
+
+def test_the_scheduler_stores_the_fetch_before_the_broker_ticks(tmp_path: Path) -> None:
+    """C4. One tick is feed fetch, then the store, then the broker."""
+    bar = _bar(_T, 100, high=101, low=99)
+    clock = {"now": _T}
+    events: list[str] = []
+    store = _store(tmp_path, clock)
+
+    class _Feed:
+        def fetch(self, *_args: object, **_kwargs: object) -> list[Bar]:
+            events.append("fetch")
+            store.upsert([bar], user_id=LOCAL_USER_ID)
+            return [bar]
+
+        def close(self) -> None:
+            return None
+
+    class _Broker(PaperBroker):
+        def __init__(self, store: SqliteBarStore, clock: dict[str, int]) -> None:
+            super().__init__(store, now=lambda: clock["now"])
+
+        def tick(self, **kwargs: object) -> None:
+            stored = store.load(
+                user_id=LOCAL_USER_ID,
+                mint=SOL_MINT,
+                timeframe="1m",
+                start=0,
+                end=bar.open_time + _STEP,
+            )
+            assert any(item.open_time == bar.open_time for item in stored)
+            events.append("broker")
+            super().tick(**kwargs)  # type: ignore[arg-type]
+
+    scheduler = PaperScheduler(
+        store,
+        _Feed(),
+        now=lambda: clock["now"],
+        interval=3600,
+        broker=_Broker(store, clock),
+    )
+    register_paper_strategy(scheduler, "sol-paper", 1, _document())
+    clock["now"] = _T + _STEP + _GRACE
+    try:
+        scheduler.tick()
+        assert events == ["fetch", "broker"]
+        _assert_fills_match([bar], store)
+    finally:
+        store.close()
+
+
+def test_a_failed_scheduler_fetch_does_not_let_the_broker_pass_the_bar(
+    tmp_path: Path,
+) -> None:
+    """The broker waits when the feed raises, then fills the bar it stores later."""
+    prior = _bar(_T, 40, high=41, low=39)
+    late = _bar(_T + _STEP, 100, high=101, low=99)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    store.upsert([prior], user_id=LOCAL_USER_ID)
+
+    class _Feed:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch(self, *_args: object, **_kwargs: object) -> list[Bar]:
+            self.calls += 1
+            if self.calls == 1:
+                raise SourceError("not yet")
+            store.upsert([late], user_id=LOCAL_USER_ID)
+            return [late]
+
+        def close(self) -> None:
+            return None
+
+    scheduler = PaperScheduler(store, _Feed(), now=lambda: clock["now"], interval=3600)
+    register_paper_strategy(scheduler, "sol-paper", 1, _document())
+    clock["now"] = _T + 4 * _STEP + _GRACE
+    try:
+        scheduler.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+        scheduler.tick()
+        _assert_fills_match([prior, late], store)
+    finally:
+        store.close()
 
 
 def test_a_bar_closed_before_registration_is_decided_and_not_filled(

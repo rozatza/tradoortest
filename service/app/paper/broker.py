@@ -12,6 +12,13 @@ after its open and not stretched to the bar size. A tick that is still inside
 that window fills. A later tick expires the order and does not fill it. The
 scheduler's close grace is 60 seconds, so a prompt tick fills. A daily bar
 does not get a longer life: the five minutes start when that bar closes.
+
+A closed bar that is not in the store yet does not move the cursor. The tick
+stops on that open time, the same way the scheduler's ``not_ready`` path
+leaves the cursor put, and the next tick can see the bar after the feed
+stores it. The cursor moves past an empty slot only once the following bar
+is already closed and this tick's fetch did not fail. That slot is a hole.
+It is stepped with no fill. Nothing here invents a candle.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
@@ -37,7 +44,7 @@ from app.backtest.engine import (
 )
 from app.backtest.errors import BacktestError
 from app.backtest.money import quantize_cents
-from app.live.feed import last_closed_open
+from app.live.feed import bar_is_closed, last_closed_open
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar
 from app.ohlcv.registry import BY_SYMBOL
 from app.ohlcv.store import SqliteBarStore
@@ -154,21 +161,31 @@ class PaperBroker:
         self._marks: dict[tuple[str, int], dict[str, Decimal]] = {}
         self._origin: dict[tuple[str, int], int] = {}
         self._stepped: dict[tuple[str, int], int | None] = {}
+        self._hold: frozenset[tuple[str, str]] = frozenset()
 
-    def tick(self) -> None:
-        """Fill new closed bars for every registration. Decisions are not read."""
-        now = int(self._now())
-        rows = self._store.live_registrations(user_id=self._user_id)
-        for strategy_id, version, document_json, _bar_size in rows:
-            try:
-                document = json.loads(document_json)
-                self._tick_one(strategy_id, version, document, now)
-            except Exception:
-                logger.exception(
-                    "paper tick failed strategy_id=%s version=%s",
-                    strategy_id,
-                    version,
-                )
+    def tick(self, *, hold: Collection[tuple[str, str]] | None = None) -> None:
+        """Fill new closed bars for every registration. Decisions are not read.
+
+        ``hold`` is the ``(mint, timeframe)`` pairs whose feed fetch failed
+        on this tick. An unstored bar for one of those pairs does not move
+        the cursor, including when the following bar is already closed.
+        """
+        self._hold = frozenset(hold or ())
+        try:
+            now = int(self._now())
+            rows = self._store.live_registrations(user_id=self._user_id)
+            for strategy_id, version, document_json, _bar_size in rows:
+                try:
+                    document = json.loads(document_json)
+                    self._tick_one(strategy_id, version, document, now)
+                except Exception:
+                    logger.exception(
+                        "paper tick failed strategy_id=%s version=%s",
+                        strategy_id,
+                        version,
+                    )
+        finally:
+            self._hold = frozenset()
 
     def _tick_one(
         self, strategy_id: str, version: int, document: Mapping[str, Any], now: int
@@ -213,8 +230,16 @@ class PaperBroker:
         start = origin if cursor is None else max(cursor + step_seconds, origin)
         expire_ids, expire_events = self._due_orders(strategy_id, version, now)
         blocked = self._blocked(strategy_id, version, now)
+        held = _fetch_held(self._hold, assets, bar_size)
         slot = start
         while slot <= closed_through:
+            # Do not commit this open time while the bar can still arrive.
+            # ``held`` is a failed fetch: wait even if the next bar is closed.
+            if not _slot_stored(bars, asset_ids, slot) and (
+                held or not _following_closed(slot, step_seconds, now)
+            ):
+                self._wait_for_bar(strategy_id, version, slot)
+                break
             self._runner[key] = self._one_slot(
                 strategy_id,
                 version,
@@ -410,6 +435,31 @@ class PaperBroker:
             )
             loaded[asset_id] = {bar.open_time: bar for bar in rows}
         return loaded
+
+    def _wait_for_bar(self, strategy_id: str, version: int, open_time: int) -> None:
+        """Leave the cursor on the previous bar. The missing bar is not skipped."""
+        logger.warning(
+            "paper bar not stored strategy_id=%s version=%s open_time=%s",
+            strategy_id,
+            version,
+            open_time,
+        )
+        if self._store.live_bar_logged(
+            user_id=self._user_id,
+            strategy_id=strategy_id,
+            version=version,
+            open_time=open_time,
+            kind="not_ready",
+        ):
+            return
+        self._store.log_live_bar(
+            user_id=self._user_id,
+            strategy_id=strategy_id,
+            version=version,
+            open_time=open_time,
+            kind="not_ready",
+            detail="bar not stored",
+        )
 
 
 def _replay_memory(
@@ -796,6 +846,34 @@ def _has_real(decision: BarDecision) -> bool:
     if any(isinstance(item, OcoTouch) for item in decision.oco):
         return True
     return any(attempt.skip is None for attempt in decision.rules)
+
+
+def _slot_stored(
+    bars: Mapping[str, Mapping[int, Bar]], asset_ids: Sequence[str], open_time: int
+) -> bool:
+    """True when every asset has a stored bar at ``open_time``.
+
+    A synthetic bar counts. A missing open time does not. The cursor does
+    not move past a slot this rejects while that bar can still be stored.
+    """
+    for asset_id in asset_ids:
+        if bars[asset_id].get(open_time) is None:
+            return False
+    return True
+
+
+def _following_closed(open_time: int, step_seconds: int, now: int) -> bool:
+    """True once the bar after ``open_time`` is closed, including the grace."""
+    return bar_is_closed(open_time + step_seconds, step_seconds, now)
+
+
+def _fetch_held(
+    hold: Collection[tuple[str, str]],
+    assets: Sequence[tuple[str, str]],
+    bar_size: str,
+) -> bool:
+    """True when this tick's fetch failed for one of the strategy's mints."""
+    return any((mint, bar_size) in hold for _asset_id, mint in assets)
 
 
 def _note_marks(

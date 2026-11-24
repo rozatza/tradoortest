@@ -2,7 +2,26 @@
 
 `service/app/paper` turns a registered strategy into simulated fills. It is one book per `(user, strategy id, version)`: that version's initial capital, cash, and open longs. `user_id` is the auth seam. This process still has one user. There is no key, no signature, no chain, and no order is sent.
 
-The scheduler in `docs/live-feed.md` records decisions with an empty book. This broker does not read those decisions and does not fill them. A bar the scheduler back-decides on the first tick was already closed at registration. Its close time is at or before `registered_at`, and the broker does not fill it.
+The scheduler in `docs/live-feed.md` records decisions with an empty book. This broker does not read those decisions. A bar the scheduler back-decides on the first tick was already closed at registration. Its close time is at or before `registered_at`, and the broker does not fill it.
+
+When the scheduler is running, one tick is ordered: the feed fetches, the store writes the closed bars, the decision walk runs, then `PaperBroker.tick` reads that store. The broker does not fetch. A direct `PaperBroker.tick` only sees bars already stored.
+
+## Deploy and undeploy
+
+`POST /strategies/{strategy_id}/versions/{version}/paper` deploys one saved version. The body is ignored. The IR is the canonical document of that version, copied onto the registration at request time. A later `PUT` appends a new version and does not change the running document. `registered_at` is the bar-store clock at the first deploy. The same version again is HTTP 200 and does not move `registered_at`.
+
+`DELETE` on the same path undeploys it. The registration is deleted, so the scheduler and the broker no longer evaluate that version.
+
+Undeploy does not invent a fill.
+
+- An open position is left as stored. Qty, open cost, entry, basis, realized, and the OCO levels stay. The price fields are not cleared, because the long is not flat. The state is `open_unmanaged`: later bars do not move it until a new deploy of that version. Cash is unchanged.
+- A resting order (`status` `open`) is set to `canceled`. No price is written and no fill row is inserted.
+- The paper cursor stays where it was. Fills already stored stay until the 24-hour purge.
+- The event log appends `ORDER_CANCELED` (reason `undeploy`) for each resting order and one `STRATEGY_UNDEPLOYED` (`position_state` `open_unmanaged` or `flat`, and `orders_canceled`). Those rows purge at 86400 seconds with the other events.
+
+A new deploy of the same version inserts a new registration and a new `registered_at`. The wallet, the position, and the cursor are still there, so the book resumes. Bars whose close is at or before the new `registered_at` are not filled.
+
+The running-paper cap counts registration rows for this user. Each deployed version is one. The default is 3 (`DEFAULT_PAPER_MAX_RUNNING`). `PAPER_MAX_RUNNING` overrides it with a whole number from 1 to 100. A blank value keeps 3. A new version at the cap is HTTP 409 `paper_limit` with message `paper strategy limit reached`. A version that is already running does not take another slot. An unusable setting is HTTP 503 `service_unavailable`. An unknown strategy or version is HTTP 404. A saved IR with no paper feed for its symbol is HTTP 422 `not_deployable`. Undeploy of a version that is not running is HTTP 404 `not_deployed`.
 
 ## What is durable
 
@@ -33,8 +52,11 @@ A synthetic bar is not a fill and it does not arm or touch an OCO. Its close may
 A bar is eligible only when all of these hold:
 
 - it is a real bar, not synthetic and not a hole
+- it is stored. A closed bar that is not in the store yet does not move the paper cursor. The tick stops on that open time and logs `not_ready` (`bar not stored`) on the live bar log. The next tick, after the feed has stored the bar, evaluates it. This is the same wait as the scheduler's `not_ready` path: a failed fetch is passed in as `hold`, and the cursor stays even if the following bar is already closed.
 - it is closed: `open_time + bar_seconds + 60 <= now` (the live close grace)
 - its close, `open_time + bar_seconds`, is strictly after `registered_at`
+
+An empty slot whose following bar is already closed, and whose fetch did not fail, is a hole. The cursor moves past it with no fill, the same way a missing bar is a hole in the backtester. A bar that shows up only after that skip is not filled. A bar that is stored while the cursor is still waiting is filled, and that fill matches `run_backtest`.
 
 The order is placed at the bar's close. It expires `ORDER_TTL_SECONDS` (300) after that close. The 300 seconds are wall-clock seconds, not bars. A 1-minute bar and a 1-day bar use the same 300 seconds, measured from the close, not from the open. The close grace is 60 seconds, so a tick that runs when the bar first becomes eligible is inside the window and fills. A tick that arrives more than 300 seconds after the close logs `ORDER_PLACED` and `ORDER_EXPIRED` and does not fill. That fill is not retried. The backtester has no clock, so a late paper tick diverges from it on purpose.
 
@@ -51,6 +73,8 @@ Each eligible bar appends rows the purge will delete. The kinds used here:
 | `ORDER_FILLED` | The engine filled it |
 | `ORDER_EXPIRED` | The tick is more than 300 seconds after the bar's close, or a resting order reached its deadline |
 | `ORDER_REJECTED` | Synthetic bar, hole, no cash, no position, pyramiding, max positions, or a second open order |
+| `ORDER_CANCELED` | Undeploy canceled a resting order. No fill is written |
+| `STRATEGY_UNDEPLOYED` | The registration was removed. `position_state` is `open_unmanaged` or `flat` |
 | `LINT` | The engine refused to loosen an OCO pair |
 
 `ORDER_FILLED` carries the derived price, quantity, notional, and commission. Those rows expire with the fill log. The open position keeps its own copy of the entry, the basis, and the OCO levels.

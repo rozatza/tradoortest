@@ -1,4 +1,4 @@
-"""FastAPI app. Health, backtest jobs, saved strategies, tools, and the author agent."""
+"""FastAPI app. Health, jobs, saved strategies, paper deploy, tools, and the author agent."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +11,7 @@ from app.jobs.queue import JobQueue
 from app.jobs.routes import error_response, router
 from app.live.scheduler import PaperScheduler, live_feed_enabled
 from app.ohlcv.routes import router as ohlcv_router
+from app.paper.routes import router as paper_router
 from app.strategies.routes import router as strategies_router
 from app.strategies.store import StrategyStore
 from app.tools.routes import router as tools_router
@@ -56,6 +57,7 @@ def create_app(
     application.include_router(router)
     application.include_router(ohlcv_router)
     application.include_router(strategies_router)
+    application.include_router(paper_router)
     application.include_router(tools_router)
     application.include_router(agent_router)
 

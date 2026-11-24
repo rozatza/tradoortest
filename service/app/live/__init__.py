@@ -1,7 +1,7 @@
 """Near-real-time bars and the paper scheduler.
 
 The feed stores closed bars. The scheduler calls the shared runner once per
-closed bar for each registered strategy version. Nothing here sends an order.
+closed bar, then the paper broker. Nothing here sends an order.
 See ``docs/live-feed.md``.
 """
 
