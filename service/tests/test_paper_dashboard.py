@@ -35,6 +35,11 @@ def test_the_dashboard_reads_the_stored_book(tmp_path: Path) -> None:
             "strategies": [],
             "positions": [],
             "events": [],
+            "events_cursor": 0,
+            "events_has_more": False,
+            "drift": [],
+            "drift_threshold": "0.01",
+            "drift_threshold_name": "PAPER_DRIFT_THRESHOLD",
         }
         assert _deploy(client, strategy_id).status_code == 201
         broker = PaperBroker(bars, now=lambda: clock["now"])
@@ -79,15 +84,19 @@ def test_the_dashboard_reads_the_stored_book(tmp_path: Path) -> None:
         kinds = [event["kind"] for event in body["events"]]
         assert "BAR_MISSED" in kinds
         missed = [event for event in body["events"] if event["kind"] == "BAR_MISSED"]
-        assert missed == [
-            {
-                "strategy_id": strategy_id,
-                "version": 1,
-                "open_time": missed_open,
-                "kind": "BAR_MISSED",
-                "detail": json.dumps({"reason": "ttl"}, sort_keys=True, separators=(",", ":")),
-            }
-        ]
+        assert len(missed) == 1
+        assert isinstance(missed[0]["id"], int) and missed[0]["id"] > 0
+        shown_miss = {
+            key: missed[0][key]
+            for key in ("strategy_id", "version", "open_time", "kind", "detail")
+        }
+        assert shown_miss == {
+            "strategy_id": strategy_id,
+            "version": 1,
+            "open_time": missed_open,
+            "kind": "BAR_MISSED",
+            "detail": json.dumps({"reason": "ttl"}, sort_keys=True, separators=(",", ":")),
+        }
         stored_events = _events(bars, strategy_id)
         shown = [
             (event["open_time"], event["kind"], event["detail"]) for event in body["events"]

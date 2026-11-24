@@ -3,10 +3,14 @@
 import { useEffect, useState, type FormEvent } from "react";
 
 import {
+  PAPER_EVENTS_LIMIT,
   errorMessage,
+  formatPaperAmount,
   paperDeployPath,
   paperPnl,
   readSnapshot,
+  type PaperDrift,
+  type PaperEvent,
   type PaperSnapshot,
 } from "@/lib/paper";
 
@@ -16,6 +20,11 @@ const EMPTY: PaperSnapshot = {
   strategies: [],
   positions: [],
   events: [],
+  eventsCursor: 0,
+  eventsHasMore: false,
+  driftThreshold: "0.01",
+  driftThresholdName: "PAPER_DRIFT_THRESHOLD",
+  drift: [],
 };
 
 export function PaperDashboard({ pollMs = 2000 }: { pollMs?: number }) {
@@ -29,25 +38,49 @@ export function PaperDashboard({ pollMs = 2000 }: { pollMs?: number }) {
   useEffect(() => {
     let cancelled = false;
     let timer = 0;
+    let since: number | null = null;
     const pull = async () => {
-      try {
-        const response = await fetch("/api/paper", {
-          cache: "no-store",
-          headers: { accept: "application/json" },
-        });
-        const body: unknown = await response.json();
-        if (cancelled) {
-          return;
+      let more = true;
+      let pages = 0;
+      while (more && pages < 5 && !cancelled) {
+        pages += 1;
+        const sentSince = since;
+        const params = new URLSearchParams({ events_limit: String(PAPER_EVENTS_LIMIT) });
+        if (sentSince !== null) {
+          params.set("events_since", String(sentSince));
         }
-        if (!response.ok) {
-          setError(errorMessage(body, "the paper API is unavailable"));
-        } else {
-          setSnapshot(readSnapshot(body));
-          setError(null);
-        }
-      } catch {
-        if (!cancelled) {
-          setError("the paper API is unavailable");
+        try {
+          const response = await fetch(`/api/paper?${params.toString()}`, {
+            cache: "no-store",
+            headers: { accept: "application/json" },
+          });
+          const body: unknown = await response.json();
+          if (cancelled) {
+            return;
+          }
+          if (!response.ok) {
+            setError(errorMessage(body, "the paper API is unavailable"));
+            more = false;
+          } else {
+            const next = readSnapshot(body);
+            if (sentSince === null) {
+              setSnapshot(next);
+            } else {
+              setSnapshot((current) => ({
+                ...next,
+                events: mergeEvents(current.events, next.events),
+                eventsHasMore: current.eventsHasMore || next.eventsHasMore,
+              }));
+            }
+            setError(null);
+            since = next.eventsCursor;
+            more = sentSince !== null && next.eventsHasMore;
+          }
+        } catch {
+          if (!cancelled) {
+            setError("the paper API is unavailable");
+          }
+          more = false;
         }
       }
       if (!cancelled) {
@@ -112,7 +145,11 @@ export function PaperDashboard({ pollMs = 2000 }: { pollMs?: number }) {
           {error}
         </p>
       ) : null}
-      <PaperBook snapshot={snapshot} busy={busy} onUndeploy={(id, number) => void undeploy(id, number)} />
+      <PaperBook
+        snapshot={snapshot}
+        busy={busy}
+        onUndeploy={(id, number) => void undeploy(id, number)}
+      />
       <section className="card" aria-label="Deploy on PAPER">
         <h2>Deploy on PAPER</h2>
         <form className="paper-form" onSubmit={(event) => void deploy(event)}>
@@ -223,11 +260,11 @@ export function PaperBook({
                     <td>{position.qty ?? "—"}</td>
                     <td>{position.entry ?? "—"}</td>
                     <td>
-                      <div>Stored realized {pnl.realized}</div>
+                      <div>Stored realized {formatPaperAmount(pnl.realized)}</div>
                       <div>Mark {pnl.markPrice ?? "none"} (last stored close)</div>
                       {pnl.combined !== null && pnl.combinedLabel !== null ? (
                         <div>
-                          {pnl.combinedLabel} {pnl.combined}
+                          {pnl.combinedLabel} {formatPaperAmount(pnl.combined)}
                         </div>
                       ) : null}
                     </td>
@@ -239,8 +276,10 @@ export function PaperBook({
           </div>
         )}
       </section>
+      <DriftReport snapshot={snapshot} />
       <section className="card" aria-label="Paper event log">
         <h2>Event log</h2>
+        {snapshot.eventsHasMore ? <p className="paper-note">Showing the latest events.</p> : null}
         {snapshot.events.length === 0 ? (
           <p className="empty">No paper event is stored.</p>
         ) : (
@@ -268,4 +307,126 @@ export function PaperBook({
       </section>
     </>
   );
+}
+
+export function mergeEvents(previous: PaperEvent[], incoming: PaperEvent[]): PaperEvent[] {
+  const seen = new Set(previous.map((event) => event.id));
+  const merged = previous.slice();
+  for (const event of incoming) {
+    if (seen.has(event.id)) {
+      continue;
+    }
+    seen.add(event.id);
+    merged.push(event);
+  }
+  merged.sort((left, right) => left.id - right.id);
+  return merged;
+}
+
+function DriftReport({ snapshot }: { snapshot: PaperSnapshot }) {
+  return (
+    <section className="card" aria-label="Backtest versus paper drift">
+      <h2>Backtest versus paper</h2>
+      <p className="paper-note">
+        Flag when a side or time differs, or when the price delta or the realized P&L delta is
+        greater than {snapshot.driftThresholdName} ({formatPaperAmount(snapshot.driftThreshold)}).
+        The comparison uses the pinned version and that version&apos;s commission and slippage. It
+        is not stored.
+      </p>
+      {snapshot.drift.length === 0 ? (
+        <p className="empty">No running strategy has a drift report.</p>
+      ) : (
+        <div className="paper-scroll">
+          <table className="paper-table">
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Status</th>
+                <th>Fills</th>
+                <th>Side/time</th>
+                <th>Price delta</th>
+                <th>Realized P&L delta</th>
+                <th>Flag</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshot.drift.map((row) => (
+                <tr key={`${row.strategyId}:${row.version}`}>
+                  <td className="mono">
+                    <div>
+                      {row.strategyId} v{row.version}
+                    </div>
+                    {row.costs ? (
+                      <div>
+                        commission {row.costs.commissionBps} bps, slippage {row.costs.slippageBps} bps
+                      </div>
+                    ) : null}
+                  </td>
+                  <td>{driftStatus(row)}</td>
+                  <td>{fills(row)}</td>
+                  <td>{row.sideTimeMismatches === null ? "—" : row.sideTimeMismatches}</td>
+                  <td>{row.priceDelta === null ? "—" : formatPaperAmount(row.priceDelta)}</td>
+                  <td>{realizedDelta(row)}</td>
+                  <td>{row.flagged ? <span className="paper-flagged">flagged</span> : "clear"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function driftStatus(row: PaperDrift): string {
+  if (row.status === "insufficient_data") {
+    return `insufficient data (${driftReason(row.reason)})`;
+  }
+  if (row.status === "drift") {
+    return "drift";
+  }
+  return "match";
+}
+
+function driftReason(reason: string | null): string {
+  if (reason === "no_window") {
+    return "no comparison window";
+  }
+  if (reason === "prior_book") {
+    return "position is from an earlier deployment";
+  }
+  if (reason === "short_history") {
+    return "stored history is shorter than warmup";
+  }
+  if (reason === "bar_missed") {
+    return "BAR_MISSED";
+  }
+  if (reason === "purged_fills") {
+    return "purged fills";
+  }
+  if (reason === "window_before_retained") {
+    return "window starts before retained data";
+  }
+  if (reason === "pinned_document") {
+    return "pinned document is unusable";
+  }
+  if (reason === "backtest_failed") {
+    return "backtest could not be run";
+  }
+  return reason ?? "missing";
+}
+
+function fills(row: PaperDrift): string {
+  if (row.fillCount === null) {
+    return "—";
+  }
+  return `${row.fillCount.paper} / ${row.fillCount.backtest}`;
+}
+
+function realizedDelta(row: PaperDrift): string {
+  if (row.realizedPnl === null) {
+    return "—";
+  }
+  const pnl = row.realizedPnl;
+  return `delta ${formatPaperAmount(pnl.delta)} (paper ${formatPaperAmount(pnl.paper)}, backtest ${formatPaperAmount(pnl.backtest)})`;
 }

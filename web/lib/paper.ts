@@ -33,11 +33,28 @@ export type PaperPosition = {
 };
 
 export type PaperEvent = {
+  id: number;
   strategyId: string;
   version: number;
   openTime: number;
   kind: string;
   detail: string;
+};
+
+export type PaperDriftStatus = "ok" | "drift" | "insufficient_data";
+
+export type PaperDrift = {
+  strategyId: string;
+  version: number;
+  status: PaperDriftStatus;
+  flagged: boolean;
+  reason: string | null;
+  threshold: string;
+  fillCount: { paper: number; backtest: number } | null;
+  sideTimeMismatches: number | null;
+  priceDelta: string | null;
+  realizedPnl: { paper: string; backtest: string; delta: string } | null;
+  costs: { commissionBps: string; slippageBps: string } | null;
 };
 
 export type PaperSnapshot = {
@@ -46,7 +63,15 @@ export type PaperSnapshot = {
   strategies: PaperStrategy[];
   positions: PaperPosition[];
   events: PaperEvent[];
+  eventsCursor: number;
+  eventsHasMore: boolean;
+  driftThreshold: string;
+  driftThresholdName: "PAPER_DRIFT_THRESHOLD";
+  drift: PaperDrift[];
 };
+
+/** Newest page size the dashboard requests. The service default is the same. */
+export const PAPER_EVENTS_LIMIT = 100;
 
 export type PaperPnl = {
   realized: string;
@@ -80,12 +105,23 @@ export function readSnapshot(value: unknown): PaperSnapshot {
   if (!isRecord(value) || value.mode !== "paper" || value.simulated !== true) {
     throw new Error("paper snapshot is invalid");
   }
+  if (value.drift_threshold_name !== "PAPER_DRIFT_THRESHOLD") {
+    throw new Error("paper snapshot is invalid");
+  }
+  if (typeof value.events_has_more !== "boolean") {
+    throw new Error("paper snapshot is invalid");
+  }
   return {
     mode: "paper",
     simulated: true,
     strategies: readList(value.strategies, readStrategy),
     positions: readList(value.positions, readPosition),
     events: readList(value.events, readEvent),
+    eventsCursor: readCount(value.events_cursor),
+    eventsHasMore: value.events_has_more,
+    driftThreshold: readText(value.drift_threshold),
+    driftThresholdName: "PAPER_DRIFT_THRESHOLD",
+    drift: readList(value.drift, readDrift),
   };
 }
 
@@ -116,6 +152,18 @@ export function paperPnl(position: PaperPosition): PaperPnl {
     combined: `${combined.n}/${combined.d}`,
     combinedLabel: "stored realized + mark",
   };
+}
+
+/**
+ * Render a stored fraction or decimal with at most 8 places and at least 2.
+ * Half-even. ``-250749/50`` is ``-5014.98``.
+ */
+export function formatPaperAmount(text: string): string {
+  const rational = parseFraction(text) ?? parseDecimal(text);
+  if (rational === null) {
+    return text;
+  }
+  return formatRational(rational);
 }
 
 export function errorMessage(value: unknown, fallback: string): string {
@@ -170,12 +218,100 @@ function readEvent(value: unknown): PaperEvent {
     throw new Error("paper snapshot is invalid");
   }
   return {
+    id: readPositive(value.id),
     strategyId: readId(value.strategy_id),
     version: readCount(value.version),
     openTime: readCount(value.open_time),
     kind: readText(value.kind),
     detail: readText(value.detail),
   };
+}
+
+function readDrift(value: unknown): PaperDrift {
+  if (!isRecord(value)) {
+    throw new Error("paper snapshot is invalid");
+  }
+  const status = value.status;
+  if (status !== "ok" && status !== "drift" && status !== "insufficient_data") {
+    throw new Error("paper snapshot is invalid");
+  }
+  if (typeof value.flagged !== "boolean") {
+    throw new Error("paper snapshot is invalid");
+  }
+  const reason = value.reason;
+  if (reason !== null && typeof reason !== "string") {
+    throw new Error("paper snapshot is invalid");
+  }
+  if (reason === "") {
+    throw new Error("paper snapshot is invalid");
+  }
+  return {
+    strategyId: readId(value.strategy_id),
+    version: readCount(value.version),
+    status,
+    flagged: value.flagged,
+    reason,
+    threshold: readText(value.threshold),
+    fillCount: readFillCount(value.fill_count),
+    sideTimeMismatches: readOptionalCount(value.side_time_mismatches),
+    priceDelta: readOptionalText(value.price_delta),
+    realizedPnl: readRealized(value.realized_pnl),
+    costs: readCosts(value.costs),
+  };
+}
+
+function readFillCount(value: unknown): { paper: number; backtest: number } | null {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("paper snapshot is invalid");
+  }
+  return { paper: readCount(value.paper), backtest: readCount(value.backtest) };
+}
+
+function readRealized(
+  value: unknown,
+): { paper: string; backtest: string; delta: string } | null {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("paper snapshot is invalid");
+  }
+  return {
+    paper: readText(value.paper),
+    backtest: readText(value.backtest),
+    delta: readText(value.delta),
+  };
+}
+
+function readCosts(value: unknown): { commissionBps: string; slippageBps: string } | null {
+  if (value === null) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    throw new Error("paper snapshot is invalid");
+  }
+  return {
+    commissionBps: readText(value.commission_bps),
+    slippageBps: readText(value.slippage_bps),
+  };
+}
+
+function readOptionalCount(value: unknown): number | null {
+  if (value === null) {
+    return null;
+  }
+  return readCount(value);
+}
+
+function readPositive(value: unknown): number {
+  const parsed = readCount(value);
+  if (parsed < 1) {
+    throw new Error("paper snapshot is invalid");
+  }
+  return parsed;
 }
 
 function readMark(value: unknown): PaperMark | null {
@@ -278,6 +414,34 @@ function reduce(numerator: bigint, denominator: bigint): Rational {
   }
   const divisor = gcd(numerator < ZERO ? -numerator : numerator, denominator);
   return { n: numerator / divisor, d: denominator / divisor };
+}
+
+const DISPLAY_SCALE = BigInt(100000000);
+const ONE = BigInt(1);
+const TWO = BigInt(2);
+
+function formatRational(value: Rational): string {
+  const negative = value.n < ZERO;
+  const numerator = negative ? -value.n : value.n;
+  const scaled = numerator * DISPLAY_SCALE;
+  const quotient = scaled / value.d;
+  const remainder = scaled % value.d;
+  let rounded = quotient;
+  const twice = remainder * TWO;
+  if (twice > value.d || (twice === value.d && quotient % TWO === ONE)) {
+    rounded += ONE;
+  }
+  const whole = rounded / DISPLAY_SCALE;
+  let frac = (rounded % DISPLAY_SCALE).toString().padStart(8, "0");
+  frac = frac.replace(/0+$/, "");
+  if (frac.length < 2) {
+    frac = frac.padEnd(2, "0");
+  }
+  const body = `${whole.toString()}.${frac}`;
+  if (negative && rounded !== ZERO) {
+    return `-${body}`;
+  }
+  return body;
 }
 
 function gcd(left: bigint, right: bigint): bigint {

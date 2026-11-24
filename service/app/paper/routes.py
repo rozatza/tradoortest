@@ -3,8 +3,10 @@
 ``POST /strategies/{strategy_id}/versions/{version}/paper`` reads that saved
 version and registers it. The request body is not an IR and is ignored.
 ``DELETE`` on the same path undeploys it. ``GET /paper`` reads the running
-registrations, the position rows, and the event log. The running-paper cap
-is ``PAPER_MAX_RUNNING`` (default 3). There is no live deploy and no wallet.
+registrations, the position rows, one page of the event log, and a
+backtest-versus-paper drift report computed on that read. The report is
+not stored. The running-paper cap is ``PAPER_MAX_RUNNING`` (default 3).
+There is no live deploy and no wallet.
 
 The bar file is the OHLCV runtime's file: ``ohlcv_db_path()``.
 """
@@ -24,6 +26,12 @@ from app.jobs.routes import error_response
 from app.ohlcv.routes import OhlcvRuntime, ohlcv_db_path
 from app.ohlcv.store import SqliteBarStore
 from app.paper.deploy import deploy_version, undeploy_version
+from app.paper.drift import (
+    PAPER_DRIFT_THRESHOLD_NAME,
+    drift_reports,
+    format_amount,
+    paper_drift_threshold,
+)
 from app.paper.errors import PaperError
 from app.paper.limits import paper_max_running
 from app.paper.snapshot import paper_snapshot
@@ -43,6 +51,12 @@ _VERSION_MESSAGE = "version must be a whole number from 1 to 1000000"
 _UNAVAILABLE = "strategy storage is unavailable"
 _LIMIT_UNAVAILABLE = "paper strategy limit is not configured"
 _FORBIDDEN = "this process serves one user"
+_DRIFT_UNAVAILABLE = "paper drift threshold is not configured"
+_DEFAULT_EVENT_LIMIT = 100
+_MAX_EVENT_LIMIT = 200
+_MAX_EVENT_CURSOR = 9_007_199_254_740_991
+_LIMIT_MESSAGE = "events_limit must be a whole number from 1 to 200"
+_SINCE_MESSAGE = "events_since must be a whole number from 0 to 9007199254740991"
 
 
 def _bar_store(request: Request) -> SqliteBarStore:
@@ -94,9 +108,22 @@ def _runtime_store(request: Request) -> SqliteBarStore | None:
 
 @router.get("/paper")
 async def read_paper(request: Request, user: CurrentUserDep) -> JSONResponse:
-    """Running paper strategies, positions, stored realized, marks, and events."""
+    """Running paper strategies, positions, a paged event log, and drift.
+
+    Drift is computed on this read from rows still inside the 24-hour purge.
+    It is not stored. ``events_limit`` defaults to 100. Omit ``events_since``
+    for the newest page. An ``events_since`` id returns later events only.
+    """
     if user.user_id != LOCAL_USER_ID:
         return error_response(403, "forbidden", _FORBIDDEN, None)
+    query = _events_query(request)
+    if isinstance(query, JSONResponse):
+        return query
+    events_since, events_limit = query
+    try:
+        threshold = paper_drift_threshold()
+    except ValueError:
+        return error_response(503, "service_unavailable", _DRIFT_UNAVAILABLE, None)
     try:
         strategies = await run_in_threadpool(open_store, request.app)
     except StoreUnavailable:
@@ -108,9 +135,21 @@ async def read_paper(request: Request, user: CurrentUserDep) -> JSONResponse:
     except (OSError, sqlite3.Error, ValueError):
         return error_response(503, "store_unavailable", _UNAVAILABLE, None)
     try:
-        body = await run_in_threadpool(paper_snapshot, bars, strategies, user.user_id)
+        body = await run_in_threadpool(
+            paper_snapshot,
+            bars,
+            strategies,
+            user.user_id,
+            events_since=events_since,
+            events_limit=events_limit,
+        )
+        body["drift"] = await run_in_threadpool(
+            drift_reports, bars, user.user_id, threshold
+        )
     except (sqlite3.Error, OSError):
         return error_response(503, "store_unavailable", _UNAVAILABLE, None)
+    body["drift_threshold"] = format_amount(threshold)
+    body["drift_threshold_name"] = PAPER_DRIFT_THRESHOLD_NAME
     return JSONResponse(status_code=200, content=body)
 
 
@@ -207,6 +246,54 @@ async def undeploy_paper(
             "position_state": result.position_state,
         },
     )
+
+
+class _QueryRejected(Exception):
+    def __init__(self, message: str, path: str) -> None:
+        self.message = message
+        self.path = path
+
+
+def _events_query(request: Request) -> tuple[int | None, int] | JSONResponse:
+    try:
+        since = _optional_whole(
+            request,
+            "events_since",
+            low=0,
+            high=_MAX_EVENT_CURSOR,
+            message=_SINCE_MESSAGE,
+        )
+        limit = _optional_whole(
+            request,
+            "events_limit",
+            low=1,
+            high=_MAX_EVENT_LIMIT,
+            message=_LIMIT_MESSAGE,
+        )
+    except _QueryRejected as exc:
+        return error_response(422, "invalid_query", exc.message, exc.path)
+    return since, _DEFAULT_EVENT_LIMIT if limit is None else limit
+
+
+def _optional_whole(
+    request: Request, name: str, *, low: int, high: int, message: str
+) -> int | None:
+    values = request.query_params.getlist(name)
+    if not values:
+        return None
+    if len(values) > 1:
+        raise _QueryRejected(f"{name} must be sent once", f"$.{name}")
+    raw = values[0]
+    if (
+        not _NUMBER.fullmatch(raw)
+        or len(raw) > 16
+        or (len(raw) > 1 and raw.startswith("0"))
+    ):
+        raise _QueryRejected(message, f"$.{name}")
+    value = int(raw)
+    if value < low or value > high:
+        raise _QueryRejected(message, f"$.{name}")
+    return value
 
 
 def _strategy_id(raw: str) -> str | JSONResponse:
