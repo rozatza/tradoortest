@@ -392,6 +392,12 @@ function driftReason(reason: string | null): string {
   if (reason === "no_window") {
     return "no comparison window";
   }
+  if (reason === "prior_book") {
+    return "position is from an earlier deployment";
+  }
+  if (reason === "short_history") {
+    return "stored history is shorter than warmup";
+  }
   if (reason === "bar_missed") {
     return "BAR_MISSED";
   }

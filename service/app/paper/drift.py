@@ -1,17 +1,21 @@
 """Compare paper fills with ``run_backtest`` on the same window.
 
-The window is the stored closed bars whose close is after ``registered_at``
-and whose open time is at or before the paper cursor. The document is the
-one pinned on the registration, so ``commission_bps`` and ``slippage_bps``
-are that document's costs. ``run_backtest`` is called and not modified.
+The window is the stored closed bars from the oldest retained bar through
+the paper cursor, the span the broker replays for warmup. Only a fill on
+a bar that closed after this registration's ``registered_at`` is compared.
+The document is the one pinned on the registration, so ``commission_bps``
+and ``slippage_bps`` are that document's costs. ``run_backtest`` is called
+and not modified. Bars before this registration warm that call and do not
+open a position in it.
 
 The report is built on read. It is not inserted, and the bars are not
 written back. There is no cache. Rows ``_purge`` has already deleted are
-not reconstructed from the wallet or the position. A ``BAR_MISSED``, a
-fill log that no longer replays onto that book, a ``registered_at`` at
-or before the retention cutoff, or a cursor that has not reached a closed
-bar is ``insufficient_data``. Those cases are not flagged as drift and
-are not reported as a match.
+not reconstructed from the wallet or the position. A ``BAR_MISSED`` from
+this registration, a fill log that no longer replays onto that book, a
+carried book from an earlier deployment, a warmup longer than the retained
+bars, a ``registered_at`` at or before the retention cutoff, or a cursor
+that has not reached a closed bar is ``insufficient_data``. Those cases
+are not flagged as drift and are not reported as a match.
 """
 
 from __future__ import annotations
@@ -131,8 +135,15 @@ def _one(
         return _insufficient(strategy_id, version, "pinned_document", threshold, costs)
     if registered_at <= cutoff:
         return _insufficient(strategy_id, version, "window_before_retained", threshold, costs)
+    warmup = _warmup_bars(document)
+    if warmup is None:
+        return _insufficient(strategy_id, version, "pinned_document", threshold, costs)
     if store.paper_has_kind(
-        user_id=user_id, strategy_id=strategy_id, version=version, kind="BAR_MISSED"
+        user_id=user_id,
+        strategy_id=strategy_id,
+        version=version,
+        kind="BAR_MISSED",
+        min_open_time=registered_at,
     ):
         return _insufficient(strategy_id, version, "bar_missed", threshold, costs)
     wallet = store.paper_wallet(user_id=user_id, strategy_id=strategy_id, version=version)
@@ -140,8 +151,20 @@ def _one(
     fills = store.paper_fills(user_id=user_id, strategy_id=strategy_id, version=version)
     if not _fills_cover_book(wallet, positions, fills):
         return _insufficient(strategy_id, version, "purged_fills", threshold, costs)
+    step = TIMEFRAME_SECONDS[bar_size]
+    if _prior_book(fills, positions, registered_at, step):
+        return _insufficient(strategy_id, version, "prior_book", threshold, costs)
     try:
-        series, gap = _window(store, user_id, assets, bar_size, registered_at, strategy_id, version)
+        series, gap, first_index = _window(
+            store,
+            user_id,
+            assets,
+            bar_size,
+            registered_at,
+            strategy_id,
+            version,
+            warmup,
+        )
     except (OSError, ValueError, TypeError):
         return _insufficient(strategy_id, version, "window_before_retained", threshold, costs)
     if gap is not None:
@@ -149,7 +172,7 @@ def _one(
     if series is None:
         return _insufficient(strategy_id, version, "no_window", threshold, costs)
     try:
-        result = run_backtest(document, series)
+        result = run_backtest(_gated(document, first_index), series)
     except (BacktestError, DecimalException, ValueError, KeyError, TypeError, ArithmeticError):
         logger.warning(
             "paper drift backtest failed strategy_id=%s version=%s",
@@ -157,9 +180,15 @@ def _one(
             version,
         )
         return _insufficient(strategy_id, version, "backtest_failed", threshold, costs)
-    paper = [_paper_fill(item) for item in fills]
+    paper = [
+        _paper_fill(item)
+        for item in fills
+        if _closed_after(int(item[0]), step, registered_at)
+    ]
     engine = [
-        _Fill(fill.open_time, fill.asset_id, fill.side, fill.price) for fill in result.fills
+        _Fill(fill.open_time, fill.asset_id, fill.side, fill.price)
+        for fill in result.fills
+        if _closed_after(fill.open_time, step, registered_at)
     ]
     mismatches, price_delta = _pair(paper, engine)
     return _compared(
@@ -302,6 +331,59 @@ def _bar_size(document: Mapping[str, Any]) -> str | None:
     return size
 
 
+def _warmup_bars(document: Mapping[str, Any]) -> int | None:
+    engine = document.get("engine")
+    if not isinstance(engine, dict):
+        return None
+    raw = engine.get("warmup_bars")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
+def _gated(document: dict[str, Any], first_index: int) -> dict[str, Any]:
+    """Pin the costs and signals. Delay the first fill until this registration.
+
+    The broker replays earlier bars for indicator memory and writes no fill
+    on a bar that closed at or before ``registered_at``. Raising the warmup
+    gate to that first bar makes ``run_backtest`` do the same. The stored
+    document is not written.
+    """
+    engine = document.get("engine")
+    if not isinstance(engine, dict):
+        return document
+    current = engine.get("warmup_bars")
+    if isinstance(current, bool) or not isinstance(current, int) or first_index <= current:
+        return document
+    copied = dict(document)
+    copied_engine = dict(engine)
+    copied_engine["warmup_bars"] = first_index
+    copied["engine"] = copied_engine
+    return copied
+
+
+def _closed_after(open_time: int, step: int, registered_at: int) -> bool:
+    return open_time + step > registered_at
+
+
+def _prior_book(
+    fills: Sequence[tuple[object, ...]],
+    positions: Sequence[tuple[object, ...]],
+    registered_at: int,
+    step: int,
+) -> bool:
+    """True when this registration inherited a fill or an open position."""
+    for fill in fills:
+        if not _closed_after(int(fill[0]), step, registered_at):
+            return True
+    for row in positions:
+        if row[1] is None or row[10] is None:
+            continue
+        if not _closed_after(int(row[10]), step, registered_at):
+            return True
+    return False
+
+
 def _window(
     store: SqliteBarStore,
     user_id: str,
@@ -310,47 +392,62 @@ def _window(
     registered_at: int,
     strategy_id: str,
     version: int,
-) -> tuple[dict[str, list[Bar]] | None, str | None]:
-    """Bars the cursor has already passed, or a gap reason.
+    warmup: int,
+) -> tuple[dict[str, list[Bar]] | None, str | None, int]:
+    """Bars from the oldest retained open through the cursor, or a gap reason.
 
-    ``(None, None)`` means the cursor has not reached a bar that closed
-    after registration. ``(None, reason)`` means the retained bars do not
-    cover that span. A series is returned only when every slot is stored.
+    The third value is the index of the first bar that closed after
+    registration. ``(None, None, 0)`` means the cursor has not reached such
+    a bar. ``(None, reason, 0)`` means the retained bars do not cover the
+    span the broker replayed. A series is returned only when every slot
+    from that oldest open through the cursor is stored.
     """
     step = TIMEFRAME_SECONDS[bar_size]
     cursor = store.paper_cursor(user_id=user_id, strategy_id=strategy_id, version=version)
     if cursor is None:
-        return None, None
-    first = _first_open(registered_at, step, cursor)
-    if first is None:
-        return None, None
-    if (cursor - first) % step != 0:
-        return None, "bar_missed"
-    expected = list(range(first, cursor + 1, step))
-    loaded: dict[str, list[Bar]] = {}
-    saw_bar = False
-    missing = False
+        return None, None, 0
+    trade_open = _first_open(registered_at, step, cursor)
+    if trade_open is None:
+        return None, None, 0
+    loaded: dict[str, dict[int, Bar]] = {}
+    earliest: int | None = None
     for asset_id, mint in assets:
         rows = store.load(
             user_id=user_id,
             mint=mint,
             timeframe=bar_size,
-            start=first,
+            start=0,
             end=cursor + step,
         )
-        by_time = {bar.open_time: bar for bar in rows}
+        by_time = {bar.open_time: bar for bar in rows if bar.open_time <= cursor}
+        loaded[asset_id] = by_time
         if by_time:
-            saw_bar = True
+            first = min(by_time)
+            earliest = first if earliest is None else min(earliest, first)
+    if earliest is None:
+        return None, "window_before_retained", 0
+    if (cursor - earliest) % step != 0 or (trade_open - earliest) % step != 0:
+        return None, "bar_missed", 0
+    expected = list(range(earliest, cursor + 1, step))
+    trade_slots = list(range(trade_open, cursor + 1, step))
+    series: dict[str, list[Bar]] = {}
+    saw_trade = False
+    missing = False
+    for asset_id, by_time in loaded.items():
+        if any(open_time in by_time for open_time in trade_slots):
+            saw_trade = True
         if any(open_time not in by_time for open_time in expected):
             missing = True
             continue
-        loaded[asset_id] = [by_time[open_time] for open_time in expected]
+        series[asset_id] = [by_time[open_time] for open_time in expected]
     if missing:
-        reason = "window_before_retained" if not saw_bar else "bar_missed"
-        return None, reason
+        reason = "window_before_retained" if not saw_trade else "bar_missed"
+        return None, reason, 0
     if not expected:
-        return None, None
-    return loaded, None
+        return None, None, 0
+    if warmup > 0 and len(expected) < warmup:
+        return None, "short_history", 0
+    return series, None, (trade_open - earliest) // step
 
 
 def _first_open(registered_at: int, step: int, cursor: int) -> int | None:

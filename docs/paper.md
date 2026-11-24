@@ -77,7 +77,7 @@ The web app polls `GET /api/paper?events_limit=100`, then later polls with `even
 
 ## Drift
 
-For each running registration, `GET /paper` calls `run_backtest` on the pinned document and the stored closed bars whose close is after `registered_at` and whose open time is at or before the paper cursor. Costs are that document's `commission_bps` and `slippage_bps`. Bars the cursor has not reached are outside the window. The engine is not modified.
+For each running registration, `GET /paper` calls `run_backtest` on the pinned document and the stored closed bars from the oldest retained bar through the paper cursor. That is the span the paper broker replays for warmup. Only a fill on a bar that closed after this registration's `registered_at` is compared. Bars before that warm the indicators and do not count as fills of this registration. Costs are that document's `commission_bps` and `slippage_bps`. Bars the cursor has not reached are outside the window. The engine is not modified.
 
 The report is computed on that read. It is not inserted, and the bars are not written back. There is no cache. A later read sees only rows the 24-hour purge has kept. The wallet and the position are not used to rebuild a fill that has aged out.
 
@@ -95,7 +95,9 @@ An equal difference is not flagged. Realized P&L is the stored position total ag
 | Reason | When |
 | --- | --- |
 | `no_window` | The paper cursor is unset, or it has not reached a stored bar that closed after `registered_at`. A window the cursor has already passed, with zero fills on both sides, is still `ok` |
-| `bar_missed` | A `BAR_MISSED` event is still inside the TTL, or the cursor span has a hole while some of that span is still stored |
+| `prior_book` | A retained fill, or an open position attached on a bar that closed at or before this `registered_at`. A redeploy that carries the previous book is this case |
+| `short_history` | `warmup_bars` is greater than the number of retained bars from the oldest stored bar through the cursor |
+| `bar_missed` | A `BAR_MISSED` event whose open time is at or after `registered_at` is still inside the TTL, or the cursor span has a hole while some of that span is still stored |
 | `purged_fills` | Replaying the retained fills does not land on the stored cash and quantity |
 | `window_before_retained` | `registered_at` is at or before the retention cutoff, or the cursor span has no stored bars left |
 

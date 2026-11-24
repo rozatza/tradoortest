@@ -1754,19 +1754,40 @@ class SqliteBarStore:
 
     @_serialized
     def paper_has_kind(
-        self, *, user_id: str, strategy_id: str, version: int, kind: str
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        kind: str,
+        min_open_time: int | None = None,
     ) -> bool:
-        """True when this version still has one event of ``kind`` inside the TTL."""
+        """True when this version still has one event of ``kind`` inside the TTL.
+
+        ``min_open_time`` keeps events at or after that bar open. An earlier
+        deployment of the same version is left out.
+        """
         self._purge()
         _owner(user_id)
-        row = self._conn.execute(
-            """
-            SELECT 1 FROM paper_events
-            WHERE user_id = ? AND strategy_id = ? AND version = ? AND kind = ?
-            LIMIT 1
-            """,
-            (user_id, strategy_id, version, kind),
-        ).fetchone()
+        if min_open_time is None:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM paper_events
+                WHERE user_id = ? AND strategy_id = ? AND version = ? AND kind = ?
+                LIMIT 1
+                """,
+                (user_id, strategy_id, version, kind),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM paper_events
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                  AND kind = ? AND open_time >= ?
+                LIMIT 1
+                """,
+                (user_id, strategy_id, version, kind, min_open_time),
+            ).fetchone()
         return row is not None
 
     @_serialized

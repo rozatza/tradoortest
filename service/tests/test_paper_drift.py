@@ -18,6 +18,7 @@ from tests.test_paper_deploy import (
     _fills,
     _revise,
     _save,
+    _undeploy,
     _world,
 )
 
@@ -189,6 +190,130 @@ def test_a_real_window_with_no_fills_stays_ok(tmp_path: Path) -> None:
         assert report["reason"] is None
         assert report["fill_count"] == {"paper": 0, "backtest": 0}
         assert report["side_time_mismatches"] == 0
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_warmup_bars_cached_before_deploy_match(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    document = _document()
+    document["engine"]["warmup_bars"] = 3
+    strategy_id, _version, _hash = _save(strategies, document)
+    try:
+        cached = [
+            _bar(_T + index * _STEP, 100 + index, high=101 + index, low=99 + index)
+            for index in range(5)
+        ]
+        bars.upsert(cached, user_id=LOCAL_USER_ID)
+        clock["now"] = _T + 5 * _STEP
+        assert _deploy(client, strategy_id).status_code == 201
+        broker = PaperBroker(bars, now=lambda: clock["now"])
+        for index in range(5, 9):
+            bars.upsert(
+                [_bar(_T + index * _STEP, 100 + index, high=101 + index, low=99 + index)],
+                user_id=LOCAL_USER_ID,
+            )
+            clock["now"] = _T + (index + 1) * _STEP + _GRACE
+            broker.tick()
+        assert [(fill[0] - _T) // _STEP for fill in _fills(bars, strategy_id)] == [5]
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "ok"
+        assert report["flagged"] is False
+        assert report["reason"] is None
+        assert report["fill_count"] == {"paper": 1, "backtest": 1}
+        assert report["side_time_mismatches"] == 0
+        assert Decimal(report["price_delta"]) == 0
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_a_redeployed_book_is_not_drift(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    strategy_id, _version, _hash = _save(strategies, _document())
+    try:
+        assert _deploy(client, strategy_id).status_code == 201
+        broker = PaperBroker(bars, now=lambda: clock["now"])
+
+        def step(index: int) -> None:
+            bars.upsert(
+                [_bar(_T + index * _STEP, 100 + index, high=101 + index, low=99 + index)],
+                user_id=LOCAL_USER_ID,
+            )
+            clock["now"] = _T + (index + 1) * _STEP + _GRACE
+            broker.tick()
+
+        step(0)
+        step(1)
+        assert client.get("/paper").json()["drift"][0]["status"] == "ok"
+        assert _undeploy(client, strategy_id).json()["position_state"] == "open_unmanaged"
+        step(2)
+        clock["now"] = _T + 3 * _STEP + _GRACE
+        assert _deploy(client, strategy_id).status_code == 201
+        for index in (3, 4, 5):
+            step(index)
+        assert [(fill[0] - _T) // _STEP for fill in _fills(bars, strategy_id)] == [0]
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "insufficient_data"
+        assert report["reason"] == "prior_book"
+        assert report["flagged"] is False
+        assert report["fill_count"] is None
+        assert report["status"] != "drift"
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_a_short_warmup_history_is_insufficient(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    document = _document()
+    document["engine"]["warmup_bars"] = 14
+    strategy_id, _version, _hash = _save(strategies, document)
+    try:
+        assert _deploy(client, strategy_id).status_code == 201
+        broker = PaperBroker(bars, now=lambda: clock["now"])
+        for index in range(3):
+            bars.upsert(
+                [_bar(_T + index * _STEP, 100 + index, high=101 + index, low=99 + index)],
+                user_id=LOCAL_USER_ID,
+            )
+            clock["now"] = _T + (index + 1) * _STEP + _GRACE
+            broker.tick()
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "insufficient_data"
+        assert report["reason"] == "short_history"
+        assert report["flagged"] is False
+        assert report["fill_count"] is None
+        assert report["status"] != "drift"
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_a_bar_missed_before_this_registration_is_ignored(tmp_path: Path) -> None:
+    client, strategies, bars, clock, strategy_id = _running(tmp_path)
+    try:
+        connection = sqlite3.connect(bars.path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO paper_events (
+                    user_id, strategy_id, version, open_time, kind, detail, stored_at
+                ) VALUES (?, ?, 1, 0, 'BAR_MISSED', '{}', ?)
+                """,
+                (LOCAL_USER_ID, strategy_id, clock["now"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "ok"
+        assert report["reason"] is None
+        assert report["flagged"] is False
     finally:
         bars.close()
         strategies.close()
