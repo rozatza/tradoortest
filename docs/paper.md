@@ -52,11 +52,11 @@ A synthetic bar is not a fill and it does not arm or touch an OCO. Its close may
 A bar is eligible only when all of these hold:
 
 - it is a real bar, not synthetic and not a hole
-- it is stored. A closed bar that is not in the store yet does not move the paper cursor. The tick stops on that open time and logs `not_ready` (`bar not stored`) on the live bar log. The next tick, after the feed has stored the bar, evaluates it. This is the same wait as the scheduler's `not_ready` path: a failed fetch is passed in as `hold`, and the cursor stays even if the following bar is already closed.
+- it is stored. A closed bar that is not in the store yet does not move the paper cursor. The tick stops on that open time and logs `not_ready` (`bar not stored`) on the live bar log. It keeps waiting until `now` is past that bar's close plus `ORDER_TTL_SECONDS` (300), the same bound as a late fill. A failed fetch is passed in as `hold` and keeps waiting after that bound, including when the following bar is already closed. If the bar is stored while the cursor is still waiting, the next tick fills it and the fill matches `run_backtest` on the stored series.
 - it is closed: `open_time + bar_seconds + 60 <= now` (the live close grace)
 - its close, `open_time + bar_seconds`, is strictly after `registered_at`
 
-An empty slot whose following bar is already closed, and whose fetch did not fail, is a hole. The cursor moves past it with no fill, the same way a missing bar is a hole in the backtester. A bar that shows up only after that skip is not filled. A bar that is stored while the cursor is still waiting is filled, and that fill matches `run_backtest`.
+An empty slot whose fetch succeeded, once `now` is past its close plus 300 seconds, is a hole. The tick appends `BAR_MISSED` (reason `ttl`) and steps that open time with no fill, so a permanent gap cannot freeze the book. A bar that shows up only after that skip is not filled. A bar stored inside the window is filled, including when it arrives two or more bars late.
 
 The order is placed at the bar's close. It expires `ORDER_TTL_SECONDS` (300) after that close. The 300 seconds are wall-clock seconds, not bars. A 1-minute bar and a 1-day bar use the same 300 seconds, measured from the close, not from the open. The close grace is 60 seconds, so a tick that runs when the bar first becomes eligible is inside the window and fills. A tick that arrives more than 300 seconds after the close logs `ORDER_PLACED` and `ORDER_EXPIRED` and does not fill. That fill is not retried. The backtester has no clock, so a late paper tick diverges from it on purpose.
 
@@ -73,6 +73,7 @@ Each eligible bar appends rows the purge will delete. The kinds used here:
 | `ORDER_FILLED` | The engine filled it |
 | `ORDER_EXPIRED` | The tick is more than 300 seconds after the bar's close, or a resting order reached its deadline |
 | `ORDER_REJECTED` | Synthetic bar, hole, no cash, no position, pyramiding, max positions, or a second open order |
+| `BAR_MISSED` | The cursor stepped an empty slot after the order TTL. No fill is written |
 | `ORDER_CANCELED` | Undeploy canceled a resting order. No fill is written |
 | `STRATEGY_UNDEPLOYED` | The registration was removed. `position_state` is `open_unmanaged` or `flat` |
 | `LINT` | The engine refused to loosen an OCO pair |

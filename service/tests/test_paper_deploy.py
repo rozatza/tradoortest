@@ -139,10 +139,12 @@ def test_a_bar_that_closed_before_deploy_is_not_filled(tmp_path: Path) -> None:
         assert deployed.status_code == 201
         assert deployed.json()["registered_at"] == clock["now"]
         bars.upsert([before, after], user_id=LOCAL_USER_ID)
-        from app.paper.broker import PaperBroker
+        from app.paper.broker import ORDER_TTL_SECONDS, PaperBroker
 
         broker = PaperBroker(bars, now=lambda: clock["now"])
-        clock["now"] = _T + 3 * _STEP + _GRACE
+        # The minute between the two bars is empty. Step it only after its
+        # order TTL, while the later bar is still inside its own window.
+        clock["now"] = (_T + _STEP) + _STEP + ORDER_TTL_SECONDS + 1
         broker.tick()
         fills = _fills(bars, strategy_id)
         assert [fill[0] for fill in fills] == [_T + 2 * _STEP]

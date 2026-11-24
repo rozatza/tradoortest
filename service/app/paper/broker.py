@@ -16,9 +16,11 @@ does not get a longer life: the five minutes start when that bar closes.
 A closed bar that is not in the store yet does not move the cursor. The tick
 stops on that open time, the same way the scheduler's ``not_ready`` path
 leaves the cursor put, and the next tick can see the bar after the feed
-stores it. The cursor moves past an empty slot only once the following bar
-is already closed and this tick's fetch did not fail. That slot is a hole.
-It is stepped with no fill. Nothing here invents a candle.
+stores it. The wait lasts until ``now`` is past that bar's close plus
+``ORDER_TTL_SECONDS``, the same bound as a late fill. A failed fetch keeps
+waiting after that bound. Only then is the empty slot a hole: the tick
+appends ``BAR_MISSED`` and steps it with no fill. Nothing here invents a
+candle.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from app.backtest.engine import (
 )
 from app.backtest.errors import BacktestError
 from app.backtest.money import quantize_cents
-from app.live.feed import bar_is_closed, last_closed_open
+from app.live.feed import last_closed_open
 from app.ohlcv.bars import TIMEFRAME_SECONDS, Bar
 from app.ohlcv.registry import BY_SYMBOL
 from app.ohlcv.store import SqliteBarStore
@@ -168,7 +170,9 @@ class PaperBroker:
 
         ``hold`` is the ``(mint, timeframe)`` pairs whose feed fetch failed
         on this tick. An unstored bar for one of those pairs does not move
-        the cursor, including when the following bar is already closed.
+        the cursor, including after the order TTL. A successful fetch that
+        omitted the slot waits until ``now`` is past the bar's close plus
+        ``ORDER_TTL_SECONDS``, then steps the hole with no fill.
         """
         self._hold = frozenset(hold or ())
         try:
@@ -234,10 +238,11 @@ class PaperBroker:
         slot = start
         while slot <= closed_through:
             # Do not commit this open time while the bar can still arrive.
-            # ``held`` is a failed fetch: wait even if the next bar is closed.
-            if not _slot_stored(bars, asset_ids, slot) and (
-                held or not _following_closed(slot, step_seconds, now)
-            ):
+            # ``held`` is a failed fetch and waits past the order TTL. A
+            # successful omit waits until the same bound as a late fill.
+            missed = not _slot_stored(bars, asset_ids, slot)
+            close_time = slot + step_seconds
+            if missed and (held or now <= close_time + ORDER_TTL_SECONDS):
                 self._wait_for_bar(strategy_id, version, slot)
                 break
             self._runner[key] = self._one_slot(
@@ -256,6 +261,7 @@ class PaperBroker:
                 blocked,
                 expire_ids,
                 expire_events,
+                missed=missed,
             )
             expire_ids = ()
             expire_events = []
@@ -292,6 +298,7 @@ class PaperBroker:
         blocked: bool,
         expire_ids: Sequence[int],
         expire_events: Sequence[Mapping[str, object]],
+        missed: bool = False,
     ) -> RunnerState:
         key = (strategy_id, version)
         marks = self._marks.setdefault(key, {})
@@ -309,7 +316,7 @@ class PaperBroker:
                 positions=[],
                 orders=[],
                 fills=[],
-                events=expire_events,
+                events=_with_miss(expire_events, open_time, missed),
                 expire_order_ids=expire_ids,
                 cash=_money(book.cash),
             )
@@ -327,7 +334,7 @@ class PaperBroker:
                 positions=[],
                 orders=orders,
                 fills=[],
-                events=[*expire_events, *events],
+                events=_with_miss([*expire_events, *events], open_time, missed),
                 expire_order_ids=expire_ids,
                 cash=_money(book.cash),
             )
@@ -343,7 +350,7 @@ class PaperBroker:
             positions=positions,
             orders=orders,
             fills=fills,
-            events=[*expire_events, *events],
+            events=_with_miss([*expire_events, *events], open_time, missed),
             expire_order_ids=expire_ids,
             cash=_money(book.cash),
         )
@@ -854,7 +861,8 @@ def _slot_stored(
     """True when every asset has a stored bar at ``open_time``.
 
     A synthetic bar counts. A missing open time does not. The cursor does
-    not move past a slot this rejects while that bar can still be stored.
+    not move past a slot this rejects until the order TTL after its close,
+    or at all when this tick's fetch failed.
     """
     for asset_id in asset_ids:
         if bars[asset_id].get(open_time) is None:
@@ -862,9 +870,14 @@ def _slot_stored(
     return True
 
 
-def _following_closed(open_time: int, step_seconds: int, now: int) -> bool:
-    """True once the bar after ``open_time`` is closed, including the grace."""
-    return bar_is_closed(open_time + step_seconds, step_seconds, now)
+def _with_miss(
+    events: Sequence[Mapping[str, object]], open_time: int, missed: bool
+) -> list[Mapping[str, object]]:
+    """Append ``BAR_MISSED`` when this step is a hole. No fill is added."""
+    rows = list(events)
+    if missed:
+        rows.append(_event(open_time, "BAR_MISSED", {"reason": "ttl"}))
+    return rows
 
 
 def _fetch_held(

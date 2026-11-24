@@ -206,6 +206,20 @@ def _assert_fills_match(bars: list[Bar], store: SqliteBarStore) -> None:
         assert bool(got[8]) == fill.limit_below_low
 
 
+def _assert_book_matches(bars: list[Bar], store: SqliteBarStore) -> None:
+    """Fills, open positions, and booked cash match ``run_backtest`` on ``bars``.
+
+    Cash is the booked P&L. An open long's quantity and entry are the position.
+    Together with the fills they are the book the backtester would still hold.
+    """
+    result = run_backtest(_document(), {"sol": bars})
+    _assert_fills_match(bars, store)
+    assert _open_positions(_positions(store)) == _backtest_open(bars)
+    wallet = store.paper_wallet(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+    assert wallet is not None
+    assert Decimal(wallet[0]) == result.final_cash
+
+
 def _age(path: Path, *tables: str) -> None:
     connection = sqlite3.connect(path)
     try:
@@ -264,7 +278,10 @@ def test_fixture_matches_the_backtester_and_survives_the_fill_purge(
         clock["now"] = _T + 3 * _STEP + _GRACE
         broker.tick()
         store.upsert([slot3], user_id=LOCAL_USER_ID)
-        clock["now"] = _T + 4 * _STEP + _GRACE
+        # The empty minute between the synthetic bar and slot3 stays open
+        # until the order TTL after its close. slot3 itself is still inside
+        # that window, so this tick steps the gap and then reads slot3.
+        clock["now"] = (_T + 2 * _STEP) + _STEP + ORDER_TTL_SECONDS + 1
         broker.tick()
         held = [slot0, slot1, slot3]
         _assert_fills_match(held, store)
@@ -303,7 +320,7 @@ def test_fixture_matches_the_backtester_and_survives_the_fill_purge(
 
         slot4 = _bar(_T + 4 * _STEP, 130, high=131, low=120)
         store.upsert([slot4], user_id=LOCAL_USER_ID)
-        clock["now"] = _T + 5 * _STEP + _GRACE
+        # Same instant: slot4 is closed, and it is still inside its order TTL.
         restarted.tick()
         finished = [slot0, slot1, slot3, slot4]
         result = run_backtest(_document(), {"sol": finished})
@@ -403,14 +420,20 @@ def test_a_failed_fetch_does_not_advance_past_an_unstored_bar(tmp_path: Path) ->
     try:
         clock["now"] = _T + _STEP + _GRACE
         broker.tick()
-        # The following bar is closed, which would otherwise be a hole.
+        # The following bar is closed. A failed fetch still waits, including
+        # after the order TTL, and it does not declare a hole.
         clock["now"] = _T + 4 * _STEP + _GRACE
+        broker.tick(hold={(SOL_MINT, "1m")})
+        late_close = late.open_time + _STEP
+        clock["now"] = late_close + ORDER_TTL_SECONDS + 1
         broker.tick(hold={(SOL_MINT, "1m")})
         assert store.paper_cursor(
             user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
         ) == _T
         assert _fills(store) == []
+        assert "BAR_MISSED" not in _kinds(store)
 
+        clock["now"] = late_close + ORDER_TTL_SECONDS
         store.upsert([late], user_id=LOCAL_USER_ID)
         broker.tick()
         _assert_fills_match([prior, late], store)
@@ -419,9 +442,16 @@ def test_a_failed_fetch_does_not_advance_past_an_unstored_bar(tmp_path: Path) ->
 
 
 def test_a_confirmed_hole_is_not_a_fill(tmp_path: Path) -> None:
-    """Once the next bar is closed, an empty slot is stepped and not filled."""
+    """A missing slot waits through the order TTL, then steps with no fill.
+
+    The following bar being closed is not enough. At the close plus
+    ``ORDER_TTL_SECONDS`` the cursor is still on the previous bar. One second
+    later the empty slot is ``BAR_MISSED`` and the stored bar after it fills.
+    """
     entered = _bar(_T, 100, high=101, low=99)
     after = _bar(_T + 2 * _STEP, 110, high=112, low=100)
+    hole = _T + _STEP
+    hole_close = hole + _STEP
     clock = {"now": _T}
     store = _store(tmp_path, clock)
     _register(store, clock, _document())
@@ -431,13 +461,156 @@ def test_a_confirmed_hole_is_not_a_fill(tmp_path: Path) -> None:
         clock["now"] = _T + _STEP + _GRACE
         broker.tick()
         store.upsert([after], user_id=LOCAL_USER_ID)
-        clock["now"] = _T + 4 * _STEP + _GRACE
+        clock["now"] = hole_close + ORDER_TTL_SECONDS
+        broker.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert [fill[0] for fill in _fills(store)] == [_T]
+        assert "BAR_MISSED" not in _kinds(store)
+
+        clock["now"] = hole_close + ORDER_TTL_SECONDS + 1
         broker.tick()
         assert [fill[0] for fill in _fills(store)] == [_T]
-        _assert_fills_match([entered, after], store)
+        missed = [
+            (open_time, json.loads(detail))
+            for open_time, kind, detail in store.paper_events(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            if kind == "BAR_MISSED"
+        ]
+        assert missed == [(hole, {"reason": "ttl"})]
+        _assert_book_matches([entered, after], store)
         assert store.paper_cursor(
             user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
         ) == _T + 2 * _STEP
+    finally:
+        store.close()
+
+
+def test_a_bar_two_bars_late_within_the_order_ttl_matches_backtest(tmp_path: Path) -> None:
+    """A bar omitted by a successful fetch still fills if it lands inside the TTL.
+
+    The following bar is already closed, with order time left. Paper on the
+    final stored series matches ``run_backtest``: entry on the late bar, the
+    stop on the next bar, and the re-entry.
+    """
+    prior = _bar(_T, 40, high=41, low=39)
+    late = _bar(_T + _STEP, 100, high=101, low=99)
+    following = _bar(_T + 2 * _STEP, 60, high=61, low=59)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, _document())
+    store.upsert([prior], user_id=LOCAL_USER_ID)
+    broker = _broker(store, clock)
+    try:
+        clock["now"] = _T + 2 * _STEP + _GRACE
+        broker.tick(hold=set())
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+
+        store.upsert([following], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + 3 * _STEP + _GRACE
+        assert clock["now"] - (late.open_time + _STEP) < ORDER_TTL_SECONDS
+        broker.tick(hold=set())
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+        assert "BAR_MISSED" not in _kinds(store)
+
+        store.upsert([late], user_id=LOCAL_USER_ID)
+        broker.tick(hold=set())
+        _assert_book_matches([prior, late, following], store)
+        assert any(fill[0] == late.open_time for fill in _fills(store))
+    finally:
+        store.close()
+
+
+def test_a_bar_two_bars_late_through_the_scheduler_matches_backtest(tmp_path: Path) -> None:
+    """The scheduler stores a late bar before the broker gives the slot up."""
+    prior = _bar(_T, 40, high=41, low=39)
+    late = _bar(_T + _STEP, 100, high=101, low=99)
+    following = _bar(_T + 2 * _STEP, 60, high=61, low=59)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    store.upsert([prior], user_id=LOCAL_USER_ID)
+    calls = {"n": 0}
+
+    class _LateFeed:
+        def fetch(self, *_args: object, **_kwargs: object) -> list[Bar]:
+            calls["n"] += 1
+            # The page that first sees the following bar closed still omits
+            # the late slot. The page after that includes it.
+            if calls["n"] <= 2:
+                chosen = [bar for bar in (prior, following) if bar.open_time < clock["now"]]
+            else:
+                chosen = [prior, late, following]
+            store.upsert(chosen, user_id=LOCAL_USER_ID)
+            return chosen
+
+        def close(self) -> None:
+            return None
+
+    scheduler = PaperScheduler(store, _LateFeed(), now=lambda: clock["now"], interval=3600)
+    register_paper_strategy(scheduler, "sol-paper", 1, _document())
+    try:
+        clock["now"] = _T + 2 * _STEP + _GRACE
+        scheduler.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        clock["now"] = _T + 3 * _STEP + _GRACE
+        assert clock["now"] - (late.open_time + _STEP) < ORDER_TTL_SECONDS
+        scheduler.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert _fills(store) == []
+        scheduler.tick()
+        _assert_book_matches([prior, late, following], store)
+    finally:
+        store.close()
+
+
+def test_a_permanent_gap_advances_after_the_order_ttl(tmp_path: Path) -> None:
+    """After the order TTL an empty slot is ``BAR_MISSED`` and the book moves on."""
+    entered = _bar(_T, 100, high=101, low=99)
+    after = _bar(_T + 2 * _STEP, 110, high=112, low=100)
+    hole = _T + _STEP
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, _document())
+    broker = _broker(store, clock)
+    try:
+        store.upsert([entered, after], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + _STEP + _GRACE
+        broker.tick()
+        assert [fill[0] for fill in _fills(store)] == [_T]
+        clock["now"] = hole + _STEP + ORDER_TTL_SECONDS
+        broker.tick()
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == _T
+        assert "BAR_MISSED" not in _kinds(store)
+
+        clock["now"] = hole + _STEP + ORDER_TTL_SECONDS + 1
+        broker.tick()
+        missed = [
+            (open_time, json.loads(detail))
+            for open_time, kind, detail in store.paper_events(
+                user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+            )
+            if kind == "BAR_MISSED"
+        ]
+        assert missed == [(hole, {"reason": "ttl"})]
+        assert hole not in {fill[0] for fill in _fills(store)}
+        _assert_book_matches([entered, after], store)
+        assert store.paper_cursor(
+            user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1
+        ) == after.open_time
     finally:
         store.close()
 

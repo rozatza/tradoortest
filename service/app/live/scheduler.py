@@ -25,7 +25,9 @@ It does not attach an OCO from that decision and it does not send an order.
 Each tick's order is fixed: the feed fetches, the store writes the closed
 bars, the decision walk runs, then ``PaperBroker.tick`` reads that store.
 The broker does not read the decisions recorded here. A fetch that raises
-is passed to the broker as ``hold`` so an unstored bar is not skipped.
+is passed to the broker as ``hold`` so an unstored bar is not skipped. A
+successful page that omits a slot does not let the broker pass it until
+the order TTL after that bar's close.
 """
 
 from __future__ import annotations
