@@ -8,9 +8,10 @@ are that document's costs. ``run_backtest`` is called and not modified.
 The report is built on read. It is not inserted, and the bars are not
 written back. There is no cache. Rows ``_purge`` has already deleted are
 not reconstructed from the wallet or the position. A ``BAR_MISSED``, a
-fill log that no longer replays onto that book, or a ``registered_at`` at
-or before the retention cutoff is ``insufficient_data``. Those cases are
-not flagged as drift and are not reported as a match.
+fill log that no longer replays onto that book, a ``registered_at`` at
+or before the retention cutoff, or a cursor that has not reached a closed
+bar is ``insufficient_data``. Those cases are not flagged as drift and
+are not reported as a match.
 """
 
 from __future__ import annotations
@@ -146,20 +147,7 @@ def _one(
     if gap is not None:
         return _insufficient(strategy_id, version, gap, threshold, costs)
     if series is None:
-        if fills:
-            return _insufficient(strategy_id, version, "window_before_retained", threshold, costs)
-        return _compared(
-            strategy_id,
-            version,
-            threshold,
-            costs,
-            paper_count=0,
-            backtest_count=0,
-            mismatches=0,
-            price_delta=Decimal(0),
-            paper_realized=Fraction(0),
-            backtest_realized=Fraction(0),
-        )
+        return _insufficient(strategy_id, version, "no_window", threshold, costs)
     try:
         result = run_backtest(document, series)
     except (BacktestError, DecimalException, ValueError, KeyError, TypeError, ArithmeticError):

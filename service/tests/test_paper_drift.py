@@ -118,6 +118,82 @@ def test_a_changed_fill_price_is_flagged(tmp_path: Path, monkeypatch: pytest.Mon
         strategies.close()
 
 
+def test_a_fresh_deploy_with_no_bars_has_no_window(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    strategy_id, _version, _hash = _save(strategies, _document())
+    try:
+        assert _deploy(client, strategy_id).status_code == 201
+        assert (
+            bars.paper_cursor(user_id=LOCAL_USER_ID, strategy_id=strategy_id, version=1) is None
+        )
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "insufficient_data"
+        assert report["reason"] == "no_window"
+        assert report["flagged"] is False
+        assert report["fill_count"] is None
+        assert report["side_time_mismatches"] is None
+        assert report["price_delta"] is None
+        assert report["realized_pnl"] is None
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_stored_bars_before_the_cursor_advances_have_no_window(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    strategy_id, _version, _hash = _save(strategies, _document())
+    try:
+        assert _deploy(client, strategy_id).status_code == 201
+        bars.upsert([_bar(_T, 100, high=101, low=99)], user_id=LOCAL_USER_ID)
+        stored = bars.load(
+            user_id=LOCAL_USER_ID,
+            mint=SOL_MINT,
+            timeframe="1m",
+            start=_T,
+            end=_T + _STEP,
+        )
+        assert stored
+        assert (
+            bars.paper_cursor(user_id=LOCAL_USER_ID, strategy_id=strategy_id, version=1) is None
+        )
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "insufficient_data"
+        assert report["reason"] == "no_window"
+        assert report["flagged"] is False
+        assert report["fill_count"] is None
+        assert report["side_time_mismatches"] is None
+        assert report["price_delta"] is None
+        assert report["realized_pnl"] is None
+    finally:
+        bars.close()
+        strategies.close()
+
+
+def test_a_real_window_with_no_fills_stays_ok(tmp_path: Path) -> None:
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    strategy_id, _version, _hash = _save(strategies, _document())
+    try:
+        assert _deploy(client, strategy_id).status_code == 201
+        broker = PaperBroker(bars, now=lambda: clock["now"])
+        bars.upsert([_bar(_T, 40, high=41, low=39)], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + _STEP + _GRACE
+        broker.tick()
+        assert bars.paper_cursor(user_id=LOCAL_USER_ID, strategy_id=strategy_id, version=1) == _T
+        assert _fills(bars, strategy_id) == []
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "ok"
+        assert report["flagged"] is False
+        assert report["reason"] is None
+        assert report["fill_count"] == {"paper": 0, "backtest": 0}
+        assert report["side_time_mismatches"] == 0
+    finally:
+        bars.close()
+        strategies.close()
+
+
 def test_bar_missed_is_insufficient_data(tmp_path: Path) -> None:
     clock = {"now": _T}
     client, strategies, bars, _application = _world(tmp_path, clock)

@@ -94,6 +94,7 @@ An equal difference is not flagged. Realized P&L is the stored position total ag
 
 | Reason | When |
 | --- | --- |
+| `no_window` | The paper cursor is unset, or it has not reached a stored bar that closed after `registered_at`. A window the cursor has already passed, with zero fills on both sides, is still `ok` |
 | `bar_missed` | A `BAR_MISSED` event is still inside the TTL, or the cursor span has a hole while some of that span is still stored |
 | `purged_fills` | Replaying the retained fills does not land on the stored cash and quantity |
 | `window_before_retained` | `registered_at` is at or before the retention cutoff, or the cursor span has no stored bars left |

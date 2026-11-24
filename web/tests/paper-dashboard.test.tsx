@@ -234,4 +234,30 @@ describe("paper dashboard", () => {
     expect(screen.queryByText("flagged")).toBeNull();
     expect(screen.queryByText("match")).toBeNull();
   });
+
+  it("shows insufficient data when the comparison window is missing", () => {
+    const snapshot = readSnapshot({
+      ...payload("open", "1/2", "ORDER_FILLED"),
+      drift: [
+        {
+          strategy_id: ID,
+          version: 1,
+          status: "insufficient_data",
+          flagged: false,
+          reason: "no_window",
+          threshold: "0.01",
+          fill_count: null,
+          side_time_mismatches: null,
+          price_delta: null,
+          realized_pnl: null,
+          costs: { commission_bps: "10", slippage_bps: "5" },
+        },
+      ],
+    });
+    render(<PaperBook snapshot={snapshot} />);
+    expect(screen.getByText("insufficient data (no comparison window)")).toBeTruthy();
+    expect(screen.queryByText("match")).toBeNull();
+    expect(screen.queryByText("0 / 0")).toBeNull();
+    expect(screen.queryByText("flagged")).toBeNull();
+  });
 });

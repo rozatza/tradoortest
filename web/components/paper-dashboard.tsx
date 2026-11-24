@@ -389,6 +389,9 @@ function driftStatus(row: PaperDrift): string {
 }
 
 function driftReason(reason: string | null): string {
+  if (reason === "no_window") {
+    return "no comparison window";
+  }
   if (reason === "bar_missed") {
     return "BAR_MISSED";
   }
