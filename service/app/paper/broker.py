@@ -677,14 +677,32 @@ def _snapshot(
     closed: Sequence[_Acc],
     held: Mapping[str, _Held],
 ) -> list[dict[str, object]]:
+    """One row per asset. A same-bar re-entry stays open.
+
+    An OCO fill closes the old account and a later enter on that bar opens a
+    new one. The closed account's realized has to land on the open row. A
+    flat row for that asset would be applied second and wipe the new long.
+    """
+    booked = _closed_realized(closed)
     rows: list[dict[str, object]] = []
+    open_ids = set(open_acc)
     for asset_id, acc in open_acc.items():
-        rows.append(_open_row(asset_id, book, acc, _lifetime(held.get(asset_id), acc)))
+        lifetime = _lifetime(held.get(asset_id), acc) + booked.get(asset_id, Fraction(0))
+        rows.append(_open_row(asset_id, book, acc, lifetime))
     for acc in closed:
+        if acc.asset_id in open_ids:
+            continue
         previous = held.get(acc.asset_id)
         base = Fraction(0) if previous is None else previous.lifetime - previous.trade
         rows.append(_flat_row(acc.asset_id, base + acc.realized_exact))
     return rows
+
+
+def _closed_realized(closed: Sequence[_Acc]) -> dict[str, Fraction]:
+    booked: dict[str, Fraction] = {}
+    for acc in closed:
+        booked[acc.asset_id] = booked.get(acc.asset_id, Fraction(0)) + acc.realized_exact
+    return booked
 
 
 def _open_row(asset_id: str, book: _Book, acc: _Acc, lifetime: Fraction) -> dict[str, object]:

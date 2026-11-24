@@ -1694,7 +1694,22 @@ class SqliteBarStore:
                 """,
                 (user_id, strategy_id, version, cash, initial_capital),
             )
+            # A flat row must not land after the open row for the same asset.
+            # The snapshot already emits one row; this keeps a later writer
+            # from nulling a long that was re-opened on the same bar.
+            kept: dict[str, Mapping[str, object]] = {}
             for position in positions:
+                asset_id = str(position["asset_id"])
+                current = kept.get(asset_id)
+                flat_after_open = (
+                    current is not None
+                    and current["qty"] is not None
+                    and position["qty"] is None
+                )
+                if flat_after_open:
+                    continue
+                kept[asset_id] = position
+            for position in kept.values():
                 self._conn.execute(
                     """
                     INSERT INTO paper_positions (

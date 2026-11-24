@@ -15,7 +15,7 @@ from app.backtest import run_backtest
 from app.live.feed import CLOSE_GRACE_SECONDS
 from app.live.scheduler import PaperScheduler, register_paper_strategy
 from app.ohlcv.bars import Bar
-from app.ohlcv.registry import SOL_MINT
+from app.ohlcv.registry import JUP_MINT, SOL_MINT
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
 from app.paper.broker import ORDER_TTL_SECONDS, PaperBroker, reconcile_book
 
@@ -512,5 +512,233 @@ def test_orders_and_events_purge_with_the_bar_cache_and_the_book_does_not(
         )
         assert wallet is not None
         assert store.paper_cursor(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1) == _T
+    finally:
+        store.close()
+
+
+def _asset(asset_id: str, symbol: str) -> dict:
+    return {
+        "id": asset_id,
+        "symbol": symbol,
+        "chain": "solana",
+        "market": "spot",
+        "quote": "USDC",
+    }
+
+
+def _enter_action(action_id: str, asset_id: str, percent: int) -> dict:
+    return {
+        "id": action_id,
+        "type": "enter",
+        "side": "long",
+        "asset": asset_id,
+        "order": {"type": "market"},
+        "sizing": {"mode": "percent_equity", "percent": percent},
+        "risk": {
+            "type": "oco",
+            "evaluation": "on_entry_fill",
+            "movement": "tighten_only",
+            "take_profit": {"mode": "percent", "percent": 50},
+            "stop_loss": {"mode": "percent", "percent": 5},
+        },
+    }
+
+
+def _enter_only(
+    assets: list[dict],
+    signals: list[dict],
+    actions: list[dict],
+    rules: list[dict],
+    max_positions: int,
+) -> dict:
+    document = _document()
+    document["assets"] = assets
+    document["signals"] = signals
+    document["actions"] = actions
+    document["rules"] = rules
+    document["portfolio"]["max_positions"] = max_positions
+    return document
+
+
+def _candle(
+    mint: str,
+    open_time: int,
+    close: float,
+    *,
+    high: float,
+    low: float,
+    open_: float,
+) -> Bar:
+    return Bar(mint, "1m", open_time, open_, high, low, close, 2.0, False)
+
+
+def _tick_at(
+    store: SqliteBarStore,
+    broker: PaperBroker,
+    clock: dict[str, int],
+    bars: list[Bar],
+) -> None:
+    for open_time in sorted({bar.open_time for bar in bars}):
+        batch = [bar for bar in bars if bar.open_time == open_time]
+        store.upsert(batch, user_id=LOCAL_USER_ID)
+        clock["now"] = open_time + _STEP + _GRACE
+        broker.tick()
+
+
+def _assert_matches(
+    store: SqliteBarStore,
+    document: dict,
+    series: dict[str, list[Bar]],
+    marks: dict[str, Decimal],
+) -> None:
+    result = run_backtest(document, series)
+    paper = _fills(store)
+    assert len(paper) == len(result.fills)
+    for got, fill in zip(paper, result.fills, strict=True):
+        assert got[0] == fill.open_time
+        assert got[1] == fill.asset_id
+        assert got[2] == fill.side
+        assert Decimal(str(got[3])) == fill.qty
+        assert Decimal(str(got[4])) == fill.price
+        assert Decimal(str(got[5])) == fill.notional
+        assert Decimal(str(got[6])) == fill.commission
+        assert got[7] == fill.leg
+        assert bool(got[8]) == fill.limit_below_low
+    expected = sorted(
+        (item.asset_id, item.qty, item.entry_price) for item in result.final_positions
+    )
+    assert sorted(_open_positions(_positions(store))) == expected
+    wallet = store.paper_wallet(user_id=LOCAL_USER_ID, strategy_id="sol-paper", version=1)
+    assert wallet is not None
+    identity, replay = reconcile_book(
+        cash=wallet[0],
+        initial=wallet[1],
+        positions=_positions(store),
+        fills=paper,
+        marks=marks,
+    )
+    assert identity is True
+    assert replay is True
+    open_ids = {asset_id for asset_id, _qty, _entry in expected}
+    for row in _positions(store):
+        if str(row[0]) not in open_ids:
+            continue
+        assert row[1] is not None
+        assert row[2] is not None
+        assert row[3] is not None
+        assert row[4] is not None and "/" in str(row[4])
+        assert row[7] is not None
+        assert row[8] is not None
+        assert row[9] is not None
+        assert row[10] is not None
+
+
+def test_same_bar_oco_reenter_keeps_the_new_long(tmp_path: Path) -> None:
+    """An OCO exit and a same-bar re-buy leave the new long on the durable row."""
+    document = _enter_only(
+        [_asset("sol", "SOL")],
+        [{"id": "go", "expr": _gt(50)}],
+        [_enter_action("enter_sol", "sol", 100)],
+        [{"id": "enter_rule", "when": "go", "do": "enter_sol"}],
+        1,
+    )
+    cases = (
+        (
+            _candle(SOL_MINT, _T + _STEP, 94, high=96, low=93, open_=96),
+            _candle(SOL_MINT, _T + 2 * _STEP, 96, high=97, low=95, open_=95),
+            _candle(SOL_MINT, _T + 3 * _STEP, 97, high=98, low=96, open_=96),
+        ),
+        (
+            _candle(SOL_MINT, _T + _STEP, 151, high=152, low=100, open_=100),
+            _candle(SOL_MINT, _T + 2 * _STEP, 155, high=160, low=150, open_=152),
+            _candle(SOL_MINT, _T + 3 * _STEP, 156, high=158, low=152, open_=155),
+        ),
+    )
+    for index, (touch, hold, later) in enumerate(cases):
+        clock = {"now": _T}
+        root = tmp_path / f"case-{index}"
+        root.mkdir()
+        store = _store(root, clock)
+        _register(store, clock, document)
+        broker = _broker(store, clock)
+        try:
+            enter = _candle(SOL_MINT, _T, 100, high=101, low=99, open_=100)
+            _tick_at(store, broker, clock, [enter, touch])
+            _assert_matches(
+                store,
+                document,
+                {"sol": [enter, touch]},
+                {"sol": Decimal(str(touch.close))},
+            )
+            _tick_at(store, broker, clock, [hold])
+            _assert_matches(
+                store,
+                document,
+                {"sol": [enter, touch, hold]},
+                {"sol": Decimal(str(hold.close))},
+            )
+            restarted = _broker(store, clock)
+            _tick_at(store, restarted, clock, [later])
+            _assert_matches(
+                store,
+                document,
+                {"sol": [enter, touch, hold, later]},
+                {"sol": Decimal(str(later.close))},
+            )
+        finally:
+            store.close()
+
+
+def test_same_bar_oco_reenter_keeps_sol_beside_jup(tmp_path: Path) -> None:
+    """SOL stopped and re-bought on one bar stays in the book next to JUP."""
+    document = _enter_only(
+        [_asset("sol", "SOL"), _asset("jup", "JUP")],
+        [{"id": "go_sol", "expr": _gt(50)}, {"id": "go_jup", "expr": _gt(80)}],
+        [_enter_action("enter_sol", "sol", 40), _enter_action("enter_jup", "jup", 40)],
+        [
+            {"id": "r_sol", "when": "go_sol", "do": "enter_sol"},
+            {"id": "r_jup", "when": "go_jup", "do": "enter_jup"},
+        ],
+        2,
+    )
+    sol0 = _candle(SOL_MINT, _T, 100, high=101, low=99, open_=100)
+    jup0 = _candle(JUP_MINT, _T, 40, high=41, low=39, open_=40)
+    sol1 = _candle(SOL_MINT, _T + _STEP, 101, high=102, low=100, open_=101)
+    jup1 = _candle(JUP_MINT, _T + _STEP, 90, high=91, low=89, open_=90)
+    sol2 = _candle(SOL_MINT, _T + 2 * _STEP, 94, high=96, low=93, open_=96)
+    jup2 = _candle(JUP_MINT, _T + 2 * _STEP, 92, high=93, low=89, open_=90)
+    sol3 = _candle(SOL_MINT, _T + 3 * _STEP, 96, high=97, low=95, open_=95)
+    jup3 = _candle(JUP_MINT, _T + 3 * _STEP, 93, high=94, low=91, open_=92)
+    sol4 = _candle(SOL_MINT, _T + 4 * _STEP, 97, high=98, low=96, open_=96)
+    jup4 = _candle(JUP_MINT, _T + 4 * _STEP, 94, high=95, low=92, open_=93)
+    clock = {"now": _T}
+    store = _store(tmp_path, clock)
+    _register(store, clock, document)
+    broker = _broker(store, clock)
+    try:
+        first = [sol0, jup0, sol1, jup1, sol2, jup2]
+        _tick_at(store, broker, clock, first)
+        series = {"sol": [sol0, sol1, sol2], "jup": [jup0, jup1, jup2]}
+        _assert_matches(
+            store,
+            document,
+            series,
+            {"sol": Decimal("94"), "jup": Decimal("92")},
+        )
+        _tick_at(store, broker, clock, [sol3, jup3])
+        held = {"sol": [sol0, sol1, sol2, sol3], "jup": [jup0, jup1, jup2, jup3]}
+        _assert_matches(store, document, held, {"sol": Decimal("96"), "jup": Decimal("93")})
+        restarted = _broker(store, clock)
+        _tick_at(store, restarted, clock, [sol4, jup4])
+        finished = {
+            "sol": [sol0, sol1, sol2, sol3, sol4],
+            "jup": [jup0, jup1, jup2, jup3, jup4],
+        }
+        _assert_matches(
+            store,
+            document,
+            finished,
+            {"sol": Decimal("97"), "jup": Decimal("94")},
+        )
     finally:
         store.close()
