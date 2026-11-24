@@ -97,6 +97,15 @@ export async function forwardGet(path: string, accept = "application/json"): Pro
   return sendUpstream(path, "GET", accept, null);
 }
 
+/** POST a fixed empty object. The paper deploy route ignores the body. */
+export async function forwardEmptyPost(path: string): Promise<Response> {
+  return sendUpstream(path, "POST", "application/json", "{}");
+}
+
+export async function forwardDelete(path: string): Promise<Response> {
+  return sendUpstream(path, "DELETE", "application/json", null);
+}
+
 /**
  * Exact backtest reads the browser may trigger. Anything else, including
  * the agent tool surface and a query string, is not a path this proxy builds.

@@ -582,3 +582,85 @@ h3 {
     font-size: 1.45rem;
   }
 }
+
+main.paper {
+  height: auto;
+  min-height: 100%;
+  min-width: 0;
+}
+
+.paper-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.paper-grid > * {
+  min-width: 0;
+}
+
+.paper-banner {
+  margin: 0;
+  border: 1px solid #1f6b3a;
+  background: #e7f0e4;
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.8rem;
+  font-weight: 600;
+}
+
+.paper-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.paper-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.paper-table th,
+.paper-table td {
+  text-align: left;
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid #d5ddd0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.paper-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-end;
+  margin-top: 0.6rem;
+}
+
+.paper-form label {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+  color: #3d4638;
+}
+
+.paper-form input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #8a9484;
+  border-radius: 0.4rem;
+  min-width: 12rem;
+}
+
+.paper-log {
+  max-height: 18rem;
+  overflow: auto;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.82rem;
+}

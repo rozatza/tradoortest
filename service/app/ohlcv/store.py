@@ -373,6 +373,16 @@ def _serialized(method):
     return wrapped
 
 
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    """Reserve the writer before a read that decides a write.
+
+    A deferred transaction lets two connections count, then both insert.
+    ``BEGIN IMMEDIATE`` takes the write lock first, so the second waits
+    and then sees the first commit. The caller is inside ``with conn``.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+
+
 class SqliteBarStore:
     """One SQLite file. Upserts are idempotent on the primary key."""
 
@@ -1124,10 +1134,13 @@ class SqliteBarStore:
         cap for this user. ``None`` does not cap, which is what the
         scheduler helper uses. A new row at the cap raises
         ``RegistrationRefused``. The same document does not consume a slot.
+        The count and the insert share one immediate transaction, so a
+        second connection waits and then sees this row.
         """
         self._purge()
         _owner(user_id)
         with self._conn:
+            _begin_immediate(self._conn)
             row = self._conn.execute(
                 """
                 SELECT document_json, registered_at FROM live_registrations
@@ -1614,6 +1627,101 @@ class SqliteBarStore:
         return [(int(row[0]), str(row[1]), str(row[2])) for row in cursor]
 
     @_serialized
+    def list_live_registrations(
+        self, *, user_id: str
+    ) -> list[tuple[str, int, str, str, int]]:
+        """``(strategy_id, version, document_json, bar_size, registered_at)``."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT strategy_id, version, document_json, bar_size, registered_at
+            FROM live_registrations
+            WHERE user_id = ?
+            ORDER BY strategy_id, version
+            """,
+            (user_id,),
+        )
+        return [
+            (str(row[0]), int(row[1]), str(row[2]), str(row[3]), int(row[4])) for row in cursor
+        ]
+
+    @_serialized
+    def list_paper_positions(self, *, user_id: str) -> list[tuple[object, ...]]:
+        """Every position row for this user. Nulls stay null. Not rebuilt from fills."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT strategy_id, version, asset_id, qty, open_cost, entry, basis, realized,
+                   trade_realized, take_profit, stop_loss, anchor, attached_at
+            FROM paper_positions
+            WHERE user_id = ?
+            ORDER BY strategy_id, version, asset_id
+            """,
+            (user_id,),
+        )
+        rows: list[tuple[object, ...]] = []
+        for row in cursor:
+            attached = None if row[12] is None else int(row[12])
+            rows.append(
+                (
+                    str(row[0]),
+                    int(row[1]),
+                    str(row[2]),
+                    None if row[3] is None else str(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    None if row[5] is None else str(row[5]),
+                    None if row[6] is None else str(row[6]),
+                    str(row[7]),
+                    None if row[8] is None else str(row[8]),
+                    None if row[9] is None else str(row[9]),
+                    None if row[10] is None else str(row[10]),
+                    None if row[11] is None else str(row[11]),
+                    attached,
+                )
+            )
+        return rows
+
+    @_serialized
+    def list_paper_events(self, *, user_id: str) -> list[tuple[str, int, int, str, str]]:
+        """``(strategy_id, version, open_time, kind, detail)`` still inside the TTL."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT strategy_id, version, open_time, kind, detail
+            FROM paper_events
+            WHERE user_id = ?
+            ORDER BY id
+            """,
+            (user_id,),
+        )
+        return [
+            (str(row[0]), int(row[1]), int(row[2]), str(row[3]), str(row[4])) for row in cursor
+        ]
+
+    @_serialized
+    def latest_real_close(
+        self, *, user_id: str, mint: str, timeframe: str
+    ) -> tuple[int, float] | None:
+        """``(open_time, close)`` of the newest stored bar that is not synthetic."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT open_time, close FROM bars
+            WHERE user_id = ? AND mint = ? AND timeframe = ? AND synthetic = 0
+            ORDER BY open_time DESC
+            LIMIT 1
+            """,
+            (user_id, mint, timeframe),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0]), float(row[1])
+
+    @_serialized
     def paper_open_orders(
         self, *, user_id: str, strategy_id: str, version: int
     ) -> list[tuple[int, int, str, int]]:
@@ -1651,6 +1759,7 @@ class SqliteBarStore:
         _owner(user_id)
         stored_at = int(self._now())
         with self._conn:
+            _begin_immediate(self._conn)
             found = self._conn.execute(
                 """
                 SELECT 1 FROM live_registrations
@@ -1803,11 +1912,25 @@ class SqliteBarStore:
 
         The wallet and position rows have no ``stored_at``. Fills, orders, and
         events do, so ``_purge`` can drop them without touching the book.
+
+        The registration is read again inside this transaction. Undeploy
+        removes that row. If it is already gone, this call writes nothing:
+        no fill, no order, no event, and the cursor stays where it was.
         """
         self._purge()
         _owner(user_id)
         stored_at = int(self._now())
         with self._conn:
+            _begin_immediate(self._conn)
+            registered = self._conn.execute(
+                """
+                SELECT 1 FROM live_registrations
+                WHERE user_id = ? AND strategy_id = ? AND version = ?
+                """,
+                (user_id, strategy_id, version),
+            ).fetchone()
+            if registered is None:
+                return
             self._conn.execute(
                 """
                 INSERT INTO paper_wallets (

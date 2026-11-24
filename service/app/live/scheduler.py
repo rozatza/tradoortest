@@ -41,7 +41,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from app.auth import LOCAL_USER_ID
@@ -871,10 +870,11 @@ def open_scheduler() -> PaperScheduler:
     """
     from app.ohlcv.adapters.birdeye import BirdeyeSource
     from app.ohlcv.adapters.geckoterminal import GeckoTerminalSource
+    from app.ohlcv.routes import ohlcv_db_path
 
-    data_dir = Path(os.environ.get("OHLCV_DATA_DIR") or "data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    store = SqliteBarStore(data_dir / "ohlcv.sqlite", ttl_seconds=MAX_CACHE_TTL_SECONDS)
+    database = ohlcv_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteBarStore(database, ttl_seconds=MAX_CACHE_TTL_SECONDS)
     payloads: list[bytes] = []
     birdeye_payloads: list[bytes] = []
     stop = threading.Event()
