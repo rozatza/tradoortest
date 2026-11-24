@@ -22,7 +22,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from pathlib import Path
 from typing import Protocol
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS live_registrations (
     version INTEGER NOT NULL,
     document_json TEXT NOT NULL,
     bar_size TEXT NOT NULL,
+    registered_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, strategy_id, version)
 );
 CREATE TABLE IF NOT EXISTS live_cursors (
@@ -175,6 +176,90 @@ CREATE TABLE IF NOT EXISTS live_errors (
     exc_type TEXT NOT NULL,
     message TEXT NOT NULL,
     stored_at INTEGER NOT NULL
+);
+"""
+
+# Paper rows. Fills, orders, and the event log carry ``stored_at`` and are
+# deleted by ``_purge``. The wallet, the position, and the cursor do not:
+# a held long outlives the 24-hour fill log, and the cursor is an open time,
+# not a price. See ``docs/paper.md``.
+_PAPER_TABLES = """
+CREATE TABLE IF NOT EXISTS paper_wallets (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    cash TEXT NOT NULL,
+    initial_capital TEXT NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version)
+);
+CREATE TABLE IF NOT EXISTS paper_positions (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    qty TEXT,
+    open_cost TEXT,
+    entry TEXT,
+    basis TEXT,
+    realized TEXT NOT NULL,
+    trade_realized TEXT,
+    take_profit TEXT,
+    stop_loss TEXT,
+    anchor TEXT,
+    attached_at INTEGER,
+    PRIMARY KEY (user_id, strategy_id, version, asset_id)
+);
+CREATE TABLE IF NOT EXISTS paper_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    status TEXT NOT NULL,
+    placed_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    price TEXT,
+    qty TEXT,
+    notional TEXT,
+    commission TEXT,
+    leg TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    price TEXT NOT NULL,
+    notional TEXT NOT NULL,
+    commission TEXT NOT NULL,
+    leg TEXT NOT NULL,
+    limit_below_low INTEGER NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_cursors (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    last_open_time INTEGER NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version)
 );
 """
 
@@ -1050,10 +1135,10 @@ class SqliteBarStore:
             self._conn.execute(
                 """
                 INSERT INTO live_registrations (
-                    user_id, strategy_id, version, document_json, bar_size
-                ) VALUES (?, ?, ?, ?, ?)
+                    user_id, strategy_id, version, document_json, bar_size, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, strategy_id, version, document_json, bar_size),
+                (user_id, strategy_id, version, document_json, bar_size, int(self._now())),
             )
 
     @_serialized
@@ -1070,6 +1155,24 @@ class SqliteBarStore:
             (user_id,),
         )
         return [(str(row[0]), int(row[1]), str(row[2]), str(row[3])) for row in cursor]
+
+    @_serialized
+    def live_registered_at(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> int | None:
+        """Unix seconds when this version was first registered. None if it is not."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT registered_at FROM live_registrations
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
 
     @_serialized
     def live_cursor(
@@ -1354,6 +1457,385 @@ class SqliteBarStore:
         )
 
     @_serialized
+    def paper_wallet(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> tuple[str, str] | None:
+        """``(cash, initial_capital)`` decimal strings, or None before the first tick."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT cash, initial_capital FROM paper_wallets
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1])
+
+    @_serialized
+    def paper_positions(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[object, ...]]:
+        """Position rows, open and flat. Nulls stay null. Not rebuilt from fills."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT asset_id, qty, open_cost, entry, basis, realized, trade_realized,
+                   take_profit, stop_loss, anchor, attached_at
+            FROM paper_positions
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY asset_id
+            """,
+            (user_id, strategy_id, version),
+        )
+        rows: list[tuple[object, ...]] = []
+        for row in cursor:
+            attached = None if row[10] is None else int(row[10])
+            rows.append(
+                (
+                    str(row[0]),
+                    None if row[1] is None else str(row[1]),
+                    None if row[2] is None else str(row[2]),
+                    None if row[3] is None else str(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    str(row[5]),
+                    None if row[6] is None else str(row[6]),
+                    None if row[7] is None else str(row[7]),
+                    None if row[8] is None else str(row[8]),
+                    None if row[9] is None else str(row[9]),
+                    attached,
+                )
+            )
+        return rows
+
+    @_serialized
+    def paper_cursor(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> int | None:
+        """Last paper open time. This is not a price and it is not purged."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT last_open_time FROM paper_cursors
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+    @_serialized
+    def paper_fills(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[object, ...]]:
+        """Fills still inside the TTL, in insert order."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time, asset_id, side, qty, price, notional, commission,
+                   leg, limit_below_low
+            FROM paper_fills
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [
+            (
+                int(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[5]),
+                str(row[6]),
+                str(row[7]),
+                bool(row[8]),
+            )
+            for row in cursor
+        ]
+
+    @_serialized
+    def paper_orders(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[object, ...]]:
+        """Orders still inside the TTL, in insert order."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time, asset_id, side, status, placed_at, expires_at,
+                   price, qty, notional, commission, leg, reason
+            FROM paper_orders
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [tuple(None if value is None else value for value in row) for row in cursor]
+
+    @_serialized
+    def paper_events(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[int, str, str]]:
+        """``(open_time, kind, detail)`` still inside the TTL, in insert order."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT open_time, kind, detail FROM paper_events
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            ORDER BY id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [(int(row[0]), str(row[1]), str(row[2])) for row in cursor]
+
+    @_serialized
+    def paper_open_orders(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[int, int, str, int]]:
+        """``(id, open_time, asset_id, expires_at)`` for status ``open``."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT id, open_time, asset_id, expires_at FROM paper_orders
+            WHERE user_id = ? AND strategy_id = ? AND version = ? AND status = 'open'
+            ORDER BY id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [(int(row[0]), int(row[1]), str(row[2]), int(row[3])) for row in cursor]
+
+    @_serialized
+    def insert_paper_order(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        open_time: int,
+        asset_id: str,
+        side: str,
+        status: str,
+        placed_at: int,
+        expires_at: int,
+        leg: str,
+        reason: str,
+    ) -> None:
+        """Insert one order row. The paper tick is what fills or expires it."""
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO paper_orders (
+                    user_id, strategy_id, version, open_time, asset_id, side, status,
+                    placed_at, expires_at, price, qty, notional, commission, leg,
+                    reason, stored_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    strategy_id,
+                    version,
+                    open_time,
+                    asset_id,
+                    side,
+                    status,
+                    placed_at,
+                    expires_at,
+                    leg,
+                    reason,
+                    stored_at,
+                ),
+            )
+
+    @_serialized
+    def commit_paper_step(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        cash: str,
+        initial_capital: str,
+        positions: Sequence[Mapping[str, object]],
+        orders: Sequence[Mapping[str, object]],
+        fills: Sequence[Mapping[str, object]],
+        events: Sequence[Mapping[str, object]],
+        cursor_open_time: int,
+        expire_order_ids: Sequence[int] = (),
+    ) -> None:
+        """Write one bar's book, log, and cursor in one transaction.
+
+        The wallet and position rows have no ``stored_at``. Fills, orders, and
+        events do, so ``_purge`` can drop them without touching the book.
+        """
+        self._purge()
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO paper_wallets (
+                    user_id, strategy_id, version, cash, initial_capital
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, strategy_id, version) DO UPDATE SET
+                    cash = excluded.cash
+                """,
+                (user_id, strategy_id, version, cash, initial_capital),
+            )
+            # A flat row must not land after the open row for the same asset.
+            # The snapshot already emits one row; this keeps a later writer
+            # from nulling a long that was re-opened on the same bar.
+            kept: dict[str, Mapping[str, object]] = {}
+            for position in positions:
+                asset_id = str(position["asset_id"])
+                current = kept.get(asset_id)
+                flat_after_open = (
+                    current is not None
+                    and current["qty"] is not None
+                    and position["qty"] is None
+                )
+                if flat_after_open:
+                    continue
+                kept[asset_id] = position
+            for position in kept.values():
+                self._conn.execute(
+                    """
+                    INSERT INTO paper_positions (
+                        user_id, strategy_id, version, asset_id, qty, open_cost, entry,
+                        basis, realized, trade_realized, take_profit, stop_loss,
+                        anchor, attached_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, strategy_id, version, asset_id) DO UPDATE SET
+                        qty = excluded.qty,
+                        open_cost = excluded.open_cost,
+                        entry = excluded.entry,
+                        basis = excluded.basis,
+                        realized = excluded.realized,
+                        trade_realized = excluded.trade_realized,
+                        take_profit = excluded.take_profit,
+                        stop_loss = excluded.stop_loss,
+                        anchor = excluded.anchor,
+                        attached_at = excluded.attached_at
+                    """,
+                    (
+                        user_id,
+                        strategy_id,
+                        version,
+                        position["asset_id"],
+                        position["qty"],
+                        position["open_cost"],
+                        position["entry"],
+                        position["basis"],
+                        position["realized"],
+                        position["trade_realized"],
+                        position["take_profit"],
+                        position["stop_loss"],
+                        position["anchor"],
+                        position["attached_at"],
+                    ),
+                )
+            for order_id in expire_order_ids:
+                self._conn.execute(
+                    """
+                    UPDATE paper_orders SET status = 'expired'
+                    WHERE id = ? AND user_id = ? AND strategy_id = ? AND version = ?
+                      AND status = 'open'
+                    """,
+                    (order_id, user_id, strategy_id, version),
+                )
+            for order in orders:
+                self._conn.execute(
+                    """
+                    INSERT INTO paper_orders (
+                        user_id, strategy_id, version, open_time, asset_id, side, status,
+                        placed_at, expires_at, price, qty, notional, commission, leg,
+                        reason, stored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        strategy_id,
+                        version,
+                        order["open_time"],
+                        order["asset_id"],
+                        order["side"],
+                        order["status"],
+                        order["placed_at"],
+                        order["expires_at"],
+                        order["price"],
+                        order["qty"],
+                        order["notional"],
+                        order["commission"],
+                        order["leg"],
+                        order["reason"],
+                        stored_at,
+                    ),
+                )
+            for fill in fills:
+                self._conn.execute(
+                    """
+                    INSERT INTO paper_fills (
+                        user_id, strategy_id, version, open_time, asset_id, side,
+                        qty, price, notional, commission, leg, limit_below_low, stored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        strategy_id,
+                        version,
+                        fill["open_time"],
+                        fill["asset_id"],
+                        fill["side"],
+                        fill["qty"],
+                        fill["price"],
+                        fill["notional"],
+                        fill["commission"],
+                        fill["leg"],
+                        1 if fill["limit_below_low"] else 0,
+                        stored_at,
+                    ),
+                )
+            for event in events:
+                self._conn.execute(
+                    """
+                    INSERT INTO paper_events (
+                        user_id, strategy_id, version, open_time, kind, detail, stored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        strategy_id,
+                        version,
+                        event["open_time"],
+                        event["kind"],
+                        event["detail"],
+                        stored_at,
+                    ),
+                )
+            self._conn.execute(
+                """
+                INSERT INTO paper_cursors (
+                    user_id, strategy_id, version, last_open_time
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, strategy_id, version) DO UPDATE SET
+                    last_open_time = excluded.last_open_time
+                """,
+                (user_id, strategy_id, version, cursor_open_time),
+            )
+
+    @_serialized
     def _ensure_schema(self) -> None:
         self._conn.executescript(_CREATE)
         bars = {row[1] for row in self._conn.execute("PRAGMA table_info(bars)")}
@@ -1375,6 +1857,12 @@ class SqliteBarStore:
             self._conn.execute("DROP TABLE pool_resolutions")
         self._conn.executescript(_PROVIDER_TABLES)
         self._conn.executescript(_LIVE_TABLES)
+        self._conn.executescript(_PAPER_TABLES)
+        reg_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(live_registrations)")}
+        if reg_cols and "registered_at" not in reg_cols:
+            self._conn.execute(
+                "ALTER TABLE live_registrations ADD COLUMN registered_at INTEGER NOT NULL DEFAULT 0"
+            )
         cursor_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(live_cursors)")}
         if cursor_cols and "state_stored_at" not in cursor_cols:
             self._conn.execute(
@@ -1400,6 +1888,9 @@ class SqliteBarStore:
             self._conn.execute("DELETE FROM live_bar_log WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM live_bar_conflicts WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM live_errors WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM paper_orders WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM paper_fills WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM paper_events WHERE stored_at <= ?", (cutoff,))
             self._conn.execute(
                 "UPDATE live_cursors SET state_json = '' WHERE state_stored_at <= ?",
                 (cutoff,),

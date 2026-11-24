@@ -2,7 +2,7 @@
 
 Near-real-time bars for SOL and the four other native majors (JUP, JTO, BONK, WIF), and a scheduler that calls the shared runner once per closed bar. This is paper state only. The scheduler records the decision. It does not persist a price, fill, attach an OCO, sign, or send an order. There is no deploy route; a strategy version is registered with `register_paper_strategy`.
 
-The runner is `app.runner.step`. The book view passed in is empty, so a decision cannot arm an OCO. A later paper broker would apply the recorded decision. This feed does not.
+The runner is `app.runner.step`. The book view passed in is empty, so a decision cannot arm an OCO. The paper broker in `docs/paper.md` does not apply these decisions. It keeps its own book and does not fill a bar that closed at or before registration, including the bars this scheduler back-decides on the first tick.
 
 ## Feed
 
