@@ -57,6 +57,22 @@ _DEFAULT_MAX_BODY_BYTES = 16384
 _init_lock = threading.Lock()
 
 
+def ohlcv_db_path() -> Path:
+    """``ohlcv.sqlite`` under ``OHLCV_DATA_DIR``, or ``data/ohlcv.sqlite``.
+
+    The paper routes and the scheduler open this same path. A blank or
+    unset directory keeps ``_DEFAULT_DB`` so a test can still point that
+    name at another file. A path that cannot be a directory is ``ValueError``.
+    """
+    raw = os.environ.get("OHLCV_DATA_DIR")
+    if raw is None or raw.strip() == "":
+        return _DEFAULT_DB
+    text = raw.strip()
+    if len(text) > 4096 or "\x00" in text:
+        raise ValueError
+    return Path(text) / "ohlcv.sqlite"
+
+
 class OhlcvRuntime:
     """Store, source, and clock for one process. Tests pass their own."""
 
@@ -84,12 +100,13 @@ def _runtime(request: Request) -> OhlcvRuntime:
         max_calls = _positive_env("OHLCV_GT_MAX_CALLS", DEFAULT_GT_MAX_CALLS)
         budget = _positive_env("BIRDEYE_CU_BUDGET", DEFAULT_CU_BUDGET)
         try:
-            _DEFAULT_DB.parent.mkdir(parents=True, exist_ok=True)
-            store = SqliteBarStore(_DEFAULT_DB)
+            database = ohlcv_db_path()
+            database.parent.mkdir(parents=True, exist_ok=True)
+            store = SqliteBarStore(database)
             source = AnyMintSource(
                 max_calls=max_calls,
                 birdeye_budget=budget,
-                birdeye_ledger=_DEFAULT_DB.parent / "birdeye-cu.json",
+                birdeye_ledger=database.parent / "birdeye-cu.json",
             )
         except ValueError:
             raise

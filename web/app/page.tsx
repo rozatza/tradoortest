@@ -9,6 +9,9 @@ export default function HomePage() {
         <p className="lede">
           Author chat, strategy file, and backtest results for one local user. This screen does not trade.
         </p>
+        <p>
+          <a href="/paper">PAPER dashboard</a>
+        </p>
       </header>
       <Chat />
     </main>

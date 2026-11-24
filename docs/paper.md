@@ -12,7 +12,9 @@ When the scheduler is running, one tick is ordered: the feed fetches, the store 
 
 `DELETE` on the same path undeploys it. The registration is deleted, so the scheduler and the broker no longer evaluate that version.
 
-Undeploy does not invent a fill.
+Undeploy does not invent a fill. A broker tick that has already decided a bar still has to pass the registration check inside the commit. If undeploy removed the row first, that commit writes no fill, no order, no event, and it does not move the cursor.
+
+The deploy route and the OHLCV runtime open the same file: `ohlcv.sqlite` under `OHLCV_DATA_DIR`, or `data/ohlcv.sqlite` when that variable is unset. The running-paper count and the insert are one immediate transaction, so two connections cannot both pass the cap.
 
 - An open position is left as stored. Qty, open cost, entry, basis, realized, and the OCO levels stay. The price fields are not cleared, because the long is not flat. The state is `open_unmanaged`: later bars do not move it until a new deploy of that version. Cash is unchanged.
 - A resting order (`status` `open`) is set to `canceled`. No price is written and no fill row is inserted.
@@ -61,6 +63,16 @@ An empty slot whose fetch succeeded, once `now` is past its close plus 300 secon
 The order is placed at the bar's close. It expires `ORDER_TTL_SECONDS` (300) after that close. The 300 seconds are wall-clock seconds, not bars. A 1-minute bar and a 1-day bar use the same 300 seconds, measured from the close, not from the open. The close grace is 60 seconds, so a tick that runs when the bar first becomes eligible is inside the window and fills. A tick that arrives more than 300 seconds after the close logs `ORDER_PLACED` and `ORDER_EXPIRED` and does not fill. That fill is not retried. The backtester has no clock, so a late paper tick diverges from it on purpose.
 
 One book has one order in status `open`. A market fill or an expiry finishes the order in the same tick, so a prompt bar does not leave one resting. A second signal while an order is still open is `ORDER_REJECTED` with reason `open_order`. It is not queued.
+
+## Dashboard
+
+`GET /paper` is the book the dashboard shows. The caller is the local user. The body is `mode` `paper` and `simulated` true, then three lists:
+
+- `strategies`: each running registration (`strategy_id`, `version`, `name`, `bar_size`, `registered_at`, `status` `running`). A version that is not registered is not in this list.
+- `positions`: each stored position row. `state` is `open` when qty is set and the version is running, `open_unmanaged` when qty is set and it is not, and `flat` when qty is null. `realized` is the stored text. `mark` is null, or `{label: "mark", price, open_time, timeframe, source: "last_stored_close"}` for the newest stored bar that is not synthetic. A flat row has no mark. The response has no cash field and no combined P&L field.
+- `events`: each `paper_events` row still inside the 24-hour TTL, including `BAR_MISSED` and `STRATEGY_UNDEPLOYED`. `detail` is the stored text.
+
+The web app polls `GET /api/paper`, which proxies that route. Deploy and undeploy from the dashboard are the same `POST` and `DELETE` as above, proxied at `/api/strategies/{strategy_id}/versions/{version}/paper`.
 
 ## Event log
 
