@@ -15,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from app.risk.programs import KNOWN_PROGRAMS
 from app.venue.address import encode
 from app.venue.checks import require_block_height
 from app.venue.errors import VenueError
@@ -59,6 +60,7 @@ class Simulation:
     lamports_before: tuple[tuple[str, int], ...]
     lamports_after: tuple[tuple[str, int], ...]
     owner_changed: tuple[str, ...] = ()
+    unparsed: tuple[str, ...] = ()
 
 
 class ChainRpc(Protocol):
@@ -77,6 +79,22 @@ class ChainRpc(Protocol):
 def chain_block_height(rpc: ChainRpc) -> int:
     """Height from ``rpc`` only. Callers must not pass a quote field."""
     return require_block_height(rpc.block_height())
+
+
+def classify_account(data: bytes) -> str:
+    """``mint``, ``token``, ``empty``, or ``unparsed``.
+
+    Classic mint accounts are 82 bytes and classic token accounts are
+    165. Anything else, including a Token-2022 extension, is unparsed
+    and the guard rejects it.
+    """
+    if data == b"":
+        return "empty"
+    if len(data) == 82:
+        return "mint"
+    if len(data) == 165:
+        return "token"
+    return "unparsed"
 
 
 def parse_lookup_table(data: bytes) -> tuple[bool, tuple[str, ...]]:
@@ -260,14 +278,22 @@ def _simulation_from(
     lamports_before: list[tuple[str, int]] = []
     lamports_after: list[tuple[str, int]] = []
     owner_changed: list[str] = []
+    unparsed: list[str] = []
     for address, prior, row in zip(accounts, before, after_rows, strict=True):
+        if address in KNOWN_PROGRAMS:
+            continue
         if prior is not None:
             lamports_before.append((address, prior[0]))
+            if classify_account(prior[1]) == "unparsed":
+                unparsed.append(address)
         if row is None:
             continue
         lamports, data = _account_value(row)
         lamports_after.append((address, lamports))
-        if prior is None:
+        kind = classify_account(data)
+        if kind == "unparsed" and address not in unparsed:
+            unparsed.append(address)
+        if prior is None or address in unparsed:
             continue
         prior_auth = _mint_authorities(prior[1])
         next_auth = _mint_authorities(data)
@@ -296,6 +322,7 @@ def _simulation_from(
         tuple(lamports_before),
         tuple(lamports_after),
         tuple(owner_changed),
+        tuple(unparsed),
     )
 
 

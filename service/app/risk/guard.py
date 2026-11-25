@@ -61,6 +61,8 @@ def guard_unsigned(
     quoted_minimum: int,
     input_account: str,
     output_account: str,
+    input_mint: str,
+    output_mint: str,
     limits: RiskLimits | None = None,
 ) -> GuardDecision:
     """Check ``tx.transaction``. Quote-copied amount fields are ignored."""
@@ -96,6 +98,8 @@ def guard_unsigned(
         quoted_minimum,
         input_account,
         output_account,
+        input_mint,
+        output_mint,
         chosen,
     )
 
@@ -310,11 +314,17 @@ def _simulated(
     quoted_minimum: int,
     input_account: str,
     output_account: str,
+    input_mint: str,
+    output_mint: str,
     limits: RiskLimits,
 ) -> GuardDecision:
     del quoted_out
     if simulation.err is not None:
         return GuardDecision(False, "simulation_failed")
+    if simulation.unparsed:
+        return GuardDecision(False, "amount_unverified")
+    if input_mint == "" or output_mint == "" or input_mint == output_mint:
+        return GuardDecision(False, "mint_mismatch")
     if simulation.owner_changed:
         return GuardDecision(False, "authority_change")
     before = {item.account: item for item in simulation.authorities_before}
@@ -334,6 +344,13 @@ def _simulated(
         return GuardDecision(False, "amount_unverified")
     if spent.owner != wallet or received.owner != wallet:
         return GuardDecision(False, "owner")
+    if spent.mint != input_mint or received.mint != output_mint:
+        return GuardDecision(False, "mint_mismatch")
+    for item in simulation.deltas:
+        if item.owner != wallet or item.account in (input_account, output_account):
+            continue
+        if item.before > item.after:
+            return GuardDecision(False, "amount_mismatch")
     if spent.before - spent.after != quoted_in:
         return GuardDecision(False, "amount_mismatch")
     gained = received.after - received.before

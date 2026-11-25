@@ -8,6 +8,7 @@ import hashlib
 import json
 import threading
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.auth import LOCAL_USER_ID
 from app.live.scheduler import PaperScheduler
 from app.main import create_app
 from app.ohlcv.registry import BONK_MINT, JTO_MINT, JUP_MINT, SOL_MINT, WIF_MINT
@@ -31,6 +33,8 @@ from app.risk.fees import (
     reset_day_ledger,
     roll_day,
     save_day,
+    server_day,
+    set_day_clock,
     take_day,
 )
 from app.risk.gate import LiveGate
@@ -90,6 +94,7 @@ from app.risk.rpc import (
     MockChainRpc,
     Simulation,
     TokenDelta,
+    classify_account,
     default_rpc,
     parse_lookup_table,
 )
@@ -531,6 +536,8 @@ def _guard(tx: UnsignedTransaction, rpc: MockChainRpc, **overrides: object) -> o
         "quoted_minimum": 1_900,
         "input_account": _POOL,
         "output_account": _TABLE,
+        "input_mint": SOL_MINT,
+        "output_mint": _USDC,
     }
     args.update(overrides)
     return guard_unsigned(tx, **args)  # type: ignore[arg-type]
@@ -838,7 +845,10 @@ def test_control_routes_require_host_origin_and_token(
         raise AssertionError("flatten")
 
     monkeypatch.setattr("app.risk.routes.apply_flatten", _count)
+    _freeze(_DAY)
+    store = SqliteBarStore(tmp_path / "day.sqlite")
     app = create_app()
+    app.state.live_day_store = store
     client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
     headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
     pending_book().add(kind="submit", mint=SOL_MINT, side="buy")
@@ -875,8 +885,8 @@ def test_control_routes_require_host_origin_and_token(
     assert bare.json()["code"] == "missing_transaction"
     assert bare.json()["sent"] is False
     assert pending_book().open_rows() == ()
-    assert take_day(_DAY).notional_usd == Decimal("0")
-    save_day(DayLedger(_DAY, notional_usd=Decimal("8")))
+    assert take_day(_DAY, store).notional_usd == Decimal("0")
+    save_day(DayLedger(_DAY, notional_usd=Decimal("8")), store)
     over = client.post("/live/submit", json=_body(), headers=headers)
     assert over.json()["code"] == "daily_notional"
     again = client.post("/live/submit", json=_body(notional_usd="1"), headers=headers)
@@ -893,6 +903,7 @@ def test_control_routes_require_host_origin_and_token(
     with pytest.raises(RuntimeError, match="loopback"):
         require_loopback("0.0.0.0")
     assert require_loopback(None) == "127.0.0.1"
+    store.close()
 
 
 def apply_flatten_restore():
@@ -930,6 +941,173 @@ def _body(**overrides: object) -> dict[str, object]:
     }
     body.update(overrides)
     return body
+
+
+def _freeze(day: str) -> None:
+    year, month, dom = (int(part) for part in day.split("-"))
+    stamp = int(datetime(year, month, dom, 15, tzinfo=UTC).timestamp())
+    set_day_clock(lambda: stamp)
+
+
+def test_a_future_day_cannot_reset_a_halted_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "kill"
+    path.write_bytes(b"0")
+    monkeypatch.setenv("LIVE_KILL_FILE", str(path))
+    monkeypatch.setenv("LIVE_CONTROL_TOKEN", "test")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    _freeze(_DAY)
+    assert server_day() == _DAY
+    store = SqliteBarStore(tmp_path / "day.sqlite")
+    halted = DayLedger(
+        _DAY,
+        notional_usd=Decimal("10"),
+        realized_loss_usd=Decimal("5"),
+        halted=True,
+    )
+    save_day(halted, store)
+    app = create_app()
+    app.state.live_day_store = store
+    client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
+    headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
+    try:
+        future = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        assert future.status_code == 422
+        assert future.json()["accepted"] is False
+        assert future.json()["code"] == "daily_halt"
+        row = store.read_live_day()
+        assert row is not None
+        assert row[0] == _DAY
+        assert Decimal(str(row[1])) == Decimal("10")
+        assert Decimal(str(row[2])) == Decimal("5")
+        assert row[7] == 1
+        fresh = take_day(_DAY, store)
+        again = evaluate(_order(), fresh, today=_DAY)
+        assert again.accepted is False
+        assert again.code == "daily_halt"
+        reset_day_ledger()
+        _freeze(_DAY)
+        booked = SqliteBarStore(tmp_path / "booked.sqlite")
+        save_day(DayLedger(_DAY, notional_usd=Decimal("2.50")), booked)
+        app.state.live_day_store = booked
+        missed = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        assert missed.status_code == 422
+        assert missed.json()["code"] == "missing_transaction"
+        kept = booked.read_live_day()
+        assert kept is not None
+        assert kept[0] == _DAY
+        assert Decimal(str(kept[1])) == Decimal("2.50")
+        still = evaluate(_order(), take_day(_DAY, booked), today=_DAY)
+        assert still.accepted is True
+        assert still.ledger.notional_usd == Decimal("5.00")
+        booked.close()
+    finally:
+        store.close()
+
+
+def test_booked_notional_and_a_halt_survive_a_new_store(tmp_path: Path) -> None:
+    path = tmp_path / "day.sqlite"
+    store = SqliteBarStore(path)
+    try:
+        ledger = empty_day(_DAY)
+        for _ in range(4):
+            booked = evaluate(_order(), ledger, today=_DAY)
+            assert booked.accepted is True
+            ledger = booked.ledger
+        assert ledger.notional_usd == Decimal("10")
+        save_day(ledger, store)
+        reset_day_ledger()
+    finally:
+        store.close()
+    restarted = SqliteBarStore(path)
+    try:
+        loaded = take_day(_DAY, restarted)
+        assert loaded.notional_usd == Decimal("10")
+        assert loaded.halted is False
+        rejected = evaluate(_order(), loaded, today=_DAY)
+        assert rejected.accepted is False
+        assert rejected.code == "daily_notional"
+        save_day(
+            DayLedger(
+                _DAY,
+                notional_usd=Decimal("10"),
+                realized_loss_usd=Decimal("5"),
+                network_lamports=7,
+                halted=True,
+            ),
+            restarted,
+        )
+    finally:
+        restarted.close()
+    reset_day_ledger()
+    again = SqliteBarStore(path)
+    try:
+        halted = take_day(_DAY, again)
+        assert halted.halted is True
+        assert halted.realized_loss_usd == Decimal("5")
+        assert halted.network_lamports == 7
+        refused = evaluate(_order(notional_usd=Decimal("1")), halted, today=_DAY)
+        assert refused.code == "daily_halt"
+        clock = {"now": 1_700_000_000}
+        durable = SqliteBarStore(tmp_path / "purge.sqlite", now=lambda: clock["now"])
+        save_day(halted, durable)
+        clock["now"] += 90_000
+        assert durable.paper_wallet(user_id=LOCAL_USER_ID, strategy_id="s", version=1) is None
+        kept = durable.read_live_day()
+        assert kept is not None and kept[0] == _DAY and kept[7] == 1
+        durable.close()
+    finally:
+        again.close()
+
+
+def test_a_wrong_mint_or_token2022_account_is_rejected() -> None:
+    built = _assemble(_swap())
+    junk = replace(
+        _sim(),
+        deltas=(
+            TokenDelta(_POOL, SOL_MINT, _WALLET, 5_000, 4_000),
+            TokenDelta(_TABLE, SYSTEM_PROGRAM, _WALLET, 0, 1_900),
+        ),
+    )
+    assert _guard(built, MockChainRpc(height=10, simulation=junk)).code == "mint_mismatch"
+    leaked = replace(
+        _sim(),
+        deltas=_sim().deltas + (TokenDelta(_OTHER, SOL_MINT, _WALLET, 20, 0),),
+    )
+    assert _guard(built, MockChainRpc(height=10, simulation=leaked)).code == "amount_mismatch"
+    skipped = replace(_sim(), unparsed=(_POOL,))
+    assert _guard(built, MockChainRpc(height=10, simulation=skipped)).code == "amount_unverified"
+    assert classify_account(bytes(82)) == "mint"
+    assert classify_account(bytes(83)) == "unparsed"
+    assert classify_account(bytes(165)) == "token"
+    assert classify_account(bytes(166)) == "unparsed"
+    assert classify_account(b"") == "empty"
+    named = _assemble(_swap(DecodedInstruction(TOKEN_2022_PROGRAM, (), b"\x00")))
+    assert _guard(named, MockChainRpc(height=1)).code == "program_id"
+
+    def _parsed(size: int, address: str) -> Simulation:
+        raw = base64.b64encode(bytes(size)).decode("ascii")
+        value = {"lamports": 1, "data": [raw, "base64"]}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if body["method"] == "getAccountInfo":
+                result = {"value": value}
+            else:
+                result = {"value": {"err": None, "accounts": [value]}}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        return HttpChainRpc("http://127.0.0.1", client).simulate(b"\x00", [address])
+
+    mint_2022 = _parsed(83, _POOL)
+    token_2022 = _parsed(166, _TABLE)
+    assert mint_2022.unparsed == (_POOL,)
+    assert token_2022.unparsed == (_TABLE,)
+    assert _guard(built, MockChainRpc(height=1, simulation=mint_2022)).code == "amount_unverified"
+    assert _guard(built, MockChainRpc(height=1, simulation=token_2022)).code == "amount_unverified"
+    assert _parsed(200, TOKEN_PROGRAM).unparsed == ()
 
 
 def test_shadow_backlog_refuses_extra_work_without_waiting() -> None:

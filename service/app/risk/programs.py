@@ -19,11 +19,15 @@ ALLOWED_PROGRAMS = frozenset(
         SYSTEM_PROGRAM,
         COMPUTE_BUDGET_PROGRAM,
         TOKEN_PROGRAM,
-        TOKEN_2022_PROGRAM,
         ASSOCIATED_TOKEN_PROGRAM,
         JUPITER_V6_PROGRAM,
     }
 )
+
+# Named so a program account is not treated as an unparsed mint.
+# Token-2022 is not an allowed outer program. Its mint and token
+# accounts fail closed until they are parsed.
+KNOWN_PROGRAMS = ALLOWED_PROGRAMS | frozenset({TOKEN_2022_PROGRAM, ADDRESS_LOOKUP_PROGRAM})
 
 TOKEN_PROGRAMS = frozenset({TOKEN_PROGRAM, TOKEN_2022_PROGRAM})
 

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from app.ohlcv.store import SqliteBarStore
+from app.paper.routes import _bar_store
 from app.risk.access import ControlRejected, require_control
 from app.risk.control import KillPersistError, apply_flatten, apply_kill
 from app.risk.engine import LiveOrder, evaluate
-from app.risk.fees import FeeLines, save_day, take_day
+from app.risk.fees import FeeLines, save_day, server_day, take_day
 from app.risk.guard import guard_unsigned
 from app.risk.killfile import kill_halted
 from app.risk.limits import DEFAULT_LIMITS
@@ -24,7 +27,10 @@ router = APIRouter()
 
 
 class SubmitIn(BaseModel):
-    """One live check. Extra fields are rejected."""
+    """One live check. Extra fields are rejected.
+
+    ``day`` is ignored. The ledger day is the server's UTC date.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,7 +57,9 @@ class SubmitIn(BaseModel):
     wallet_value_usd: str
     out_amount: int
     minimum_out_amount: int
-    day: str
+    day: str | None = None
+    input_mint: str | None = None
+    output_mint: str | None = None
     in_amount: int = 0
     transaction_b64: str | None = None
     input_account: str | None = None
@@ -91,8 +99,12 @@ async def flatten(request: Request, body: SubmitIn) -> JSONResponse:
         return _forbidden()
     if body.action != "flatten" or body.side != "sell":
         return JSONResponse(status_code=422, content={"error": {"code": "bad_side"}})
-    result = apply_flatten(_order(body), take_day(body.day), today=body.day)
-    save_day(result.ledger)
+    store = _day_store(request)
+    if isinstance(store, JSONResponse):
+        return store
+    today = server_day()
+    result = apply_flatten(_order(body), take_day(today, store), today=today)
+    save_day(result.ledger, store)
     return JSONResponse(
         {
             "accepted": result.accepted,
@@ -121,22 +133,25 @@ async def submit(request: Request, body: SubmitIn) -> JSONResponse:
             status_code=409,
             content={"accepted": False, "code": "killed", "sent": False},
         )
-    prior = take_day(body.day)
-    result = evaluate(_order(body), prior, today=body.day)
+    store = _day_store(request)
+    if isinstance(store, JSONResponse):
+        return store
+    today = server_day()
+    prior = take_day(today, store)
+    result = evaluate(_order(body), prior, today=today)
     if not result.accepted:
-        save_day(result.ledger)
+        save_day(result.ledger, store)
         return JSONResponse(
             status_code=422,
             content={"accepted": False, "code": result.code, "sent": False, "resized": False},
         )
     guarded = _guard(request, body)
     if guarded is not None:
-        save_day(prior)
         return JSONResponse(
             status_code=422,
             content={"accepted": False, "code": guarded, "sent": False},
         )
-    save_day(result.ledger)
+    save_day(result.ledger, store)
     row = pending_book().add(kind="submit", mint=body.mint, side=body.side)
     return JSONResponse(
         {
@@ -186,6 +201,10 @@ def _order(body: SubmitIn) -> LiveOrder:
 def _guard(request: Request, body: SubmitIn) -> str | None:
     if body.transaction_b64 is None or body.input_account is None or body.output_account is None:
         return "missing_transaction"
+    input_mint = body.input_mint
+    output_mint = body.output_mint
+    if input_mint is None or output_mint is None or input_mint == output_mint:
+        return "mint_mismatch"
     import base64
 
     try:
@@ -201,8 +220,8 @@ def _guard(request: Request, body: SubmitIn) -> str | None:
         account_keys=view[0],
         static_account_count=view[3],
         lookup_tables=view[4],
-        input_mint=body.mint,
-        output_mint=body.mint,
+        input_mint=input_mint,
+        output_mint=output_mint,
         quote_in_amount=body.in_amount,
         quote_out_amount=body.out_amount,
         quote_minimum_out_amount=body.minimum_out_amount,
@@ -220,11 +239,27 @@ def _guard(request: Request, body: SubmitIn) -> str | None:
         quoted_minimum=body.minimum_out_amount,
         input_account=body.input_account,
         output_account=body.output_account,
+        input_mint=input_mint,
+        output_mint=output_mint,
         limits=DEFAULT_LIMITS,
     )
     if decision.accepted:
         return None
     return decision.code
+
+
+def _day_store(request: Request) -> SqliteBarStore | JSONResponse:
+    """The bar-store file. Tests may set ``app.state.live_day_store``."""
+    current = getattr(request.app.state, "live_day_store", None)
+    if isinstance(current, SqliteBarStore):
+        return current
+    try:
+        return _bar_store(request)
+    except (OSError, sqlite3.Error, ValueError):
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "store_unavailable"}},
+        )
 
 
 def _decimal(text: str) -> Decimal | None:
