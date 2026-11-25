@@ -4,6 +4,7 @@ import {
   formatPaperAmount,
   paperDeployPath,
   paperPnl,
+  readShadowReport,
   readSnapshot,
   type PaperPosition,
 } from "@/lib/paper";
@@ -118,6 +119,7 @@ describe("paper snapshot", () => {
     expect(snapshot.events[0]?.kind).toBe("BAR_MISSED");
     expect(snapshot.events[0]?.id).toBe(7);
     expect(snapshot.eventsCursor).toBe(7);
+    expect(snapshot.shadow.enabled).toBe(false);
     expect(snapshot.driftThresholdName).toBe("PAPER_DRIFT_THRESHOLD");
     expect(snapshot.events[0]?.detail).toBe('{"reason":"ttl"}');
   });
@@ -154,5 +156,56 @@ describe("paper snapshot", () => {
     expect(paperDeployPath("NOPE", "1")).toBeNull();
     expect(paperDeployPath(ID, "0")).toBeNull();
     expect(paperDeployPath(ID, "01")).toBeNull();
+  });
+});
+
+describe("shadow report", () => {
+  it("keeps quoted output and fee lines, and drops a provider body", () => {
+    const report = readShadowReport({
+      mode: "shadow",
+      simulated: true,
+      enabled: true,
+      build_enabled: false,
+      slippage_bps: 50,
+      min_interval_seconds: "1.0",
+      daily_cap: 1000,
+      amount_mismatch_rate: "0.2500",
+      build_attempts: 4,
+      amount_mismatches: 1,
+      transaction: "AQ==",
+      quotes: [
+        {
+          strategy_id: ID,
+          version: 1,
+          open_time: 1_700_000_040,
+          asset_id: "sol",
+          side: "buy",
+          input_mint: "usdc",
+          output_mint: "sol",
+          paper_out: "2",
+          quoted_out: "2.5",
+          price_impact: "-0.1",
+          route_label: "Synthetic",
+          router: "metis",
+          network_fee_lamports: 5000,
+          priority_fee_lamports: 1000,
+          rent_lamports: 2039280,
+          latency_ms: 12,
+          slippage_bps: 50,
+          quote_status: "ok",
+          build_status: "not_requested",
+          error_code: null,
+          quoted_at: 1_700_000_100,
+          payload: { transaction: "AQ==" },
+        },
+      ],
+    });
+    expect(report.amountMismatchRate).toBe("0.2500");
+    expect(report.quotes[0]?.quotedOut).toBe("2.5");
+    expect(report.quotes[0]?.networkFeeLamports).toBe(5000);
+    expect(report.quotes[0]?.rentLamports).toBe(2039280);
+    expect(JSON.stringify(report)).not.toContain("AQ==");
+    expect(JSON.stringify(report)).not.toContain("payload");
+    expect(JSON.stringify(report)).not.toContain("transaction");
   });
 });

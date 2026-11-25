@@ -77,7 +77,9 @@ The web app polls `GET /api/paper?events_limit=100`, then later polls with `even
 
 ## Drift
 
-For each running registration, `GET /paper` calls `run_backtest` on the pinned document and the stored closed bars from the oldest retained bar through the paper cursor. That is the span the paper broker replays for warmup. Only a fill on a bar that closed after this registration's `registered_at` is compared. Bars before that warm the indicators and do not count as fills of this registration. Costs are that document's `commission_bps` and `slippage_bps`. Bars the cursor has not reached are outside the window. The engine is not modified.
+For each running registration, `GET /paper` calls `run_backtest` on the pinned document and the stored closed bars from the broker's indicator origin through the paper cursor. The origin is the oldest stored open time at the broker's first tick. It is recorded then and it does not move backward. A bar with an older open time that is stored after that tick is left out of the window, so the backtest uses the same seed the broker used and does not flag a false drift. The recorded origin is an open time, like the cursor. It is not a price and `_purge` does not delete it.
+
+When no origin is recorded yet, or a purge has already dropped every bar at and before that origin, the window still starts at the oldest retained bar. An EMA reseeds after that gap. Only a fill on a bar that closed after this registration's `registered_at` is compared. Bars before that warm the indicators and do not count as fills of this registration. Costs are that document's `commission_bps` and `slippage_bps`. Bars the cursor has not reached are outside the window. The engine is not modified.
 
 The report is computed on that read. It is not inserted, and the bars are not written back. There is no cache. A later read sees only rows the 24-hour purge has kept. The wallet and the position are not used to rebuild a fill that has aged out.
 
@@ -96,12 +98,26 @@ An equal difference is not flagged. Realized P&L is the stored position total ag
 | --- | --- |
 | `no_window` | The paper cursor is unset, or it has not reached a stored bar that closed after `registered_at`. A window the cursor has already passed, with zero fills on both sides, is still `ok` |
 | `prior_book` | A retained fill, or an open position attached on a bar that closed at or before this `registered_at`. A redeploy that carries the previous book is this case |
-| `short_history` | `warmup_bars` is greater than the number of retained bars from the oldest stored bar through the cursor |
+| `short_history` | `warmup_bars` is greater than the number of retained bars from the window start through the cursor |
 | `bar_missed` | A `BAR_MISSED` event whose open time is at or after `registered_at` is still inside the TTL, or the cursor span has a hole while some of that span is still stored |
 | `purged_fills` | Replaying the retained fills does not land on the stored cash and quantity |
 | `window_before_retained` | `registered_at` is at or before the retention cutoff, or the cursor span has no stored bars left |
 
-That read does not halt the strategy.
+That read does not halt the strategy. `history_before_origin` is not a status. The window is aligned instead, and a real disagreement inside that window is still `drift`.
+
+## Shadow quotes
+
+`SHADOW_QUOTES_ENABLED` is off unless it is the exact string `1`. `LIVE_FEED_ENABLED` and `LIVE_TRADING_ENABLED` are separate and stay default-off. With the shadow flag on, each new paper fill is followed by one `ExecutionVenue.quote` for the trade that fill simulated: a buy spends the paper notional of USDC, a sell spends the paper quantity of the asset. The row sits next to the fill. The fill, the cash, and the position are not changed.
+
+`SHADOW_BUILD_ENABLED` `1` also requests an unsigned `/build`. That call exists to count `amount_mismatch` between `/order` and `/build`. The transaction bytes are not stored. No path signs or sends. `execute` still raises.
+
+`SHADOW_SLIPPAGE_BPS` is the `slippageBps` query parameter sent on both `/order` and `/build`. Blank keeps 50. That number is the request parameter. It is not the P4-04 risk cap.
+
+Jupiter calls wait at least `JUPITER_MIN_INTERVAL_SECONDS` (default 1 second) between attempts and stop after `JUPITER_DAILY_CAP` attempts (default 1000) on a calendar day. The day key moves forward only. HTTP 429 and HTTP 5xx still use the bounded backoff, at most five attempts. The shadow runner also reserves one stored call per quote and per build, with the same daily cap, so a restart does not start the count over.
+
+The row keeps quoted output, price impact, route label, router, quote latency, and three fee lines: network fee (`signatureFeeLamports`), priority fee, and token-account rent. Those three are not added to strategy P&L. A provider body, a transaction, an API key, and a signature are not stored. `paper_shadow.stored_at` is purged at 86400 seconds with the fills and the events. The wallet, the position, the cursor, and the origin are not.
+
+`GET /paper` includes a `shadow` object: whether the flags are on, the request slippage, the interval, the daily cap, the `amount_mismatch` rate (`amount_mismatches / build_attempts`, or null when no build was attempted), and the newest shadow rows. `GET /shadow` is that object alone, with `mode` `shadow`. The `/paper` dashboard and `/shadow` render it. Both say the fee lines are not strategy P&L.
 
 ## Event log
 

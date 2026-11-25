@@ -426,6 +426,20 @@ def _window(
             earliest = first if earliest is None else min(earliest, first)
     if earliest is None:
         return None, "window_before_retained", 0
+    # The broker fixes its indicator origin at the first tick. Bars stored
+    # later with an older open time are not part of that window. Starting
+    # here keeps the backtest on the same seed, so a backfill cannot flag
+    # a false drift. A purge that drops the origin bar still starts at the
+    # oldest bar that remains: the EMA reseeds after that gap.
+    recorded = store.paper_origin(
+        user_id=user_id, strategy_id=strategy_id, version=version
+    )
+    if (
+        recorded is not None
+        and earliest < recorded <= cursor
+        and (recorded - earliest) % step == 0
+    ):
+        earliest = recorded
     if (cursor - earliest) % step != 0 or (trade_open - earliest) % step != 0:
         return None, "bar_missed", 0
     expected = list(range(earliest, cursor + 1, step))

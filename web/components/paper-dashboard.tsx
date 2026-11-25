@@ -3,6 +3,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 
 import {
+  EMPTY_SHADOW,
   PAPER_EVENTS_LIMIT,
   errorMessage,
   formatPaperAmount,
@@ -12,6 +13,7 @@ import {
   type PaperDrift,
   type PaperEvent,
   type PaperSnapshot,
+  type ShadowReport,
 } from "@/lib/paper";
 
 const EMPTY: PaperSnapshot = {
@@ -25,6 +27,7 @@ const EMPTY: PaperSnapshot = {
   driftThreshold: "0.01",
   driftThresholdName: "PAPER_DRIFT_THRESHOLD",
   drift: [],
+  shadow: EMPTY_SHADOW,
 };
 
 export function PaperDashboard({ pollMs = 2000 }: { pollMs?: number }) {
@@ -277,6 +280,7 @@ export function PaperBook({
         )}
       </section>
       <DriftReport snapshot={snapshot} />
+      <ShadowQuotes report={snapshot.shadow} />
       <section className="card" aria-label="Paper event log">
         <h2>Event log</h2>
         {snapshot.eventsHasMore ? <p className="paper-note">Showing the latest events.</p> : null}
@@ -321,6 +325,69 @@ export function mergeEvents(previous: PaperEvent[], incoming: PaperEvent[]): Pap
   }
   merged.sort((left, right) => left.id - right.id);
   return merged;
+}
+
+export function ShadowQuotes({ report }: { report: ShadowReport }) {
+  const rate =
+    report.amountMismatchRate === null
+      ? "no build attempted"
+      : `${report.amountMismatchRate} (${report.amountMismatches} / ${report.buildAttempts})`;
+  return (
+    <section className="card" aria-label="Shadow quotes">
+      <h2>Shadow quotes</h2>
+      <p className="paper-note">
+        {report.enabled
+          ? `Shadow quotes are on. Request slippage ${report.slippageBps ?? "unset"} bps. Interval ${report.minIntervalSeconds ?? "unset"} s. Daily cap ${report.dailyCap ?? "unset"}.`
+          : "Shadow quotes are off. SHADOW_QUOTES_ENABLED is not 1."}{" "}
+        Quoted output sits next to the paper fill. Network fee, priority fee, and token-account rent
+        are not part of strategy P&L. amount_mismatch rate {rate}.
+      </p>
+      {report.quotes.length === 0 ? (
+        <p className="empty">No shadow quote is stored.</p>
+      ) : (
+        <div className="paper-scroll">
+          <table className="paper-table">
+            <thead>
+              <tr>
+                <th>Open time</th>
+                <th>Side</th>
+                <th>Paper out</th>
+                <th>Quoted out</th>
+                <th>Impact</th>
+                <th>Route</th>
+                <th>Network</th>
+                <th>Priority</th>
+                <th>Rent</th>
+                <th>Latency</th>
+                <th>Build</th>
+              </tr>
+            </thead>
+            <tbody>
+              {report.quotes.map((quote) => (
+                <tr key={`${quote.strategyId}:${quote.version}:${quote.openTime}:${quote.side}`}>
+                  <td>{quote.openTime}</td>
+                  <td>{quote.side}</td>
+                  <td>{quote.paperOut}</td>
+                  <td>{quote.quotedOut ?? "—"}</td>
+                  <td>{quote.priceImpact ?? "—"}</td>
+                  <td>{quote.routeLabel ?? "—"}</td>
+                  <td>{fee(quote.networkFeeLamports)}</td>
+                  <td>{fee(quote.priorityFeeLamports)}</td>
+                  <td>{fee(quote.rentLamports)}</td>
+                  <td>{quote.latencyMs === null ? "—" : `${quote.latencyMs} ms`}</td>
+                  <td>{quote.buildStatus}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function fee(value: number | null): string {
+  return value === null ? "—" : `${value} lamports`;
 }
 
 function DriftReport({ snapshot }: { snapshot: PaperSnapshot }) {

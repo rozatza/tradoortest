@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { GET as getPaper } from "@/app/api/paper/route";
+import { GET as getShadow } from "@/app/api/shadow/route";
 import { DELETE, POST } from "@/app/api/strategies/[strategyId]/versions/[version]/paper/route";
 
 const ID = "a".repeat(32);
@@ -29,6 +30,17 @@ describe("paper proxy", () => {
     const response = await getPaper(new Request("http://chat.local/api/paper"));
     expect(response.status).toBe(200);
     expect(calls[0]?.url).toBe("http://127.0.0.1:8000/paper");
+    expect(calls[0]?.init.method).toBe("GET");
+    const headers = new Headers(calls[0]?.init.headers);
+    expect(headers.get("authorization")).toBeNull();
+    expect(headers.get("cookie")).toBeNull();
+  });
+
+  it("reads the shadow report and does not forward a caller credential", async () => {
+    const calls = stub();
+    const response = await getShadow();
+    expect(response.status).toBe(200);
+    expect(calls[0]?.url).toBe("http://127.0.0.1:8000/shadow");
     expect(calls[0]?.init.method).toBe("GET");
     const headers = new Headers(calls[0]?.init.headers);
     expect(headers.get("authorization")).toBeNull();

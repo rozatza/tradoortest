@@ -155,6 +155,7 @@ class PaperBroker:
         *,
         now: Callable[[], int] | None = None,
         user_id: str = LOCAL_USER_ID,
+        shadow_venue: object | None = None,
     ) -> None:
         self._store = store
         self._now = (lambda: int(time.time())) if now is None else now
@@ -164,6 +165,7 @@ class PaperBroker:
         self._origin: dict[tuple[str, int], int] = {}
         self._stepped: dict[tuple[str, int], int | None] = {}
         self._hold: frozenset[tuple[str, str]] = frozenset()
+        self._shadow_venue = shadow_venue
 
     def tick(self, *, hold: Collection[tuple[str, str]] | None = None) -> None:
         """Fill new closed bars for every registration. Decisions are not read.
@@ -217,7 +219,7 @@ class PaperBroker:
         if not opens:
             return
         key = (strategy_id, version)
-        origin = self._origin.setdefault(key, min(opens))
+        origin = self._fixed_origin(strategy_id, version, min(opens))
         asset_ids = tuple(asset_id for asset_id, _mint in assets)
         config = config_from_document(document)
         cursor = self._store.paper_cursor(
@@ -354,7 +356,66 @@ class PaperBroker:
             expire_order_ids=expire_ids,
             cash=_money(book.cash),
         )
+        if fills:
+            self._observe_shadow(strategy_id, version, document, now)
         return outcome.state
+
+    def _fixed_origin(self, strategy_id: str, version: int, floor: int) -> int:
+        """Origin fixed at the first tick. Older bars stored later do not move it.
+
+        The in-process value is the one the first tick chose. A new process
+        keeps that recorded open time when the store now also holds bars
+        before it. A purge that has already dropped the recorded bar uses
+        the oldest bar still stored, which is the same reseed the drift
+        report uses.
+        """
+        key = (strategy_id, version)
+        if key in self._origin:
+            return self._origin[key]
+        recorded = self._store.paper_origin(
+            user_id=self._user_id, strategy_id=strategy_id, version=version
+        )
+        if recorded is None:
+            chosen = floor
+            self._store.save_paper_origin(
+                user_id=self._user_id,
+                strategy_id=strategy_id,
+                version=version,
+                origin_open_time=chosen,
+            )
+        elif floor < recorded:
+            chosen = recorded
+        else:
+            chosen = floor
+        self._origin[key] = chosen
+        return chosen
+
+    def _observe_shadow(
+        self,
+        strategy_id: str,
+        version: int,
+        document: Mapping[str, Any],
+        now: int,
+    ) -> None:
+        """Quote the fill that was just committed. A failure does not change it."""
+        try:
+            from app.paper.shadow import observe_shadow
+
+            observe_shadow(
+                self._store,
+                user_id=self._user_id,
+                strategy_id=strategy_id,
+                version=version,
+                document=document,
+                now=now,
+                venue=self._shadow_venue,
+            )
+        except Exception:
+            logger.warning(
+                "shadow quote failed strategy_id=%s version=%s",
+                strategy_id,
+                version,
+            )
 
     def _load_book(
         self, strategy_id: str, version: int, costs: _Costs

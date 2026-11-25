@@ -172,6 +172,103 @@ def test_stored_bars_before_the_cursor_advances_have_no_window(tmp_path: Path) -
         strategies.close()
 
 
+def test_older_bars_backfilled_after_the_first_tick_do_not_flag_drift(tmp_path: Path) -> None:
+    """ROZ-107 C-R1, the probe23c section 3 case.
+
+    The broker fixes its EMA origin at the first tick. Older bars stored
+    after that tick used to make the drift backtest cross while the paper
+    book did not, which flagged a false drift. The window now starts at
+    the recorded origin, so the two sides agree.
+    """
+    import math
+    import random
+
+    from app.indicators import ema
+
+    period = 20
+    clock = {"now": _T}
+    client, strategies, bars, _application = _world(tmp_path, clock)
+    document = _document()
+    document["engine"]["warmup_bars"] = 0
+    document["derived_series"] = [
+        {
+            "id": "e",
+            "kind": "indicator",
+            "indicator": "ema",
+            "source": "close",
+            "params": {"period": period},
+        }
+    ]
+    document["signals"] = [
+        {
+            "id": "go",
+            "expr": {
+                "op": "cross_above",
+                "args": [{"op": "ref", "name": "close"}, {"op": "ref", "name": "e"}],
+            },
+        },
+        document["signals"][1],
+    ]
+    strategy_id, _version, _hash = _save(strategies, document)
+    try:
+        random.seed(7)
+        history = {
+            300 + offset: 100 + math.sin(offset / 3) * 2 + random.uniform(-0.3, 0.3)
+            for offset in range(30)
+        }
+        bars.upsert(
+            [
+                _bar(_T + index * _STEP, close, high=close + 0.5, low=close - 0.5)
+                for index, close in history.items()
+            ],
+            user_id=LOCAL_USER_ID,
+        )
+        clock["now"] = _T + 330 * _STEP
+        assert _deploy(client, strategy_id).status_code == 201
+        broker = PaperBroker(bars, now=lambda: clock["now"])
+        history[330] = 95.0
+        bars.upsert(
+            [_bar(_T + 330 * _STEP, 95.0, high=95.5, low=94.5)],
+            user_id=LOCAL_USER_ID,
+        )
+        clock["now"] = _T + 331 * _STEP + _GRACE
+        broker.tick()
+        origin = bars.paper_origin(user_id=LOCAL_USER_ID, strategy_id=strategy_id, version=1)
+        assert origin == _T + 300 * _STEP
+        older = {index: 100 + random.uniform(-8, 8) for index in range(300)}
+        bars.upsert(
+            [
+                _bar(_T + index * _STEP, close, high=close + 0.5, low=close - 0.5)
+                for index, close in older.items()
+            ],
+            user_id=LOCAL_USER_ID,
+        )
+        broker_closes = [history[index] for index in range(300, 331)]
+        drift_closes = [older[index] for index in range(300)] + broker_closes
+        broker_ema = ema(broker_closes, period)[-1]
+        drift_ema = ema(drift_closes, period)[-1]
+        assert broker_ema != drift_ema
+        low, high = sorted((broker_ema, drift_ema))
+        crafted = (low + high) / 2
+        bars.upsert(
+            [_bar(_T + 331 * _STEP, crafted, high=crafted + 0.5, low=crafted - 0.5)],
+            user_id=LOCAL_USER_ID,
+        )
+        clock["now"] = _T + 332 * _STEP + _GRACE
+        broker.tick()
+        assert _fills(bars, strategy_id) == []
+        report = client.get("/paper").json()["drift"][0]
+        assert report["status"] == "ok"
+        assert report["flagged"] is False
+        assert report["reason"] is None
+        assert report["fill_count"] == {"paper": 0, "backtest": 0}
+        assert report["side_time_mismatches"] == 0
+        assert report["status"] != "drift"
+    finally:
+        bars.close()
+        strategies.close()
+
+
 def test_a_real_window_with_no_fills_stays_ok(tmp_path: Path) -> None:
     clock = {"now": _T}
     client, strategies, bars, _application = _world(tmp_path, clock)
