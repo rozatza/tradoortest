@@ -17,6 +17,7 @@ Internal Astral-style strategy trader for one user. Scope is Solana spot, long-o
 | `docs/ohlcv.md` | Provider, cost, timeframes, bar checks, and the backfill command. |
 | `docs/live-feed.md` | Near-real-time bars, the paper scheduler, closed bars, and the restart cursor. |
 | `docs/paper.md` | Simulated paper fills, the 5-minute order expiry, and the position rows that outlive the 24-hour fill log. |
+| `docs/live.md` | Phase 4 live-trading design and threat model. The design only. This tree does not sign or send. |
 | `data/` | Gitignored local SQLite. `strategies.sqlite` is saved strategies, `backtest-jobs.sqlite` is the job queue, `ohlcv.sqlite` is the OHLCV cache, and `agent.sqlite` is the author transcript. The cache, job results, and pool rows expire within 24 hours. The agent file does not keep a second copy of those payloads. |
 | `schemas/` | JSON Schema draft 2020-12 for IR v1, plus three valid examples. |
 | `docs/dsl-spec.md` | Strategy DSL, IR contract, semantic error codes, and the canonical hash. |
@@ -49,7 +50,7 @@ Run the API locally, after `make install`:
 
 Backfill SOL and four native majors (JUP, JTO, BONK, WIF) after `make install`. This talks to the public GeckoTerminal API and writes `data/ohlcv.sqlite`, which git ignores. That file is a cache and expires within 24 hours. No API key is required. Data by GeckoTerminal / CoinGecko. Any other Solana mint is `--mints`. GeckoTerminal stays the primary source. Birdeye is an optional fallback and stays off unless `BIRDEYE_API_KEY` is set in the environment. Details, rate limits, and the gap report are in `docs/ohlcv.md`. A local live check, not part of CI, is `scripts/acceptance_roz92.py`.
 
-`LIVE_FEED_ENABLED` starts a background scheduler that polls closed bars for those majors and records one runner decision per strategy version. It is off when the variable is unset. It does not send orders. See `docs/live-feed.md`. When the flag is on, the same tick stores the fetched bars and then runs `PaperBroker.tick` for simulated fills. `POST /strategies/{strategy_id}/versions/{version}/paper` deploys one saved version. `DELETE` on that path undeploys it. The running-paper cap defaults to 3 (`PAPER_MAX_RUNNING`). `GET /paper` also compares each running version's fills with `run_backtest` on the stored bars since `registered_at` and flags a quote delta above `PAPER_DRIFT_THRESHOLD` (default `0.01`). The report is not stored. See `docs/paper.md`.
+`LIVE_FEED_ENABLED` starts a background scheduler that polls closed bars for those majors and records one runner decision per strategy version. It is off when the variable is unset. It does not send orders. See `docs/live-feed.md`. Live orders are specified in `docs/live.md` and are not implemented in this tree. When the flag is on, the same tick stores the fetched bars and then runs `PaperBroker.tick` for simulated fills. `POST /strategies/{strategy_id}/versions/{version}/paper` deploys one saved version. `DELETE` on that path undeploys it. The running-paper cap defaults to 3 (`PAPER_MAX_RUNNING`). `GET /paper` also compares each running version's fills with `run_backtest` on the stored bars since `registered_at` and flags a quote delta above `PAPER_DRIFT_THRESHOLD` (default `0.01`). The report is not stored. See `docs/paper.md`.
 
 ```bash
 .venv/bin/python -m app.ohlcv.backfill --days 90
