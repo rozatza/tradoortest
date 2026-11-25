@@ -1,6 +1,6 @@
 """Pinned Jupiter Swap API V2.
 
-Verified 2026-11-25T03:14:26Z by reading the public docs. ``dev.jup.ag``
+Verified 2026-11-25T03:16:55Z by reading the public docs. ``dev.jup.ag``
 served these pages. The documentation index also names
 ``developers.jup.ag``. Both describe the same API.
 
@@ -36,7 +36,7 @@ JUPITER_BUILD_PATH = "/build"
 JUPITER_EXECUTE_PATH = "/execute"
 JUPITER_API_KEY_HEADER = "x-api-key"
 JUPITER_API_KEY_ENV = "JUPITER_API_KEY"
-JUPITER_VERIFIED_AT = "2026-11-25T03:14:26Z"
+JUPITER_VERIFIED_AT = "2026-11-25T03:16:55Z"
 
 # Documented /order response fields. Anything else is a schema failure.
 ORDER_FIELDS = frozenset(
