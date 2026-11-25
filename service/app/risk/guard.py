@@ -33,7 +33,7 @@ from app.risk.programs import (
     TOKEN_TRANSFER,
     TOKEN_TRANSFER_CHECKED,
 )
-from app.risk.route_ix import decode_jupiter_route
+from app.risk.route_ix import RouteTerms, decode_jupiter_route
 from app.risk.rpc import ChainRpc, Simulation
 from app.venue.address import address_bytes
 from app.venue.errors import VenueError
@@ -72,7 +72,11 @@ def guard_unsigned(
     output_mint: str,
     limits: RiskLimits | None = None,
 ) -> GuardDecision:
-    """Check ``tx.transaction``. Quote-copied amount fields are ignored."""
+    """Check ``tx.transaction``. Copied quote fields on ``tx`` are ignored.
+
+    ``quoted_out`` is the venue quote. The route must name that amount,
+    and its min-out must cover the simulated gain at the slippage cap.
+    """
     chosen = DEFAULT_LIMITS if limits is None else limits
     known = set(owned)
     known.add(wallet)
@@ -91,9 +95,9 @@ def guard_unsigned(
     decoded = _decoded_transfer_amount(instructions)
     if decoded is not None and decoded != quoted_in:
         return GuardDecision(False, "amount_mismatch")
-    route_code = _route_terms(instructions, quoted_in, quoted_minimum, chosen)
-    if route_code is not None:
-        return GuardDecision(False, route_code)
+    route = _route_terms(instructions, quoted_in, quoted_out, quoted_minimum, chosen)
+    if isinstance(route, str):
+        return GuardDecision(False, route)
     if rpc is None:
         return GuardDecision(False, "missing_rpc")
     try:
@@ -111,6 +115,7 @@ def guard_unsigned(
         input_mint,
         output_mint,
         chosen,
+        instructions,
     )
 
 
@@ -270,15 +275,70 @@ def _token(
 def _route_terms(
     instructions: tuple[DecodedInstruction, ...],
     quoted_in: int,
+    quoted_out: int,
     quoted_minimum: int,
     limits: RiskLimits,
-) -> str | None:
+) -> RouteTerms | str | None:
     """Refuse a Jupiter route whose min-out or slippage is outside the cap.
 
     A transaction with no Jupiter instruction is left to the simulation.
     One that names Jupiter must decode. Minimum-out ``0`` is refused
-    even when the slippage field would also fail.
+    even when the slippage field would also fail. The instruction's
+    quoted out must be the venue quote's out amount.
     """
+    decoded = _one_route(instructions)
+    if decoded is None:
+        return None
+    if isinstance(decoded, str):
+        return decoded
+    if decoded.min_out <= 0:
+        return "min_out"
+    if decoded.in_amount != quoted_in:
+        return "amount_mismatch"
+    if decoded.slippage_bps > limits.max_slippage_bps:
+        return "slippage"
+    if decoded.quoted_out != quoted_out:
+        return "amount_mismatch"
+    floor = decoded.quoted_out - decoded.quoted_out * limits.max_slippage_bps // 10_000
+    if decoded.min_out < floor or decoded.min_out < quoted_minimum:
+        return "min_out"
+    return decoded
+
+
+def simulated_min_out(
+    instructions: tuple[DecodedInstruction, ...],
+    *,
+    quote_out: int,
+    gained: int,
+    limits: RiskLimits,
+) -> str | None:
+    """Bind min-out to the simulated gain, not to the route's own numbers.
+
+    ``quote_out`` must equal the instruction's quoted out. Min-out must
+    be at least ``gained * (10_000 - cap) // 10_000``. That product is
+    integer division, so a float cannot round the floor down.
+    """
+    decoded = _one_route(instructions)
+    if decoded is None:
+        return None
+    if isinstance(decoded, str):
+        return decoded
+    if isinstance(quote_out, bool) or not isinstance(quote_out, int):
+        return "amount_mismatch"
+    if decoded.quoted_out != quote_out:
+        return "amount_mismatch"
+    if isinstance(gained, bool) or not isinstance(gained, int) or gained < 0:
+        return "min_out"
+    cap = limits.max_slippage_bps
+    required = gained * (10_000 - cap) // 10_000
+    if decoded.min_out < required:
+        return "min_out"
+    return None
+
+
+def _one_route(
+    instructions: tuple[DecodedInstruction, ...],
+) -> RouteTerms | str | None:
     routes = [item for item in instructions if item.program_id == JUPITER_V6_PROGRAM]
     if not routes:
         return None
@@ -289,16 +349,7 @@ def _route_terms(
         return decoded
     if decoded is None:
         return "route_undecoded"
-    if decoded.min_out <= 0:
-        return "min_out"
-    if decoded.in_amount != quoted_in:
-        return "amount_mismatch"
-    if decoded.slippage_bps > limits.max_slippage_bps:
-        return "slippage"
-    floor = decoded.quoted_out - decoded.quoted_out * limits.max_slippage_bps // 10_000
-    if decoded.min_out < floor or decoded.min_out < quoted_minimum:
-        return "min_out"
-    return None
+    return decoded
 
 
 def _decoded_transfer_amount(instructions: tuple[DecodedInstruction, ...]) -> int | None:
@@ -363,8 +414,8 @@ def _simulated(
     input_mint: str,
     output_mint: str,
     limits: RiskLimits,
+    instructions: tuple[DecodedInstruction, ...],
 ) -> GuardDecision:
-    del quoted_out
     if simulation.err is not None:
         return GuardDecision(False, "simulation_failed")
     if simulation.unparsed:
@@ -409,6 +460,14 @@ def _simulated(
     gained = received.after - received.before
     if gained < quoted_minimum:
         return GuardDecision(False, "amount_mismatch")
+    bound = simulated_min_out(
+        instructions,
+        quote_out=quoted_out,
+        gained=gained,
+        limits=limits,
+    )
+    if bound is not None:
+        return GuardDecision(False, bound)
     lamports_before = dict(simulation.lamports_before)
     lamports_after = dict(simulation.lamports_after)
     if wallet not in lamports_before or wallet not in lamports_after:

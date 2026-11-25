@@ -22,7 +22,7 @@ from decimal import Decimal
 from app.risk.engine import LiveOrder, evaluate
 from app.risk.fees import FeeLines, record_realized_loss, save_day, server_day, take_day
 from app.risk.gate import LiveGate
-from app.risk.guard import guard_unsigned
+from app.risk.guard import guard_unsigned, simulated_min_out
 from app.risk.killfile import kill_halted
 from app.risk.limits import DEFAULT_LIMITS, RiskLimits, order_slippage_bps
 from app.risk.order import quote_and_build
@@ -32,7 +32,7 @@ from app.risk.route_ix import decode_jupiter_route
 from app.risk.rpc import ChainRpc, Simulation, TokenDelta
 from app.venue.errors import VenueError
 from app.venue.flags import live_trading_enabled
-from app.venue.tx import message_fee_payer, split_transaction
+from app.venue.tx import decode_unsigned_v0, message_fee_payer, split_transaction, zero_signatures
 from app.venue.types import QuoteRequest
 
 # Public mints and their decimals. USDC is the quote asset, not an entry.
@@ -82,6 +82,9 @@ class _Guarded:
     accounts: tuple[str, ...]
     in_usd: Decimal
     out_usd: Decimal
+    quote_out: int
+    output_account: str
+    tables: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 class Step:
@@ -255,6 +258,9 @@ def prepare_trade(
             built.account_keys,
             in_usd,
             out_usd,
+            quote.out_amount,
+            received.account,
+            tuple((table.address, table.addresses) for table in built.lookup_tables),
         )
     )
     return Step(
@@ -353,6 +359,24 @@ def confirm_trade(
         _consume(pending_id)
         code = "bad_signature" if simulated.err == "bad_signature" else "simulation_failed"
         return _step(422, code)
+    try:
+        viewed = decode_unsigned_v0(zero_signatures(signed), item.tables)
+    except VenueError:
+        _consume(pending_id)
+        return _step(422, "bad_transaction")
+    gained = _output_gain(simulated, item.output_account, wallet)
+    if gained is None:
+        _consume(pending_id)
+        return _step(422, "amount_unverified")
+    bound = simulated_min_out(
+        viewed[2],
+        quote_out=item.quote_out,
+        gained=gained,
+        limits=chosen,
+    )
+    if bound is not None:
+        _consume(pending_id)
+        return _step(422, bound)
     result = evaluate(order, take_day(today, store), chosen, today=today)
     if not result.accepted:
         if result.ledger.halted:
@@ -369,11 +393,11 @@ def confirm_trade(
         _consume(pending_id)
         return _step(409, "trading_disabled")
     _consume(pending_id)
+    save_day(result.ledger, store)
     try:
         signature = context.rpc.send(signed)
     except VenueError:
         return _step(503, "send_failed")
-    save_day(result.ledger, store)
     try:
         status = context.rpc.confirm(signature)
     except VenueError:
@@ -428,6 +452,18 @@ def _pair(intent: Intent) -> tuple[str, str] | None:
         return USDC_MINT, intent.mint
     if intent.side == "sell" and intent.action in ("exit", "flatten"):
         return intent.mint, USDC_MINT
+    return None
+
+
+def _output_gain(simulation: Simulation, account: str, wallet: str) -> int | None:
+    """Atoms the output account gained. Missing or negative is refused."""
+    for item in simulation.deltas:
+        if item.account != account or item.owner != wallet:
+            continue
+        gain = item.after - item.before
+        if gain < 0:
+            return None
+        return gain
     return None
 
 

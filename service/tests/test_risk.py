@@ -538,7 +538,7 @@ def _guard(tx: UnsignedTransaction, rpc: MockChainRpc, **overrides: object) -> o
         "owned": frozenset({_WALLET, _POOL, _TABLE}),
         "rpc": rpc,
         "quoted_in": 1_000,
-        "quoted_out": 99_999,
+        "quoted_out": 2_000,
         "quoted_minimum": 1_900,
         "input_account": _POOL,
         "output_account": _TABLE,

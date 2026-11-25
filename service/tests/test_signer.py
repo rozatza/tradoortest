@@ -28,7 +28,7 @@ from app.risk.route_ix import (
 )
 from app.risk.rpc import HttpChainRpc, MockChainRpc, RpcError, Simulation, TokenDelta
 from app.risk.signer import USDC_MINT, LiveContext, reset_guarded
-from app.venue.errors import VenueExecuteDisabled, VenueRejected
+from app.venue.errors import VenueError, VenueExecuteDisabled, VenueRejected
 from app.venue.mock import MockVenue
 from app.venue.tx import assemble_unsigned, split_transaction
 from app.venue.types import AccountRole, DecodedInstruction, VenueExpiry, VenueQuote
@@ -439,6 +439,151 @@ def test_send_is_reachable_only_when_live_trading_is_exactly_1(
     assert seen == ["sendTransaction"]
 
 
+def test_a_hostile_quote_cannot_shrink_min_out_below_the_simulated_gain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR case 4. Quote and instruction agree on 1. The simulation gains 25_000_000."""
+    client, rpc, store = _open(
+        tmp_path,
+        monkeypatch,
+        name="spoof",
+        out_amount=1,
+        minimum=1,
+        quoted_out=1,
+        sim_out=_OUT,
+    )
+    spoofed = client.post("/live/prepare", json=_intent(), headers=_headers())
+    assert spoofed.status_code == 422
+    assert spoofed.json()["code"] == "min_out"
+    assert spoofed.json()["sent"] is False
+    assert "send" not in rpc.calls
+    store.close()
+    mismatched, mismatched_rpc, mismatched_store = _open(
+        tmp_path,
+        monkeypatch,
+        name="quoted",
+        out_amount=_OUT,
+        minimum=1,
+        quoted_out=1,
+    )
+    disagreed = mismatched.post("/live/prepare", json=_intent(), headers=_headers())
+    assert disagreed.status_code == 422
+    assert disagreed.json()["code"] == "amount_mismatch"
+    assert "send" not in mismatched_rpc.calls
+    mismatched_store.close()
+    # 100 bps of 10_000 is 9_900. Gain 10_001 still clears that floor. Gain 10_002 does not.
+    edge = 10_001
+    price = (Decimal(_IN) / Decimal(10**6)) / (Decimal(edge) / Decimal(10**9))
+    passed, _passed_rpc, passed_store = _open(
+        tmp_path,
+        monkeypatch,
+        name="edge",
+        out_amount=10_000,
+        minimum=9_900,
+        quoted_out=10_000,
+        instruction_slippage=100,
+        sim_out=edge,
+        bar_price=price,
+    )
+    allowed = passed.post("/live/prepare", json=_intent(), headers=_headers())
+    assert allowed.status_code == 200, allowed.json()
+    assert allowed.json()["trade"]["minimum_out_amount"] == 9_900
+    passed_store.close()
+    refused, refused_rpc, refused_store = _open(
+        tmp_path,
+        monkeypatch,
+        name="over",
+        out_amount=10_000,
+        minimum=9_900,
+        quoted_out=10_000,
+        instruction_slippage=100,
+        sim_out=edge + 1,
+        bar_price=price,
+    )
+    over = refused.post("/live/prepare", json=_intent(), headers=_headers())
+    assert over.status_code == 422
+    assert over.json()["code"] == "min_out"
+    assert "send" not in refused_rpc.calls
+    refused_store.close()
+    fresh, fresh_rpc, fresh_store = _open(tmp_path, monkeypatch, name="confirm-gain")
+    grown = _GainOnVerify(fresh_rpc, 25_126_264)
+    fresh.app.state.live_context = _swap_rpc(fresh.app.state.live_context, grown)
+    prepared = fresh.post("/live/prepare", json=_intent(), headers=_headers())
+    assert prepared.status_code == 200, prepared.json()
+    blocked = fresh.post(
+        "/live/confirm",
+        json={
+            "pending_id": prepared.json()["pending_id"],
+            "signed_transaction_b64": _sign(prepared.json()["transaction_b64"]),
+        },
+        headers=_headers(),
+    )
+    assert blocked.status_code == 422
+    assert blocked.json()["code"] == "min_out"
+    assert "send" not in grown.calls
+    fresh_store.close()
+
+
+def test_a_failed_send_keeps_the_booked_notional_and_fees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, rpc, store = _open(tmp_path, monkeypatch, name="sendfail")
+
+    def timeout(_tx: bytes) -> str:
+        raise VenueError("timeout")
+
+    rpc.send = timeout  # type: ignore[method-assign]
+    prepared = client.post("/live/prepare", json=_intent(), headers=_headers())
+    assert prepared.status_code == 200
+    failed = client.post(
+        "/live/confirm",
+        json={
+            "pending_id": prepared.json()["pending_id"],
+            "signed_transaction_b64": _sign(prepared.json()["transaction_b64"]),
+        },
+        headers=_headers(),
+    )
+    assert failed.status_code == 503
+    assert failed.json()["code"] == "send_failed"
+    assert failed.json()["sent"] is False
+    store.close()
+    fresh = SqliteBarStore(tmp_path / "sendfail.sqlite")
+    booked = take_day(_DAY, fresh)
+    assert booked.notional_usd == Decimal("2.5")
+    assert booked.network_lamports == 5_000
+    assert booked.priority_lamports == 1_000
+    assert booked.rent_lamports == 1_000_000
+    fresh.close()
+    again, _again_rpc, again_store = _open(tmp_path, monkeypatch, name="sendfail")
+    seen = again.post("/live/prepare", json=_intent(), headers=_headers())
+    assert seen.status_code == 200
+    assert take_day(_DAY, again_store).notional_usd == Decimal("2.5")
+    again_store.close()
+    crashed, crash_rpc, crash_store = _open(tmp_path, monkeypatch, name="crash")
+
+    def die(_tx: bytes) -> str:
+        raise KeyboardInterrupt("process dies after send")
+
+    crash_rpc.send = die  # type: ignore[method-assign]
+    prepared = crashed.post("/live/prepare", json=_intent(), headers=_headers())
+    assert prepared.status_code == 200
+    with pytest.raises(BaseException):
+        crashed.post(
+            "/live/confirm",
+            json={
+                "pending_id": prepared.json()["pending_id"],
+                "signed_transaction_b64": _sign(prepared.json()["transaction_b64"]),
+            },
+            headers=_headers(),
+        )
+    crash_store.close()
+    reopened = SqliteBarStore(tmp_path / "crash.sqlite")
+    kept = take_day(_DAY, reopened)
+    assert kept.notional_usd == Decimal("2.5")
+    assert kept.fee_total_lamports() == 1_006_000
+    reopened.close()
+
+
 def test_the_signer_source_has_no_keypair() -> None:
     banned = ("Keypair", "from_seed", "nacl", "solders", "private_key", "secret_key", "mnemonic")
     roots = [Path("app/risk"), Path("app/venue")]
@@ -455,6 +600,43 @@ def test_the_signer_source_has_no_keypair() -> None:
             text = path.read_text()
             for word in (*banned, "privateKey", "secretKey"):
                 assert word not in text, f"{path} contains {word}"
+
+
+class _GainOnVerify(MockChainRpc):
+    def __init__(self, source: MockChainRpc, gained: int) -> None:
+        super().__init__(
+            height=source._height,
+            simulation=source._simulation,
+            accounts=source._accounts,
+            holdings=source._holdings,
+        )
+        self._gained = gained
+
+    def simulate(
+        self,
+        transaction: bytes,
+        accounts: object,
+        *,
+        sig_verify: bool = False,
+    ) -> Simulation:
+        found = super().simulate(transaction, accounts, sig_verify=sig_verify)  # type: ignore[arg-type]
+        if not sig_verify:
+            return found
+        deltas = []
+        for item in found.deltas:
+            if item.owner == _WALLET and item.after > item.before and item.mint == SOL_MINT:
+                gained = item.before + self._gained
+                deltas.append(TokenDelta(item.account, item.mint, item.owner, item.before, gained))
+            else:
+                deltas.append(item)
+        return Simulation(
+            found.err,
+            tuple(deltas),
+            found.authorities_before,
+            found.authorities_after,
+            found.lamports_before,
+            found.lamports_after,
+        )
 
 
 class _KillOnVerify(MockChainRpc):
@@ -547,6 +729,7 @@ def _open(
     side: str = "buy",
     in_amount: int = _IN,
     out_amount: int = _OUT,
+    sim_out: int | None = None,
     minimum: int = _MIN,
     bar_price: Decimal = Decimal("100"),
     drop: int = 1_006_000,
@@ -570,7 +753,7 @@ def _open(
     rpc = _rpc(
         output_mint=output_mint,
         in_amount=in_amount,
-        out_amount=out_amount,
+        out_amount=out_amount if sim_out is None else sim_out,
         wallet_lamports=wallet_lamports,
         holdings=holdings,
         freeze=freeze,
