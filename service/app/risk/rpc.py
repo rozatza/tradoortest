@@ -63,6 +63,8 @@ class Simulation:
     unparsed: tuple[str, ...] = ()
     controls_changed: tuple[str, ...] = ()
     closed: tuple[str, ...] = ()
+    created: tuple[tuple[str, str, bytes, bytes], ...] = ()
+    controlled: tuple[str, ...] = ()
 
 
 class ChainRpc(Protocol):
@@ -283,6 +285,8 @@ def _simulation_from(
     unparsed: list[str] = []
     controls_changed: list[str] = []
     closed: list[str] = []
+    created: list[tuple[str, str, bytes, bytes]] = []
+    controlled: list[str] = []
     for address, prior, row in zip(accounts, before, after_rows, strict=True):
         if address in KNOWN_PROGRAMS:
             continue
@@ -296,21 +300,34 @@ def _simulation_from(
         lamports, data = _account_value(row)
         lamports_after.append((address, lamports))
         _note_unparsed(address, data, unparsed)
-        if prior is None or address in unparsed:
+        if address in unparsed:
+            continue
+        next_token = _token_amount(data)
+        if prior is None:
+            if next_token is not None:
+                created.append(
+                    (address, next_token.owner, next_token.delegate, next_token.close_authority)
+                )
+                if _controls_set(next_token):
+                    controlled.append(address)
+            continue
+        prior_token = _token_amount(prior[1])
+        if prior_token is not None and next_token is None:
+            closed.append(address)
             continue
         prior_auth = _mint_authorities(prior[1])
         next_auth = _mint_authorities(data)
         if prior_auth is not None and next_auth is not None:
             authorities_before.append(AuthorityView(address, prior_auth[0], prior_auth[1]))
             authorities_after.append(AuthorityView(address, next_auth[0], next_auth[1]))
-        prior_token = _token_amount(prior[1])
-        next_token = _token_amount(data)
         if prior_token is None or next_token is None:
             continue
         if prior_token.owner != next_token.owner:
             owner_changed.append(address)
         if _controls_differ(prior_token, next_token):
             controls_changed.append(address)
+        if _controls_set(prior_token) or _controls_set(next_token):
+            controlled.append(address)
         deltas.append(
             TokenDelta(
                 address,
@@ -331,6 +348,8 @@ def _simulation_from(
         tuple(unparsed),
         tuple(controls_changed),
         tuple(closed),
+        tuple(created),
+        tuple(controlled),
     )
 
 
@@ -361,6 +380,11 @@ def _note_unparsed(address: str, data: bytes, found: list[str]) -> None:
         return
     if len(data) == 165 and _token_amount(data) is None:
         found.append(address)
+
+
+def _controls_set(view: TokenView) -> bool:
+    """A delegate or a close authority is set. An empty tag is ``b""``."""
+    return view.delegate != b"" or view.close_authority != b""
 
 
 def _controls_differ(left: TokenView, right: TokenView) -> bool:

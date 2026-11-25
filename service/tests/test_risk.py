@@ -1231,6 +1231,66 @@ def test_a_delegate_or_close_authority_change_is_rejected() -> None:
     assert _decide(changed).code == "authority_change"
 
 
+def _swap_rows(
+    *,
+    input_before: bytes | None = None,
+    input_after: bytes | None = None,
+    output_before: bytes | None = None,
+    output_after: bytes | None = None,
+    extra: tuple[str, tuple[int, bytes] | None, bytes | None] | None = None,
+) -> Simulation:
+    before_input = input_before or _token_bytes(SOL_MINT, _WALLET, 5_000)
+    after_input = input_after or _token_bytes(SOL_MINT, _WALLET, 4_000)
+    before_output = output_before or _token_bytes(_USDC, _WALLET, 0)
+    after_output = output_after or _token_bytes(_USDC, _WALLET, 1_900)
+    accounts = [_WALLET, _POOL, _TABLE]
+    before: list[tuple[int, bytes] | None] = [
+        (1_000_000, b""),
+        (2_039_280, before_input),
+        (2_039_280, before_output),
+    ]
+    after: list[object] = [
+        _rpc_row(995_000, b""),
+        _rpc_row(2_039_280, after_input),
+        _rpc_row(2_039_280, after_output),
+    ]
+    if extra is not None:
+        accounts.append(extra[0])
+        before.append(extra[1])
+        after.append(None if extra[2] is None else _rpc_row(2_039_280, extra[2]))
+    return _simulation_from(tuple(accounts), before, after, None)
+
+
+def test_a_new_token_account_cannot_carry_a_delegate_or_close_authority() -> None:
+    granted = _token_bytes(_USDC, _WALLET, 0, delegate=_PROGRAM, delegated=2**64 - 1)
+    assert _decide(_swap_rows(extra=(_OTHER, None, granted))).code == "authority_change"
+    closing = _token_bytes(_USDC, _WALLET, 0, close=_PROGRAM)
+    assert _decide(_swap_rows(extra=(_OTHER, None, closing))).code == "authority_change"
+    clean = _token_bytes(_USDC, _WALLET, 0)
+    assert _decide(_swap_rows(extra=(_OTHER, None, clean))).accepted is True
+
+
+def test_input_and_output_reject_a_delegate_that_does_not_change() -> None:
+    held = dict(delegate=_PROGRAM, delegated=100)
+    before = _token_bytes(SOL_MINT, _WALLET, 5_000, **held)
+    after = _token_bytes(SOL_MINT, _WALLET, 4_000, **held)
+    assert _decide(_swap_rows(input_before=before, input_after=after)).code == "authority_change"
+    output_before = _token_bytes(_USDC, _WALLET, 0, close=_PROGRAM)
+    output_after = _token_bytes(_USDC, _WALLET, 1_900, close=_PROGRAM)
+    decided = _swap_rows(output_before=output_before, output_after=output_after)
+    assert _decide(decided).code == "authority_change"
+
+
+def test_a_token_account_that_stops_parsing_is_closed() -> None:
+    prior = (2_039_280, _token_bytes(SOL_MINT, _WALLET, 500_000_000))
+    emptied = _decide(_swap_rows(extra=(_OTHER, prior, b"")))
+    assert emptied.code == "account_closed"
+    bad = bytearray(_token_bytes(SOL_MINT, _WALLET, 500_000_000))
+    bad[72] = 2
+    unverified = _decide(_swap_rows(extra=(_OTHER, prior, bytes(bad))))
+    assert unverified.code == "amount_unverified"
+
+
 def test_a_negative_notional_does_not_rewind_the_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

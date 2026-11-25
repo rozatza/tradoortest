@@ -329,6 +329,11 @@ def _simulated(
         return GuardDecision(False, "mint_mismatch")
     if simulation.owner_changed or simulation.controls_changed:
         return GuardDecision(False, "authority_change")
+    if _created_authority(simulation, wallet, input_account, output_account):
+        return GuardDecision(False, "authority_change")
+    watched = (input_account, output_account)
+    if any(account in watched for account in simulation.controlled):
+        return GuardDecision(False, "authority_change")
     before = {item.account: item for item in simulation.authorities_before}
     after = {item.account: item for item in simulation.authorities_after}
     if set(before) != set(after):
@@ -370,6 +375,24 @@ def _simulated(
     if drop > limits.max_fee_lamports:
         return GuardDecision(False, "per_tx_fee")
     return GuardDecision(True, "ok")
+
+
+def _created_authority(
+    simulation: Simulation,
+    wallet: str,
+    input_account: str,
+    output_account: str,
+) -> bool:
+    """A token account born in this transaction must not grant a delegate.
+
+    Wallet-owned accounts, and the input and output accounts, are checked.
+    An account owned by someone else is not this wallet's authority.
+    """
+    for account, owner, delegate, close_authority in simulation.created:
+        watched = owner == wallet or account in (input_account, output_account)
+        if watched and (delegate != b"" or close_authority != b""):
+            return True
+    return False
 
 
 def _index(keys: tuple[str, ...], program_id: str) -> int | None:
