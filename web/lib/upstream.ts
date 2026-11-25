@@ -339,6 +339,42 @@ async function forward(
   return sendUpstream(path, method, accept, text);
 }
 
+const LIVE_PATHS = new Set(["/live/prepare", "/live/confirm", "/live/flatten"]);
+const MAX_LIVE_BODY_BYTES = 8_192;
+
+/**
+ * Forward one live control call. The browser does not supply the token or
+ * the Origin. Both are set here, and the token is not copied into the
+ * response.
+ */
+export async function forwardLive(path: string, request: Request): Promise<Response> {
+  if (!LIVE_PATHS.has(path)) {
+    return jsonError(404, "not_found", "that live route is not proxied");
+  }
+  const token = process.env.LIVE_CONTROL_TOKEN;
+  if (typeof token !== "string" || token === "" || /[\u0000-\u001f\u007f]/.test(token)) {
+    return jsonError(503, "service_unavailable", "live control is not configured");
+  }
+  const capped = await readCappedBody(request, MAX_LIVE_BODY_BYTES);
+  if (capped instanceof Response) {
+    return capped;
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(capped);
+    const payload: unknown = JSON.parse(text);
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      return jsonError(422, "invalid_json", "request body must be a JSON object");
+    }
+  } catch {
+    return jsonError(422, "invalid_json", "request body is not JSON");
+  }
+  return sendUpstream(path, "POST", "application/json", text, {
+    origin: "http://127.0.0.1",
+    "x-live-token": token,
+  });
+}
+
 async function sendUpstream(
   path: string,
   method: string,

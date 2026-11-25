@@ -89,6 +89,7 @@ from app.risk.programs import (
     TOKEN_PROGRAM,
     TOKEN_TRANSFER_CHECKED,
 )
+from app.risk.route_ix import encode_route_v2
 from app.risk.rpc import (
     AuthorityView,
     HttpChainRpc,
@@ -101,6 +102,7 @@ from app.risk.rpc import (
     default_rpc,
     parse_lookup_table,
 )
+from app.risk.signer import reset_guarded
 from app.venue.address import address_bytes
 from app.venue.errors import VenueExecuteDisabled
 from app.venue.flags import live_trading_enabled
@@ -132,6 +134,7 @@ def _reset(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_day_ledger()
     reset_process_halt()
     pending_book().reset()
+    reset_guarded()
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
     monkeypatch.delenv("LIVE_KILL_FILE", raising=False)
     monkeypatch.delenv("LIVE_KILL", raising=False)
@@ -494,7 +497,7 @@ def _swap(*extra: DecodedInstruction) -> tuple[DecodedInstruction, ...]:
             AccountRole(SOL_MINT, False, False),
             AccountRole(_USDC, False, False),
         ),
-        b"\x01",
+        encode_route_v2(in_amount=1_000, quoted_out=2_000, slippage_bps=50),
     )
     return (*extra, jupiter)
 
@@ -535,7 +538,7 @@ def _guard(tx: UnsignedTransaction, rpc: MockChainRpc, **overrides: object) -> o
         "owned": frozenset({_WALLET, _POOL, _TABLE}),
         "rpc": rpc,
         "quoted_in": 1_000,
-        "quoted_out": 99_999,
+        "quoted_out": 2_000,
         "quoted_minimum": 1_900,
         "input_account": _POOL,
         "output_account": _TABLE,
@@ -870,36 +873,35 @@ def test_control_routes_require_host_origin_and_token(
     assert path.read_bytes() == b"1"
     assert calls["flatten"] == 0
     assert pending_book().open_rows() == ()
-    missing = client.post("/live/submit", json=_body(), headers={"origin": "http://127.0.0.1"})
+    missing = client.post("/live/submit", json=_intent(), headers={"origin": "http://127.0.0.1"})
     assert missing.status_code == 403
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
-    off = client.post("/live/submit", json=_body(), headers=headers)
+    off = client.post("/live/submit", json=_intent(), headers=headers)
     assert off.status_code == 409
     assert off.json()["code"] == "trading_disabled"
+    assert off.json()["sent"] is False
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
     path.write_bytes(b"0")
     reset_process_halt()
-    slipped = client.post("/live/submit", json=_body(slippage_bps=51), headers=headers)
-    assert slipped.status_code == 422
-    assert slipped.json()["code"] == "slippage_param"
-    assert slipped.json()["resized"] is False
-    bare = client.post("/live/submit", json=_body(), headers=headers)
-    assert bare.status_code == 422
-    assert bare.json()["code"] == "missing_transaction"
-    assert bare.json()["sent"] is False
-    assert pending_book().open_rows() == ()
-    assert take_day(_DAY, store).notional_usd == Decimal("0")
-    save_day(DayLedger(_DAY, notional_usd=Decimal("8")), store)
-    over = client.post("/live/submit", json=_body(), headers=headers)
-    assert over.json()["code"] == "daily_notional"
-    again = client.post("/live/submit", json=_body(notional_usd="1"), headers=headers)
-    assert again.json()["code"] == "daily_halt"
+    payloads = {
+        "/live/prepare": _intent(),
+        "/live/confirm": {"pending_id": 1, "signed_transaction_b64": "AA=="},
+        "/live/flatten": _intent(),
+    }
+    for path_name, payload in payloads.items():
+        denied = client.post(path_name, json=payload, headers={"origin": "https://evil.example"})
+        assert denied.status_code == 403
+    unconfigured = client.post("/live/prepare", json=_intent(), headers=headers)
+    assert unconfigured.status_code == 409
+    assert unconfigured.json()["code"] == "wallet_unconfigured"
+    assert unconfigured.json()["sent"] is False
     monkeypatch.setattr("app.risk.routes.apply_flatten", apply_flatten_restore())
-    flat = client.post("/live/flatten", json=_body(side="sell", action="flatten"), headers=headers)
-    assert flat.status_code == 200
+    flat_body = _intent(side="sell", action="flatten")
+    flat = client.post("/live/flatten", json=flat_body, headers=headers)
+    assert flat.status_code == 409
     assert flat.json()["flattened"] is True
     assert flat.json()["sent"] is False
-    assert flat.json()["accepted"] is True
+    assert flat.json()["code"] == "wallet_unconfigured"
     assert host_allowed("evil.example") is False
     assert origin_allowed(None) is False
     assert origin_allowed("http://127.0.0.1") is True
@@ -915,31 +917,12 @@ def apply_flatten_restore():
     return apply_flatten
 
 
-def _body(**overrides: object) -> dict[str, object]:
+def _intent(**overrides: object) -> dict[str, object]:
     body: dict[str, object] = {
         "side": "buy",
         "action": "entry",
         "mint": SOL_MINT,
-        "notional_usd": "2.50",
-        "slippage_bps": 50,
-        "price_impact": "-0.1",
-        "pool_liquidity_usd": "100000",
-        "pool_age_seconds": 200_000,
-        "freeze_authority_set": False,
-        "mint_authority_set": False,
-        "sell_route_ok": True,
-        "sell_route_impact": "0.1",
-        "bar_age_bars": 0,
-        "bar_price": "100",
-        "quote_price": "100",
-        "open_positions": 0,
-        "asset_already_open": False,
-        "network_fee_lamports": 5_000,
-        "priority_fee_lamports": 1_000,
-        "rent_lamports": 0,
-        "wallet_value_usd": "20",
-        "out_amount": 10_000,
-        "minimum_out_amount": 9_950,
+        "amount": 2_500_000,
     }
     body.update(overrides)
     return body
@@ -974,11 +957,17 @@ def test_a_future_day_cannot_reset_a_halted_ledger(
     client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
     headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
     try:
-        future = client.post("/live/submit", json=_body(), headers=headers)
+        monkeypatch.setenv("LIVE_WALLET_PUBKEY", _WALLET)
+        future = client.post("/live/submit", json=_intent(), headers=headers)
         assert future.status_code == 422
         assert future.json()["accepted"] is False
         assert future.json()["code"] == "daily_halt"
-        dated = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        assert future.json()["sent"] is False
+        dated = client.post(
+            "/live/submit",
+            json={**_intent(), "day": "2026-11-26"},
+            headers=headers,
+        )
         assert dated.status_code == 422
         row = store.read_live_day()
         assert row is not None
@@ -995,9 +984,10 @@ def test_a_future_day_cannot_reset_a_halted_ledger(
         booked = SqliteBarStore(tmp_path / "booked.sqlite")
         save_day(DayLedger(_DAY, notional_usd=Decimal("2.50")), booked)
         app.state.live_day_store = booked
-        missed = client.post("/live/submit", json=_body(), headers=headers)
-        assert missed.status_code == 422
-        assert missed.json()["code"] == "missing_transaction"
+        missed = client.post("/live/submit", json=_intent(), headers=headers)
+        assert missed.status_code == 503
+        assert missed.json()["code"] == "unconfigured"
+        assert missed.json()["sent"] is False
         kept = booked.read_live_day()
         assert kept is not None
         assert kept[0] == _DAY
@@ -1238,6 +1228,8 @@ def _swap_rows(
     output_before: bytes | None = None,
     output_after: bytes | None = None,
     extra: tuple[str, tuple[int, bytes] | None, bytes | None] | None = None,
+    wallet_before: int = 1_000_000,
+    wallet_after: int = 995_000,
 ) -> Simulation:
     before_input = input_before or _token_bytes(SOL_MINT, _WALLET, 5_000)
     after_input = input_after or _token_bytes(SOL_MINT, _WALLET, 4_000)
@@ -1245,12 +1237,12 @@ def _swap_rows(
     after_output = output_after or _token_bytes(_USDC, _WALLET, 1_900)
     accounts = [_WALLET, _POOL, _TABLE]
     before: list[tuple[int, bytes] | None] = [
-        (1_000_000, b""),
+        (wallet_before, b""),
         (2_039_280, before_input),
         (2_039_280, before_output),
     ]
     after: list[object] = [
-        _rpc_row(995_000, b""),
+        _rpc_row(wallet_after, b""),
         _rpc_row(2_039_280, after_input),
         _rpc_row(2_039_280, after_output),
     ]
@@ -1267,7 +1259,13 @@ def test_a_new_token_account_cannot_carry_a_delegate_or_close_authority() -> Non
     closing = _token_bytes(_USDC, _WALLET, 0, close=_PROGRAM)
     assert _decide(_swap_rows(extra=(_OTHER, None, closing))).code == "authority_change"
     clean = _token_bytes(_USDC, _WALLET, 0)
-    assert _decide(_swap_rows(extra=(_OTHER, None, clean))).accepted is True
+    rent = 2_039_280
+    paid = _swap_rows(
+        extra=(_OTHER, None, clean),
+        wallet_before=1_000_000 + rent,
+        wallet_after=995_000,
+    )
+    assert _decide(paid).accepted is True
 
 
 def test_input_and_output_reject_a_delegate_that_does_not_change() -> None:
@@ -1323,16 +1321,19 @@ def test_a_negative_notional_does_not_rewind_the_day(
     client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
     headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
     try:
-        negative = client.post("/live/submit", json=_body(notional_usd="-100"), headers=headers)
+        monkeypatch.setenv("LIVE_WALLET_PUBKEY", _WALLET)
+        negative = client.post(
+            "/live/submit",
+            json={**_intent(), "notional_usd": "-100"},
+            headers=headers,
+        )
         assert negative.status_code == 422
-        assert negative.json()["code"] == "missing_mark"
         charged = client.post(
             "/live/submit",
-            json=_body(network_fee_lamports=-1),
+            json={**_intent(), "network_fee_lamports": -1},
             headers=headers,
         )
         assert charged.status_code == 422
-        assert charged.json()["code"] == "per_tx_fee"
         row = store.read_live_day()
         assert row is not None
         assert Decimal(str(row[1])) == Decimal("9.99")

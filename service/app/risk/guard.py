@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import struct
 
+from app.risk.fees import FeeLines, split_lamport_drop
 from app.risk.limits import DEFAULT_LIMITS, RiskLimits
 from app.risk.programs import (
     ALLOWED_PROGRAMS,
@@ -32,6 +33,7 @@ from app.risk.programs import (
     TOKEN_TRANSFER,
     TOKEN_TRANSFER_CHECKED,
 )
+from app.risk.route_ix import RouteTerms, decode_jupiter_route
 from app.risk.rpc import ChainRpc, Simulation
 from app.venue.address import address_bytes
 from app.venue.errors import VenueError
@@ -40,11 +42,16 @@ from app.venue.types import AccountRole, DecodedInstruction, UnsignedTransaction
 
 
 class GuardDecision:
-    """A rejected transaction is not resized and not signed."""
+    """A rejected transaction is not resized and not signed.
 
-    def __init__(self, accepted: bool, code: str) -> None:
+    ``fees`` is set only when the simulation's wallet lamport drop was
+    split into network, priority, and rent. It is not a client number.
+    """
+
+    def __init__(self, accepted: bool, code: str, fees: FeeLines | None = None) -> None:
         self.accepted = accepted
         self.code = code
+        self.fees = fees
 
     def __repr__(self) -> str:
         return f"GuardDecision({self.accepted!r}, {self.code!r})"
@@ -65,7 +72,11 @@ def guard_unsigned(
     output_mint: str,
     limits: RiskLimits | None = None,
 ) -> GuardDecision:
-    """Check ``tx.transaction``. Quote-copied amount fields are ignored."""
+    """Check ``tx.transaction``. Copied quote fields on ``tx`` are ignored.
+
+    ``quoted_out`` is the venue quote. The route must name that amount,
+    and its min-out must cover the simulated gain at the slippage cap.
+    """
     chosen = DEFAULT_LIMITS if limits is None else limits
     known = set(owned)
     known.add(wallet)
@@ -84,6 +95,9 @@ def guard_unsigned(
     decoded = _decoded_transfer_amount(instructions)
     if decoded is not None and decoded != quoted_in:
         return GuardDecision(False, "amount_mismatch")
+    route = _route_terms(instructions, quoted_in, quoted_out, quoted_minimum, chosen)
+    if isinstance(route, str):
+        return GuardDecision(False, route)
     if rpc is None:
         return GuardDecision(False, "missing_rpc")
     try:
@@ -101,6 +115,7 @@ def guard_unsigned(
         input_mint,
         output_mint,
         chosen,
+        instructions,
     )
 
 
@@ -257,6 +272,86 @@ def _token(
     return "instruction"
 
 
+def _route_terms(
+    instructions: tuple[DecodedInstruction, ...],
+    quoted_in: int,
+    quoted_out: int,
+    quoted_minimum: int,
+    limits: RiskLimits,
+) -> RouteTerms | str | None:
+    """Refuse a Jupiter route whose min-out or slippage is outside the cap.
+
+    A transaction with no Jupiter instruction is left to the simulation.
+    One that names Jupiter must decode. Minimum-out ``0`` is refused
+    even when the slippage field would also fail. The instruction's
+    quoted out must be the venue quote's out amount.
+    """
+    decoded = _one_route(instructions)
+    if decoded is None:
+        return None
+    if isinstance(decoded, str):
+        return decoded
+    if decoded.min_out <= 0:
+        return "min_out"
+    if decoded.in_amount != quoted_in:
+        return "amount_mismatch"
+    if decoded.slippage_bps > limits.max_slippage_bps:
+        return "slippage"
+    if decoded.quoted_out != quoted_out:
+        return "amount_mismatch"
+    floor = decoded.quoted_out - decoded.quoted_out * limits.max_slippage_bps // 10_000
+    if decoded.min_out < floor or decoded.min_out < quoted_minimum:
+        return "min_out"
+    return decoded
+
+
+def simulated_min_out(
+    instructions: tuple[DecodedInstruction, ...],
+    *,
+    quote_out: int,
+    gained: int,
+    limits: RiskLimits,
+) -> str | None:
+    """Bind min-out to the simulated gain, not to the route's own numbers.
+
+    ``quote_out`` must equal the instruction's quoted out. Min-out must
+    be at least ``gained * (10_000 - cap) // 10_000``. That product is
+    integer division, so a float cannot round the floor down.
+    """
+    decoded = _one_route(instructions)
+    if decoded is None:
+        return None
+    if isinstance(decoded, str):
+        return decoded
+    if isinstance(quote_out, bool) or not isinstance(quote_out, int):
+        return "amount_mismatch"
+    if decoded.quoted_out != quote_out:
+        return "amount_mismatch"
+    if isinstance(gained, bool) or not isinstance(gained, int) or gained < 0:
+        return "min_out"
+    cap = limits.max_slippage_bps
+    required = gained * (10_000 - cap) // 10_000
+    if decoded.min_out < required:
+        return "min_out"
+    return None
+
+
+def _one_route(
+    instructions: tuple[DecodedInstruction, ...],
+) -> RouteTerms | str | None:
+    routes = [item for item in instructions if item.program_id == JUPITER_V6_PROGRAM]
+    if not routes:
+        return None
+    if len(routes) != 1:
+        return "route_undecoded"
+    decoded = decode_jupiter_route(routes[0].data)
+    if isinstance(decoded, str):
+        return decoded
+    if decoded is None:
+        return "route_undecoded"
+    return decoded
+
+
 def _decoded_transfer_amount(instructions: tuple[DecodedInstruction, ...]) -> int | None:
     """Sum outer token transfers. ``None`` when the swap is not that shape.
 
@@ -319,8 +414,8 @@ def _simulated(
     input_mint: str,
     output_mint: str,
     limits: RiskLimits,
+    instructions: tuple[DecodedInstruction, ...],
 ) -> GuardDecision:
-    del quoted_out
     if simulation.err is not None:
         return GuardDecision(False, "simulation_failed")
     if simulation.unparsed:
@@ -365,6 +460,14 @@ def _simulated(
     gained = received.after - received.before
     if gained < quoted_minimum:
         return GuardDecision(False, "amount_mismatch")
+    bound = simulated_min_out(
+        instructions,
+        quote_out=quoted_out,
+        gained=gained,
+        limits=limits,
+    )
+    if bound is not None:
+        return GuardDecision(False, bound)
     lamports_before = dict(simulation.lamports_before)
     lamports_after = dict(simulation.lamports_after)
     if wallet not in lamports_before or wallet not in lamports_after:
@@ -372,9 +475,31 @@ def _simulated(
     if lamports_after[wallet] <= 0:
         return GuardDecision(False, "per_tx_fee")
     drop = lamports_before[wallet] - lamports_after[wallet]
-    if drop > limits.max_fee_lamports:
+    if drop < 0 or drop > limits.max_fee_lamports:
         return GuardDecision(False, "per_tx_fee")
-    return GuardDecision(True, "ok")
+    rent = _rent(simulation, wallet)
+    if rent is None:
+        return GuardDecision(False, "per_tx_fee")
+    fees = split_lamport_drop(drop, rent=rent, signatures=1)
+    if fees is None or fees.total_lamports() != drop:
+        return GuardDecision(False, "per_tx_fee")
+    return GuardDecision(True, "ok", fees)
+
+
+def _rent(simulation: Simulation, wallet: str) -> int | None:
+    """Lamports other accounts gained. Those are rent, not the fee."""
+    before = dict(simulation.lamports_before)
+    after = dict(simulation.lamports_after)
+    gained = 0
+    for account, end in after.items():
+        if account == wallet:
+            continue
+        start = before.get(account, 0)
+        if end < 0 or start < 0:
+            return None
+        if end > start:
+            gained += end - start
+    return gained
 
 
 def _created_authority(

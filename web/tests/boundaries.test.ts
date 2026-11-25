@@ -13,10 +13,16 @@ const FORBIDDEN = [
   "CacheStorage",
   "NEXT_PUBLIC_",
   "privateKey",
-  "signTransaction",
+  "secretKey",
+  "Keypair",
+  "mnemonic",
   "createWallet",
   "/tools/",
 ];
+
+/** The manual-confirm wallet adapter is the only file that may name this feature. */
+const SIGN_FEATURE = "signTransaction";
+const SIGN_FEATURE_FILE = "lib/live-wallet.ts";
 
 function sourceFiles(dir: string): string[] {
   const found: string[] = [];
@@ -44,10 +50,14 @@ describe("client boundaries", () => {
     const hits: string[] = [];
     for (const file of files) {
       const text = readFileSync(file, "utf8");
+      const relative = path.relative(ROOT, file);
       for (const token of FORBIDDEN) {
         if (text.includes(token)) {
-          hits.push(`${path.relative(ROOT, file)} contains ${token}`);
+          hits.push(`${relative} contains ${token}`);
         }
+      }
+      if (text.includes(SIGN_FEATURE) && relative !== SIGN_FEATURE_FILE) {
+        hits.push(`${relative} contains ${SIGN_FEATURE}`);
       }
     }
     expect(hits).toEqual([]);

@@ -483,6 +483,56 @@ def _is_writable(
     return loaded_index < loaded_writable
 
 
+def zero_signatures(blob: bytes) -> bytes:
+    """The same message with a zero signature block.
+
+    Confirm compares a signed transaction with the guarded message, then
+    decodes that message. Decoding rejects a non-zero signature, so the
+    block is cleared first. The message bytes are not changed.
+    """
+    _sigs, message, count = split_transaction(blob)
+    prefix = len(blob) - len(message)
+    raw = bytearray(blob[:prefix])
+    _count, pos = _read_shortvec(bytes(raw), 0)
+    if _count != count or pos + count * _SIG_LEN != prefix:
+        raise VenueSchemaError("bad_signatures")
+    raw[pos:] = b"\x00" * (prefix - pos)
+    return bytes(raw) + message
+
+
+def split_transaction(blob: bytes) -> tuple[bytes, bytes, int]:
+    """Signature bytes, message bytes, and the signature count.
+
+    The message starts at the version prefix. A non-zero signature is
+    left intact so a signed transaction can be compared with the
+    unsigned message that was guarded. This does not check the signature.
+    """
+    if not isinstance(blob, bytes | bytearray) or not blob:
+        raise VenueSchemaError("truncated_transaction")
+    data = bytes(blob)
+    count, pos = _read_shortvec(data, 0)
+    if count < 1 or count > _MAX_ACCOUNTS:
+        raise VenueSchemaError("bad_signatures")
+    end = pos + count * _SIG_LEN
+    if end > len(data):
+        raise VenueSchemaError("truncated_transaction")
+    return data[pos:end], data[end:], count
+
+
+def message_fee_payer(message: bytes) -> str:
+    """The first static account. That slot is the first signature's pubkey."""
+    if not message or message[0] & 0x80 == 0 or message[0] & 0x7F != 0:
+        raise VenueSchemaError("unsupported_version")
+    if len(message) < 4:
+        raise VenueSchemaError("truncated_transaction")
+    if message[1] < 1:
+        raise VenueSchemaError("bad_signatures")
+    _count, pos = _read_shortvec(message, 4)
+    if pos + 32 > len(message):
+        raise VenueSchemaError("truncated_transaction")
+    return encode(message[pos : pos + 32])
+
+
 def _shortvec(value: int) -> bytes:
     if value < 0 or value > 0xFFFF:
         raise VenueSchemaError("bad_compact")

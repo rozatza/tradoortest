@@ -11,6 +11,8 @@ export default function HomePage() {
         </p>
         <p>
           <a href="/paper">PAPER dashboard</a>
+          {" · "}
+          <a href="/live">Manual confirm</a>
         </p>
       </header>
       <Chat />

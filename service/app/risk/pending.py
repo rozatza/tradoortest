@@ -32,6 +32,20 @@ class PendingBook:
             self._rows.append(row)
             return row
 
+    def finish(self, pending_id: int, status: str) -> bool:
+        """Move one pending row to ``status``. A missing row stays absent."""
+        with self._lock:
+            updated: list[PendingTrade] = []
+            found = False
+            for row in self._rows:
+                if row.pending_id == pending_id and row.status == "pending":
+                    updated.append(replace(row, status=status))
+                    found = True
+                else:
+                    updated.append(row)
+            self._rows = updated
+            return found
+
     def cancel_all(self) -> int:
         """Mark every pending row canceled. Returns how many changed."""
         with self._lock:

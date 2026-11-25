@@ -675,3 +675,57 @@ main.paper {
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   font-size: 0.82rem;
 }
+
+.live {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.live-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+}
+
+.live-form label {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+  color: #3d4638;
+}
+
+.live-form input,
+.live-form select {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #8a9484;
+  border-radius: 0.4rem;
+  background: #fff;
+}
+
+.live-trade {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+
+.live-trade div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.live-trade dt {
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #5c6656;
+}
+
+.live-trade dd {
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}

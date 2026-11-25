@@ -9,6 +9,7 @@ from app.risk.fees import DayLedger
 from app.risk.killfile import kill_file_path, mark_process_halt, write_kill_halt
 from app.risk.limits import RiskLimits
 from app.risk.pending import PendingBook, pending_book
+from app.risk.signer import clear_guarded
 
 
 class KillPersistError(Exception):
@@ -22,6 +23,7 @@ def apply_kill(path: Path | None = None, book: PendingBook | None = None) -> int
     target = kill_file_path() if path is None else path
     book = pending_book() if book is None else book
     canceled = book.cancel_all()
+    clear_guarded()
     if target is None:
         mark_process_halt()
         raise KillPersistError()

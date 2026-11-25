@@ -1,4 +1,4 @@
-"""Host, Origin, and header-token checks for kill, flatten, and submit.
+"""Host, Origin, and header-token checks for every live route.
 
 The local-user seam is not this token. A missing token, a missing
 Origin, or a host outside the loopback allowlist is rejected. The token
