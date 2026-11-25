@@ -1,0 +1,47 @@
+{
+  "synthetic": true,
+  "note": "Synthetic Swap API V2 /order body. Not a live response. No key.",
+  "body": {
+    "mode": "ultra",
+    "inputMint": "So11111111111111111111111111111111111111112",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "inAmount": "100000000",
+    "outAmount": "11680143",
+    "inUsdValue": 15.5,
+    "otherAmountThreshold": "11600000",
+    "priceImpact": -0.1,
+    "swapMode": "ExactIn",
+    "slippageBps": 50,
+    "priceImpactPct": "0.001",
+    "routePlan": [
+      {
+        "swapInfo": {
+          "ammKey": "11111111111111111111111111111111",
+          "label": "Synthetic",
+          "inputMint": "So11111111111111111111111111111111111111112",
+          "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "inAmount": "100000000",
+          "outAmount": "11680143"
+        },
+        "percent": 100,
+        "bps": 10000
+      }
+    ],
+    "feeMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "feeBps": 2,
+    "platformFee": {
+      "amount": "2336",
+      "feeBps": 2,
+      "feeMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    },
+    "signatureFeeLamports": 5000,
+    "signatureFeePayer": null,
+    "router": "metis",
+    "transaction": null,
+    "lastValidBlockHeight": "200000000",
+    "gasless": false,
+    "requestId": "synthetic-order-1",
+    "totalTime": 12,
+    "taker": null
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "synthetic": true,
+  "note": "Synthetic Swap API V2 /build body. Not a live response. No key.",
+  "body": {
+    "inputMint": "So11111111111111111111111111111111111111112",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "inAmount": "100000000",
+    "outAmount": "11680143",
+    "otherAmountThreshold": "11600000",
+    "swapMode": "ExactIn",
+    "slippageBps": 50,
+    "priceImpactPct": "0.001",
+    "routePlan": [
+      {
+        "swapInfo": {
+          "ammKey": "11111111111111111111111111111111",
+          "label": "Synthetic",
+          "inputMint": "So11111111111111111111111111111111111111112",
+          "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "inAmount": "100000000",
+          "outAmount": "11680143"
+        },
+        "percent": 100,
+        "bps": 10000
+      }
+    ],
+    "computeBudgetInstructions": [],
+    "setupInstructions": [],
+    "swapInstruction": {
+      "programId": "3JF3sEqM796hk5WFqA6EtmEwJQ9quALszsfJyvXNQKy3",
+      "accounts": [
+        {
+          "pubkey": "29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2",
+          "isSigner": true,
+          "isWritable": true
+        },
+        {
+          "pubkey": "So11111111111111111111111111111111111111112",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "isSigner": false,
+          "isWritable": false
+        },
+        {
+          "pubkey": "4Ss5JMkXAD9Z7cktFEdrqeMuT6jGMF1pVozTyPHZ6zT4",
+          "isSigner": false,
+          "isWritable": true
+        },
+        {
+          "pubkey": "6k78AbasGMFFrhG95Pj6jQbqkVt7FQMhVgemxJovWKR6",
+          "isSigner": false,
+          "isWritable": false
+        }
+      ],
+      "data": "AQ=="
+    },
+    "cleanupInstruction": null,
+    "otherInstructions": [],
+    "tipInstruction": null,
+    "addressesByLookupTableAddress": {
+      "5bV6jUfhDHCQVA1WfKBUnXUsboJgoKgkzkKcxr3joew5": [
+        "6k78AbasGMFFrhG95Pj6jQbqkVt7FQMhVgemxJovWKR6",
+        "4Ss5JMkXAD9Z7cktFEdrqeMuT6jGMF1pVozTyPHZ6zT4"
+      ]
+    },
+    "transactionVersion": 0,
+    "blockhashWithMetadata": {
+      "blockhash": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+      "lastValidBlockHeight": 200000000,
+      "fetchedAt": {"secs_since_epoch": 1700000000, "nanos_since_epoch": 0}
+    }
+  }
+}
