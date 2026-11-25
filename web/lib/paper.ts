@@ -57,6 +57,51 @@ export type PaperDrift = {
   costs: { commissionBps: string; slippageBps: string } | null;
 };
 
+export type ShadowQuote = {
+  strategyId: string;
+  version: number;
+  openTime: number;
+  assetId: string;
+  side: string;
+  paperOut: string;
+  quotedOut: string | null;
+  priceImpact: string | null;
+  routeLabel: string | null;
+  router: string | null;
+  networkFeeLamports: number | null;
+  priorityFeeLamports: number | null;
+  rentLamports: number | null;
+  latencyMs: number | null;
+  slippageBps: number | null;
+  quoteStatus: string;
+  buildStatus: string;
+  errorCode: string | null;
+};
+
+export type ShadowReport = {
+  enabled: boolean;
+  buildEnabled: boolean;
+  slippageBps: number | null;
+  minIntervalSeconds: string | null;
+  dailyCap: number | null;
+  amountMismatchRate: string | null;
+  buildAttempts: number;
+  amountMismatches: number;
+  quotes: ShadowQuote[];
+};
+
+export const EMPTY_SHADOW: ShadowReport = {
+  enabled: false,
+  buildEnabled: false,
+  slippageBps: null,
+  minIntervalSeconds: null,
+  dailyCap: null,
+  amountMismatchRate: null,
+  buildAttempts: 0,
+  amountMismatches: 0,
+  quotes: [],
+};
+
 export type PaperSnapshot = {
   mode: "paper";
   simulated: true;
@@ -68,6 +113,7 @@ export type PaperSnapshot = {
   driftThreshold: string;
   driftThresholdName: "PAPER_DRIFT_THRESHOLD";
   drift: PaperDrift[];
+  shadow: ShadowReport;
 };
 
 /** Newest page size the dashboard requests. The service default is the same. */
@@ -122,7 +168,15 @@ export function readSnapshot(value: unknown): PaperSnapshot {
     driftThreshold: readText(value.drift_threshold),
     driftThresholdName: "PAPER_DRIFT_THRESHOLD",
     drift: readList(value.drift, readDrift),
+    shadow: value.shadow === undefined ? EMPTY_SHADOW : readShadow(value.shadow),
   };
+}
+
+export function readShadowReport(value: unknown): ShadowReport {
+  if (!isRecord(value) || value.mode !== "shadow" || value.simulated !== true) {
+    throw new Error("shadow report is invalid");
+  }
+  return readShadow(value);
 }
 
 /**
@@ -224,6 +278,49 @@ function readEvent(value: unknown): PaperEvent {
     openTime: readCount(value.open_time),
     kind: readText(value.kind),
     detail: readText(value.detail),
+  };
+}
+
+function readShadow(value: unknown): ShadowReport {
+  if (!isRecord(value) || typeof value.enabled !== "boolean" || typeof value.build_enabled !== "boolean") {
+    throw new Error("paper snapshot is invalid");
+  }
+  return {
+    enabled: value.enabled,
+    buildEnabled: value.build_enabled,
+    slippageBps: readOptionalCount(value.slippage_bps),
+    minIntervalSeconds: readOptionalText(value.min_interval_seconds),
+    dailyCap: readOptionalCount(value.daily_cap),
+    amountMismatchRate: readOptionalText(value.amount_mismatch_rate),
+    buildAttempts: readCount(value.build_attempts),
+    amountMismatches: readCount(value.amount_mismatches),
+    quotes: readList(value.quotes, readShadowQuote),
+  };
+}
+
+function readShadowQuote(value: unknown): ShadowQuote {
+  if (!isRecord(value)) {
+    throw new Error("paper snapshot is invalid");
+  }
+  return {
+    strategyId: readId(value.strategy_id),
+    version: readCount(value.version),
+    openTime: readCount(value.open_time),
+    assetId: readText(value.asset_id),
+    side: readText(value.side),
+    paperOut: readText(value.paper_out),
+    quotedOut: readOptionalText(value.quoted_out),
+    priceImpact: readOptionalText(value.price_impact),
+    routeLabel: readOptionalText(value.route_label),
+    router: readOptionalText(value.router),
+    networkFeeLamports: readOptionalCount(value.network_fee_lamports),
+    priorityFeeLamports: readOptionalCount(value.priority_fee_lamports),
+    rentLamports: readOptionalCount(value.rent_lamports),
+    latencyMs: readOptionalCount(value.latency_ms),
+    slippageBps: readOptionalCount(value.slippage_bps),
+    quoteStatus: readText(value.quote_status),
+    buildStatus: readText(value.build_status),
+    errorCode: readOptionalText(value.error_code),
   };
 }
 

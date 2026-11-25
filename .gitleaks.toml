@@ -1,0 +1,23 @@
+title = "tradoortest"
+
+[extend]
+useDefault = true
+
+# The generic-api-key rule stays on. These four strings are allowlisted only
+# when they are the whole secret and the path is the recorded /build fixture.
+# A different secret in that file, or the same string in another file, is
+# still reported.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Synthetic Swap API fixture pubkeys"
+condition = "AND"
+paths = ['''(^|/)service/tests/fixtures/venue/build\.json$''']
+regexTarget = "secret"
+regexes = [
+  '''^29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2$''',
+  '''^EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v$''',
+  '''^4Ss5JMkXAD9Z7cktFEdrqeMuT6jGMF1pVozTyPHZ6zT4$''',
+  '''^6k78AbasGMFFrhG95Pj6jQbqkVt7FQMhVgemxJovWKR6$''',
+]

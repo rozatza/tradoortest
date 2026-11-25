@@ -16,12 +16,17 @@ from app.venue.pin import QUOTE_TTL_SECONDS
 
 @dataclass(frozen=True, slots=True)
 class QuoteRequest:
-    """One exact-in spot quote. ``side`` is ``buy`` or ``sell``."""
+    """One exact-in spot quote. ``side`` is ``buy`` or ``sell``.
+
+    ``slippage_bps`` is sent on the quote when it is set. It is a request
+    parameter. The risk engine does not read it here.
+    """
 
     input_mint: str
     output_mint: str
     amount: int
     side: str
+    slippage_bps: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,9 @@ class VenueQuote:
     fee_mint: str | None
     fee_amount: int | None
     swap_mode: str
+    network_fee_lamports: int | None = None
+    priority_fee_lamports: int | None = None
+    rent_fee_lamports: int | None = None
 
     def as_record(self) -> dict[str, object]:
         """Fields a store may persist. No provider body and no transaction."""
@@ -75,6 +83,9 @@ class VenueQuote:
             "fee_mint": self.fee_mint,
             "fee_amount": self.fee_amount,
             "swap_mode": self.swap_mode,
+            "network_fee_lamports": self.network_fee_lamports,
+            "priority_fee_lamports": self.priority_fee_lamports,
+            "rent_fee_lamports": self.rent_fee_lamports,
         }
 
 
@@ -149,8 +160,12 @@ class ExecutionVenue(Protocol):
         taker: str,
         now: int,
         block_height: int | None = None,
+        slippage_bps: int | None = None,
     ) -> UnsignedTransaction:
-        """Build an unsigned transaction for a quote the caller accepted."""
+        """Build an unsigned transaction for a quote the caller accepted.
+
+        ``slippage_bps`` is the same request parameter as on the quote.
+        """
 
     def execute(self, transaction: object = None) -> None:
         """Send is not implemented."""
@@ -204,5 +219,8 @@ _RECORD_KEY_ORDER = (
     "fee_mint",
     "fee_amount",
     "swap_mode",
+    "network_fee_lamports",
+    "priority_fee_lamports",
+    "rent_fee_lamports",
 )
 _RECORD_KEYS = frozenset(_RECORD_KEY_ORDER)

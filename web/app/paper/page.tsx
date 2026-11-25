@@ -8,10 +8,13 @@ export default function PaperPage() {
         <h1>Paper dashboard</h1>
         <p className="lede">
           Running paper strategies, positions, stored realized P&L, a labeled mark, the event log,
-          and a backtest-versus-paper drift report. This screen does not send an order.
+          a backtest-versus-paper drift report, and quote-only shadow rows. This screen does not
+          send an order.
         </p>
         <p>
           <a href="/">Author workspace</a>
+          {" · "}
+          <a href="/shadow">Shadow quotes</a>
         </p>
       </header>
       <PaperDashboard />

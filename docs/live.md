@@ -50,7 +50,7 @@ The lifecycle calls the venue twice around the risk engine, because the check ne
 5. The venue or the local RPC submits it.
 6. Confirm and reconcile read the chain.
 
-Shadow mode (P4-03) records the quote next to the paper fill and stops there. It does not build, sign, or send.
+Shadow mode (P4-03) records the quote next to the paper fill. When build is enabled it also requests an unsigned transaction so the amount mismatch between the quote and the build can be counted. It does not sign or send, and it does not keep the transaction bytes.
 
 ## Custody
 
@@ -261,7 +261,7 @@ These are merge and runtime gates. A later task does not skip one because the co
 - P4-04 (the risk engine and the kill switch) merges before any signer PR. P4-05 and P4-06 are blocked on that merge.
 - CI never holds a trading key or a venue API key, and it never sends a transaction. Tests use a mock venue, or a local validator when a task needs a chain. The workflow does not set `LIVE_TRADING_ENABLED`.
 - gitleaks and trufflehog are required on every PR diff. They are a standing check on the diff. They are not a substitute for the logging and storage rules above.
-- ROZ-107 C-R1 is fixed before `LIVE_FEED_ENABLED` is turned on. C-R1 is the drift-report start point: drift currently backtests from the oldest stored bar, while the broker's start point is fixed at its first tick, so a later backfill of older bars can make recursive indicators diverge and flag false drift. P4-03 is the first Phase 4 task that would run against the live feed, and it leaves the feed off. Live orders depend on that feed, so the same gate sits in front of any live quote.
+- ROZ-107 C-R1 is fixed in P4-03, before `LIVE_FEED_ENABLED` is turned on. Drift and the broker share the origin recorded at the broker's first tick. A later backfill of older bars does not move that origin, so it does not flag a false drift. `LIVE_FEED_ENABLED` stays default-off in this phase. Live orders depend on that feed, so the flag stays off until an operator turns it on.
 - The runtime that can sign is bound to loopback. The auto signer refuses to start otherwise.
 - The canary uses the micro limits in this document. Turning the canary from shadow, to manual confirm, to auto is an operator decision after P4-10's runbook, not a side effect of merging these tasks.
 
@@ -273,7 +273,7 @@ Tasks land in this order: P4-01, P4-02, P4-03, P4-04, then P4-05 and P4-06 in ei
 | --- | --- | --- | --- |
 | P4-01 | ROZ-108 | This design and threat model. Docs only. | Records custody, the lifecycle, the limits, the gates, and the threat-to-task map. No signer, no venue client, no order path. |
 | P4-02 | ROZ-109 | The `ExecutionVenue` interface and the Jupiter Swap API implementation. | The only venue surface. Strict parse of quotes and built transactions. No sign and no send. CI uses a mock and has no key. |
-| P4-03 | ROZ-110 | Quote-only shadow mode beside the paper fill. | Real quotes through the interface, no sign and no send. Bounded venue retries. Quote rows purge at 24 hours. Leaves `LIVE_FEED_ENABLED` off until ROZ-107 C-R1 is fixed. |
+| P4-03 | ROZ-110 | Quote-only shadow mode beside the paper fill. | Real quotes through the interface, no sign and no send. Bounded venue retries. Quote rows purge at 24 hours. Fixes ROZ-107 C-R1 and leaves `LIVE_FEED_ENABLED` default-off. |
 | P4-04 | ROZ-111 | The risk engine and the kill switch. No signer. | The limit table, slippage and impact caps, token gates, the stale-data gate, the wallet-ceiling check, `LIVE_TRADING_ENABLED` defaulting off, `POST /live/kill`, the dead-man halt, and fee/rent amounts kept separate from strategy P&L. Merge gate for both signers. |
 | P4-05 | ROZ-114 | Option A, the manual-confirm signer. | The server builds an unsigned transaction and confirms on-chain. It never sees a key. Pending trades expire after one bar. The risk engine still runs. Blocked on P4-04. |
 | P4-06 | ROZ-112 | Option B, the own-wallet auto signer. Internal only. | CoS generates the keypair on the CoS box. Loopback bind, local auth token, `LIVE_SIGNER=local`, and the startup ceiling refusal. The secret stays out of the repo, logs, sqlite, errors, and CI. Blocked on P4-04. |
@@ -295,7 +295,7 @@ P4-02 re-reads the Jupiter docs and pins the client. The points below are assump
 - **USD mark.** Which price converts a token amount into the $2.50, $10, $5, and $25 checks is decided in P4-04. One mark is used for all four. A missing mark fails closed.
 - **Loss cap versus fees.** The $5 daily realized-loss halt uses strategy P&L and excludes network fees, priority fees, and rent, matching the report split. P4-04 can tighten that if the fee lines should halt on their own.
 - **Ceiling while already running.** The required rule is that startup above $25 refuses. This design also stops new buys on a later tick that measures above the ceiling, and still allows a scheduled sell. P4-04 can choose a stricter full halt instead.
-- **Unspecified numbers.** Slippage bps, price-impact cap, pool liquidity, pool age, stale-bar count N, disagreement percent X, dead-man tick count K, priority fee, and compute budget are set in P4-04 and P4-07. Passing a slippage override to Jupiter can change which routers answer. P4-02 and P4-04 decide whether the request sets one. The risk engine still rejects a quote or a minimum-output that is outside our cap either way.
+- **Unspecified numbers.** Price-impact cap, pool liquidity, pool age, stale-bar count N, disagreement percent X, dead-man tick count K, priority fee, and compute budget are set in P4-04 and P4-07. P4-03 sends `slippageBps` on `/order` and `/build` when the caller sets it (`SHADOW_SLIPPAGE_BPS`, default 50). That value is a request parameter. Passing it can change which routers answer. The risk engine still rejects a quote or a minimum-output that is outside its own cap. The cap is P4-04's.
 - **Authorities on the majors.** This document does not assert that SOL, JUP, JTO, BONK, or WIF currently pass the freeze and mint checks. The checks run. A major that fails is not bought.
 - **API key.** Whether the chosen Jupiter path still answers with no API key is a P4-02 fact. If a key is required, it stays on the box, as [Key handling](#key-handling) says.
 - **Local auth token.** The token does not exist in the current process. P4-06 introduces it. This document does not define its format, only where it lives and which routes require it.

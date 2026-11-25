@@ -14,9 +14,14 @@ An API key is optional. Quotes are documented to work without one.
 When ``JUPITER_API_KEY`` is set it is sent only as the ``x-api-key``
 header. It is not put on the query, in an error, or in ``repr``.
 
-Slippage is not sent. ``/order`` then uses the documented real-time
-estimate. ``/build`` applies its documented default. The build is
-rejected when its mints or amounts differ from the accepted quote.
+``slippageBps`` is sent on ``/order`` and ``/build`` when the caller
+sets it. Omitting it leaves the venue's own estimate. The value is a
+request parameter. The risk engine owns the cap. The build is rejected
+when its mints or amounts differ from the accepted quote.
+
+Every attempt waits for the pace interval and counts toward the daily
+cap. A timeout, HTTP 429, or HTTP 5xx still retries at most five times
+with the existing backoff. The response body is not stored.
 
 This path is Metis-only. The docs describe JupiterZ RFQ as a single
 ``/order`` transaction whose market-maker signature is added when
@@ -42,6 +47,7 @@ from app.venue.checks import (
     require_clock,
     require_fresh,
     require_request,
+    require_slippage,
 )
 from app.venue.errors import (
     VenueExecuteDisabled,
@@ -50,6 +56,7 @@ from app.venue.errors import (
     VenueSchemaError,
     VenueTransportError,
 )
+from app.venue.pace import Pace, daily_cap, min_interval_seconds
 from app.venue.pin import (
     BUILD_QUERY_KEYS,
     JUPITER_API_KEY_ENV,
@@ -59,6 +66,7 @@ from app.venue.pin import (
     JUPITER_ORDER_PATH,
     MAX_RESPONSE_BYTES,
     ORDER_QUERY_KEYS,
+    SLIPPAGE_QUERY_KEY,
 )
 from app.venue.schema import loads, parse_build, parse_order
 from app.venue.tx import assemble_unsigned
@@ -71,6 +79,7 @@ _PATH_KEYS = {
     JUPITER_ORDER_PATH: ORDER_QUERY_KEYS,
     JUPITER_BUILD_PATH: BUILD_QUERY_KEYS,
 }
+_OPTIONAL_QUERY = frozenset({SLIPPAGE_QUERY_KEY})
 
 
 class JupiterVenue:
@@ -87,12 +96,18 @@ class JupiterVenue:
         api_key: str | None | object = _UNSET,
         sleep: Callable[[float], None] = time.sleep,
         rng: Callable[[], float] | None = None,
+        clock: Callable[[], float] | None = None,
+        min_interval: float | None = None,
+        daily_limit: int | None = None,
     ) -> None:
         self._client = client
         self._owns_client = client is None
         self._key = api_key
         self._sleep = sleep
         self._rng = rng
+        interval = min_interval_seconds() if min_interval is None else min_interval
+        cap = daily_cap() if daily_limit is None else daily_limit
+        self._pace = Pace(sleep=sleep, clock=clock, interval=interval, cap=cap)
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:
@@ -113,12 +128,16 @@ class JupiterVenue:
         require_request(request)
         payload = self._get_json(
             JUPITER_ORDER_PATH,
-            {
-                "inputMint": request.input_mint,
-                "outputMint": request.output_mint,
-                "amount": str(request.amount),
-                "swapMode": "ExactIn",
-            },
+            _with_slippage(
+                {
+                    "inputMint": request.input_mint,
+                    "outputMint": request.output_mint,
+                    "amount": str(request.amount),
+                    "swapMode": "ExactIn",
+                },
+                request.slippage_bps,
+            ),
+            now,
         )
         parsed = parse_order(payload, now)
         if parsed.input_mint != request.input_mint or parsed.output_mint != request.output_mint:
@@ -143,6 +162,9 @@ class JupiterVenue:
             fee_mint=parsed.fee_mint,
             fee_amount=parsed.fee_amount,
             swap_mode=parsed.swap_mode,
+            network_fee_lamports=parsed.network_fee_lamports,
+            priority_fee_lamports=parsed.priority_fee_lamports,
+            rent_fee_lamports=parsed.rent_fee_lamports,
         )
 
     def build(
@@ -152,6 +174,7 @@ class JupiterVenue:
         taker: str,
         now: int,
         block_height: int | None = None,
+        slippage_bps: int | None = None,
     ) -> UnsignedTransaction:
         now = require_clock(now)
         taker = require_address(taker)
@@ -161,15 +184,21 @@ class JupiterVenue:
             raise VenueExpired("missing_block_height")
         current = require_block_height(block_height)
         require_fresh(quote, now, block_height)
+        if slippage_bps is not None:
+            require_slippage(slippage_bps)
         payload = self._get_json(
             JUPITER_BUILD_PATH,
-            {
-                "inputMint": quote.input_mint,
-                "outputMint": quote.output_mint,
-                "amount": str(quote.in_amount),
-                "taker": taker,
-                "transactionVersion": "0",
-            },
+            _with_slippage(
+                {
+                    "inputMint": quote.input_mint,
+                    "outputMint": quote.output_mint,
+                    "amount": str(quote.in_amount),
+                    "taker": taker,
+                    "transactionVersion": "0",
+                },
+                slippage_bps,
+            ),
+            now,
         )
         parsed = parse_build(payload)
         if current > parsed.last_valid_block_height:
@@ -194,27 +223,29 @@ class JupiterVenue:
     def execute(self, transaction: object = None) -> None:
         raise VenueExecuteDisabled("execute_disabled")
 
-    def _get_json(self, path: str, params: dict[str, str]) -> Any:
+    def _get_json(self, path: str, params: dict[str, str], now: int) -> Any:
         if path not in _PATH_KEYS:
             raise VenueExecuteDisabled("execute_disabled")
-        if set(params) != _PATH_KEYS[path]:
+        keys = set(params)
+        if not _PATH_KEYS[path] <= keys <= _PATH_KEYS[path] | _OPTIONAL_QUERY:
             raise VenueSchemaError("bad_request")
         url = JUPITER_BASE_URL + path
         backoff = 1.0
         last_status = 0
         for attempt in range(_ATTEMPTS):
+            self._pace.acquire(now)
             try:
                 response = self._http().get(url, params=params, headers=self._headers())
             except httpx.TimeoutException:
                 if attempt == _ATTEMPTS - 1:
                     raise VenueTransportError("Jupiter request timed out") from None
-                self._sleep(self._delay(backoff, None, None))
+                self._pause(self._delay(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.TransportError as exc:
                 if isinstance(exc, _NO_RETRY) or attempt == _ATTEMPTS - 1:
                     raise VenueTransportError("Jupiter request failed") from None
-                self._sleep(self._delay(backoff, None, None))
+                self._pause(self._delay(backoff, None, None))
                 backoff = min(backoff * 2, 120.0)
                 continue
             except httpx.HTTPError:
@@ -223,7 +254,7 @@ class JupiterVenue:
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == _ATTEMPTS - 1:
                     raise VenueTransportError(f"Jupiter returned HTTP {response.status_code}")
-                self._sleep(self._delay(backoff, response, response.status_code))
+                self._pause(self._delay(backoff, response, response.status_code))
                 backoff = min(backoff * 2, 120.0)
                 continue
             if response.status_code != 200:
@@ -254,6 +285,10 @@ class JupiterVenue:
             return ""
         return text
 
+    def _pause(self, delay: float) -> None:
+        self._sleep(delay)
+        self._pace.note_sleep(delay)
+
     def _delay(
         self, backoff: float, response: httpx.Response | None, status: int | None
     ) -> float:
@@ -268,3 +303,12 @@ class JupiterVenue:
             )
             self._owns_client = True
         return self._client
+
+
+def _with_slippage(params: dict[str, str], slippage_bps: int | None) -> dict[str, str]:
+    if slippage_bps is None:
+        return params
+    require_slippage(slippage_bps)
+    copied = dict(params)
+    copied[SLIPPAGE_QUERY_KEY] = str(slippage_bps)
+    return copied

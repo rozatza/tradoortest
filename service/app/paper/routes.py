@@ -34,6 +34,7 @@ from app.paper.drift import (
 )
 from app.paper.errors import PaperError
 from app.paper.limits import paper_max_running
+from app.paper.shadow import shadow_report
 from app.paper.snapshot import paper_snapshot
 from app.strategies.errors import StoreUnavailable, StrategyNotFound, VersionNotFound
 from app.strategies.routes import open_store
@@ -146,10 +147,29 @@ async def read_paper(request: Request, user: CurrentUserDep) -> JSONResponse:
         body["drift"] = await run_in_threadpool(
             drift_reports, bars, user.user_id, threshold
         )
+        body["shadow"] = await run_in_threadpool(shadow_report, bars, user.user_id)
     except (sqlite3.Error, OSError):
         return error_response(503, "store_unavailable", _UNAVAILABLE, None)
     body["drift_threshold"] = format_amount(threshold)
     body["drift_threshold_name"] = PAPER_DRIFT_THRESHOLD_NAME
+    return JSONResponse(status_code=200, content=body)
+
+
+@router.get("/shadow")
+async def read_shadow(request: Request, user: CurrentUserDep) -> JSONResponse:
+    """Quote-only shadow rows next to paper fills. Nothing is signed or sent."""
+    if user.user_id != LOCAL_USER_ID:
+        return error_response(403, "forbidden", _FORBIDDEN, None)
+    try:
+        bars = await run_in_threadpool(_bar_store, request)
+    except (OSError, sqlite3.Error, ValueError):
+        return error_response(503, "store_unavailable", _UNAVAILABLE, None)
+    try:
+        body = await run_in_threadpool(shadow_report, bars, user.user_id)
+    except (sqlite3.Error, OSError):
+        return error_response(503, "store_unavailable", _UNAVAILABLE, None)
+    body["mode"] = "shadow"
+    body["simulated"] = True
     return JSONResponse(status_code=200, content=body)
 
 

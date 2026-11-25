@@ -66,6 +66,9 @@ class ParsedOrder:
     fee_mint: str | None
     fee_amount: int | None
     swap_mode: str
+    network_fee_lamports: int | None
+    priority_fee_lamports: int | None
+    rent_fee_lamports: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +138,9 @@ def parse_order(payload: object, now: int) -> ParsedOrder:
     _optional_numbers(body)
     slippage = _maybe_bps(body, "slippageBps")
     fee_bps, fee_mint, fee_amount = _fees(body)
+    network_fee = _maybe_lamports(body, "signatureFeeLamports")
+    priority_fee = _maybe_lamports(body, "prioritizationFeeLamports")
+    rent_fee = _maybe_lamports(body, "rentFeeLamports")
     _maybe_address(body, "signatureFeePayer")
     _maybe_address(body, "prioritizationFeePayer")
     _maybe_address(body, "rentFeePayer")
@@ -163,6 +169,9 @@ def parse_order(payload: object, now: int) -> ParsedOrder:
         fee_mint=fee_mint,
         fee_amount=fee_amount,
         swap_mode=swap_mode,
+        network_fee_lamports=network_fee,
+        priority_fee_lamports=priority_fee,
+        rent_fee_lamports=rent_fee,
     )
 
 
@@ -408,15 +417,14 @@ def _optional_numbers(body: dict[str, object]) -> None:
     for key in ("inUsdValue", "outUsdValue", "swapUsdValue", "totalTime"):
         if key in body and body[key] is not None:
             _number(body[key])
-    for key in (
-        "signatureFeeLamports",
-        "prioritizationFeeLamports",
-        "rentFeeLamports",
-    ):
-        if key in body and body[key] is not None:
-            if type(body[key]) is not JsonInt:
-                raise VenueSchemaError("bad_number")
-            _u64(str(body[key]))
+
+
+def _maybe_lamports(body: dict[str, object], key: str) -> int | None:
+    if key not in body or body[key] is None:
+        return None
+    if type(body[key]) is not JsonInt:
+        raise VenueSchemaError("bad_number")
+    return _u64(str(body[key]))
 
 
 def _maybe_bps(body: dict[str, object], key: str) -> int | None:

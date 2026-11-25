@@ -261,6 +261,50 @@ CREATE TABLE IF NOT EXISTS paper_cursors (
     last_open_time INTEGER NOT NULL,
     PRIMARY KEY (user_id, strategy_id, version)
 );
+-- Open time of the broker's first tick. Not a price. Not purged.
+-- A later backfill of older bars does not move it backward.
+CREATE TABLE IF NOT EXISTS paper_origins (
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    origin_open_time INTEGER NOT NULL,
+    PRIMARY KEY (user_id, strategy_id, version)
+);
+-- Shadow quote next to a paper fill. No provider body. Purged at 24 hours.
+CREATE TABLE IF NOT EXISTS paper_shadow (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    fill_id INTEGER NOT NULL,
+    open_time INTEGER NOT NULL,
+    asset_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    input_mint TEXT,
+    output_mint TEXT,
+    paper_out TEXT NOT NULL,
+    quoted_out TEXT,
+    price_impact TEXT,
+    route_label TEXT,
+    router TEXT,
+    network_fee_lamports INTEGER,
+    priority_fee_lamports INTEGER,
+    rent_lamports INTEGER,
+    latency_ms INTEGER,
+    slippage_bps INTEGER,
+    quote_status TEXT NOT NULL,
+    build_status TEXT NOT NULL,
+    error_code TEXT,
+    quoted_at INTEGER NOT NULL,
+    stored_at INTEGER NOT NULL,
+    UNIQUE (user_id, fill_id)
+);
+-- One row. The day key moves forward only. Not a quote payload.
+CREATE TABLE IF NOT EXISTS shadow_budget (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    day_key INTEGER NOT NULL,
+    calls INTEGER NOT NULL
+);
 """
 
 _UPSERT = """
@@ -1559,6 +1603,218 @@ class SqliteBarStore:
         return int(row[0])
 
     @_serialized
+    def paper_origin(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> int | None:
+        """Open time fixed at the broker's first tick. Not purged."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT origin_open_time FROM paper_origins
+            WHERE user_id = ? AND strategy_id = ? AND version = ?
+            """,
+            (user_id, strategy_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+    @_serialized
+    def save_paper_origin(
+        self,
+        *,
+        user_id: str,
+        strategy_id: str,
+        version: int,
+        origin_open_time: int,
+    ) -> None:
+        """Record the first-tick origin. A later call does not move it."""
+        self._purge()
+        _owner(user_id)
+        if isinstance(origin_open_time, bool) or not isinstance(origin_open_time, int):
+            raise StoreError("bad_origin")
+        if origin_open_time < 0:
+            raise StoreError("bad_origin")
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO paper_origins (
+                    user_id, strategy_id, version, origin_open_time
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, strategy_id, version) DO NOTHING
+                """,
+                (user_id, strategy_id, version, origin_open_time),
+            )
+
+    @_serialized
+    def unshadowed_paper_fills(
+        self, *, user_id: str, strategy_id: str, version: int
+    ) -> list[tuple[object, ...]]:
+        """Fills that do not yet have a shadow row. Includes the fill id."""
+        self._purge()
+        _owner(user_id)
+        cursor = self._conn.execute(
+            """
+            SELECT paper_fills.id, paper_fills.open_time, paper_fills.asset_id,
+                   paper_fills.side, paper_fills.qty, paper_fills.notional
+            FROM paper_fills
+            WHERE paper_fills.user_id = ?
+              AND paper_fills.strategy_id = ?
+              AND paper_fills.version = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM paper_shadow
+                  WHERE paper_shadow.user_id = paper_fills.user_id
+                    AND paper_shadow.fill_id = paper_fills.id
+              )
+            ORDER BY paper_fills.id
+            """,
+            (user_id, strategy_id, version),
+        )
+        return [
+            (int(row[0]), int(row[1]), str(row[2]), str(row[3]), str(row[4]), str(row[5]))
+            for row in cursor
+        ]
+
+    @_serialized
+    def insert_paper_shadow(self, row: Mapping[str, object]) -> None:
+        """One shadow observation. A second insert for the same fill is ignored."""
+        self._purge()
+        user_id = str(row["user_id"])
+        _owner(user_id)
+        stored_at = int(self._now())
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO paper_shadow (
+                    user_id, strategy_id, version, fill_id, open_time, asset_id, side,
+                    input_mint, output_mint, paper_out, quoted_out, price_impact,
+                    route_label, router, network_fee_lamports, priority_fee_lamports,
+                    rent_lamports, latency_ms, slippage_bps, quote_status, build_status,
+                    error_code, quoted_at, stored_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(user_id, fill_id) DO NOTHING
+                """,
+                (
+                    user_id,
+                    str(row["strategy_id"]),
+                    int(row["version"]),  # type: ignore[arg-type]
+                    int(row["fill_id"]),  # type: ignore[arg-type]
+                    int(row["open_time"]),  # type: ignore[arg-type]
+                    str(row["asset_id"]),
+                    str(row["side"]),
+                    row["input_mint"],
+                    row["output_mint"],
+                    str(row["paper_out"]),
+                    row["quoted_out"],
+                    row["price_impact"],
+                    row["route_label"],
+                    row["router"],
+                    row["network_fee_lamports"],
+                    row["priority_fee_lamports"],
+                    row["rent_lamports"],
+                    row["latency_ms"],
+                    row["slippage_bps"],
+                    str(row["quote_status"]),
+                    str(row["build_status"]),
+                    row["error_code"],
+                    int(row["quoted_at"]),  # type: ignore[arg-type]
+                    stored_at,
+                ),
+            )
+
+    @_serialized
+    def list_paper_shadow(self, *, user_id: str, limit: int = 50) -> list[tuple[object, ...]]:
+        """Newest shadow rows still inside the TTL, oldest of that page first."""
+        self._purge()
+        _owner(user_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 200:
+            raise StoreError("bad_limit")
+        cursor = self._conn.execute(
+            """
+            SELECT strategy_id, version, open_time, asset_id, side, input_mint, output_mint,
+                   paper_out, quoted_out, price_impact, route_label, router,
+                   network_fee_lamports,
+                   priority_fee_lamports, rent_lamports, latency_ms, slippage_bps,
+                   quote_status, build_status, error_code, quoted_at
+            FROM paper_shadow
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = list(cursor)
+        rows.reverse()
+        return [tuple(row) for row in rows]
+
+    @_serialized
+    def shadow_build_counts(self, *, user_id: str) -> tuple[int, int]:
+        """``(build attempts, amount_mismatch count)`` inside the TTL."""
+        self._purge()
+        _owner(user_id)
+        row = self._conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN build_status IN ('ok', 'amount_mismatch', 'rejected', 'error')
+                    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN build_status = 'amount_mismatch' THEN 1 ELSE 0 END)
+            FROM paper_shadow
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return (0, 0)
+        attempts = 0 if row[0] is None else int(row[0])
+        mismatches = 0 if row[1] is None else int(row[1])
+        return attempts, mismatches
+
+    @_serialized
+    def take_shadow_call(self, *, now: int, cap: int) -> bool:
+        """Reserve one shadow venue call for this calendar day.
+
+        The day key moves forward only. A clock step backward does not
+        clear the count and does not allow the call. False means the cap
+        is already reached. The row is not a quote payload.
+        """
+        self._purge()
+        if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+            raise StoreError("bad_clock")
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise StoreError("bad_limit")
+        day = now // 86400
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT day_key, calls FROM shadow_budget WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO shadow_budget (id, day_key, calls) VALUES (1, ?, 1)",
+                    (day,),
+                )
+                return True
+            stored_day = int(row[0])
+            calls = int(row[1])
+            if day < stored_day:
+                return False
+            if day > stored_day:
+                self._conn.execute(
+                    "UPDATE shadow_budget SET day_key = ?, calls = 1 WHERE id = 1",
+                    (day,),
+                )
+                return True
+            if calls >= cap:
+                return False
+            self._conn.execute(
+                "UPDATE shadow_budget SET calls = ? WHERE id = 1",
+                (calls + 1,),
+            )
+            return True
+
+    @_serialized
     def paper_fills(
         self, *, user_id: str, strategy_id: str, version: int
     ) -> list[tuple[object, ...]]:
@@ -2233,6 +2489,7 @@ class SqliteBarStore:
             self._conn.execute("DELETE FROM paper_orders WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM paper_fills WHERE stored_at <= ?", (cutoff,))
             self._conn.execute("DELETE FROM paper_events WHERE stored_at <= ?", (cutoff,))
+            self._conn.execute("DELETE FROM paper_shadow WHERE stored_at <= ?", (cutoff,))
             self._conn.execute(
                 "UPDATE live_cursors SET state_json = '' WHERE state_stored_at <= ?",
                 (cutoff,),

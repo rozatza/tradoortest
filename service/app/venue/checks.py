@@ -38,6 +38,15 @@ def require_request(request: QuoteRequest) -> None:
         raise VenueRejected("amount_mismatch")
     if request.amount <= 0 or request.amount >= 2**64:
         raise VenueRejected("amount_mismatch")
+    if request.slippage_bps is not None:
+        require_slippage(request.slippage_bps)
+
+
+def require_slippage(value: object) -> int:
+    """A request parameter from 0 to 10000 basis points. Not a risk cap."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10_000:
+        raise VenueRejected("bad_slippage")
+    return value
 
 
 def require_fresh(quote: VenueQuote, now: int, block_height: int | None) -> None:

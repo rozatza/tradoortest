@@ -156,11 +156,14 @@ ROUTERS = frozenset({"metis", "jupiterz", "dflow", "okx"})
 MODES = frozenset({"ultra", "manual"})
 SWAP_TYPES = frozenset({"aggregator", "rfq", "aggregator+rfq", "dflow", "okx"})
 
-# Query keys this client sends. Slippage is not one of them.
+# Required query keys. ``slippageBps`` is optional and, when the caller sets
+# it, is sent on both ``/order`` and ``/build``. It is a request parameter.
+# The risk engine owns the cap (P4-04).
 ORDER_QUERY_KEYS = frozenset({"inputMint", "outputMint", "amount", "swapMode"})
 BUILD_QUERY_KEYS = frozenset(
     {"inputMint", "outputMint", "amount", "taker", "transactionVersion"}
 )
+SLIPPAGE_QUERY_KEY = "slippageBps"
 
 # The build guide resolves lookup tables from the response. No RPC.
 TRANSACTION_VERSION = 0

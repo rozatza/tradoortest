@@ -40,6 +40,17 @@ def test_the_dashboard_reads_the_stored_book(tmp_path: Path) -> None:
             "drift": [],
             "drift_threshold": "0.01",
             "drift_threshold_name": "PAPER_DRIFT_THRESHOLD",
+            "shadow": {
+                "enabled": False,
+                "build_enabled": False,
+                "slippage_bps": 50,
+                "min_interval_seconds": "1.0",
+                "daily_cap": 1000,
+                "amount_mismatch_rate": None,
+                "build_attempts": 0,
+                "amount_mismatches": 0,
+                "quotes": [],
+            },
         }
         assert _deploy(client, strategy_id).status_code == 201
         broker = PaperBroker(bars, now=lambda: clock["now"])

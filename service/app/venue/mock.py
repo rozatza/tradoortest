@@ -10,7 +10,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from app.venue.address import require_address
-from app.venue.checks import require_block_height, require_clock, require_fresh, require_request
+from app.venue.checks import (
+    require_block_height,
+    require_clock,
+    require_fresh,
+    require_request,
+    require_slippage,
+)
 from app.venue.errors import (
     VenueExecuteDisabled,
     VenueExpired,
@@ -50,6 +56,9 @@ class MockVenue:
         fee_bps: int | None = None,
         fee_mint: str | None = None,
         fee_amount: int | None = None,
+        network_fee_lamports: int | None = None,
+        priority_fee_lamports: int | None = None,
+        rent_fee_lamports: int | None = None,
     ) -> None:
         if not route_label:
             raise VenueSchemaError("missing_route")
@@ -85,10 +94,16 @@ class MockVenue:
         self._fee_bps = fee_bps
         self._fee_mint = fee_mint
         self._fee_amount = fee_amount
+        self._network_fee = network_fee_lamports
+        self._priority_fee = priority_fee_lamports
+        self._rent_fee = rent_fee_lamports
+        self.last_quote_slippage: int | None = None
+        self.last_build_slippage: int | None = None
 
     def quote(self, request: QuoteRequest, *, now: int) -> VenueQuote:
         now = require_clock(now)
         require_request(request)
+        self.last_quote_slippage = request.slippage_bps
         if request.input_mint != self._input_mint or request.output_mint != self._output_mint:
             raise VenueRejected("mint_mismatch")
         if request.amount != self._in_amount:
@@ -111,6 +126,9 @@ class MockVenue:
             fee_mint=self._fee_mint,
             fee_amount=self._fee_amount,
             swap_mode="ExactIn",
+            network_fee_lamports=self._network_fee,
+            priority_fee_lamports=self._priority_fee,
+            rent_fee_lamports=self._rent_fee,
         )
 
     def build(
@@ -120,9 +138,13 @@ class MockVenue:
         taker: str,
         now: int,
         block_height: int | None = None,
+        slippage_bps: int | None = None,
     ) -> UnsignedTransaction:
         now = require_clock(now)
         taker = require_address(taker)
+        if slippage_bps is not None:
+            require_slippage(slippage_bps)
+        self.last_build_slippage = slippage_bps
         if block_height is None:
             raise VenueExpired("missing_block_height")
         require_block_height(block_height)

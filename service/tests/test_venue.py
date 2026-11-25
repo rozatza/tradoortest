@@ -458,7 +458,7 @@ def test_execute_helper_refuses_the_path_before_http() -> None:
     client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
     venue = JupiterVenue(client, api_key=None)
     with pytest.raises(VenueExecuteDisabled, match="execute_disabled"):
-        venue._get_json(JUPITER_EXECUTE_PATH, {})
+        venue._get_json(JUPITER_EXECUTE_PATH, {}, _NOW)
 
 
 def test_pin_names_the_verified_swap_api() -> None:
@@ -479,6 +479,46 @@ def test_runner_core_and_the_legacy_engine_are_unchanged() -> None:
     text = (_ROOT / "service/app/runner/core.py").read_text()
     assert "Jupiter" not in text
     assert "ExecutionVenue" not in text
+
+
+def test_slippage_bps_is_sent_on_order_and_build() -> None:
+    script = _Script(_body("order.json"), _body("build.json"))
+    venue = script.venue()
+    quote = venue.quote(QuoteRequest(_SOL, _USDC, _AMOUNT, "buy", 50), now=_NOW)
+    venue.build(quote, taker=_TAKER, now=_NOW, block_height=_HEIGHT, slippage_bps=50)
+    assert script.requests[0].url.params["slippageBps"] == "50"
+    assert script.requests[1].url.params["slippageBps"] == "50"
+    assert quote.network_fee_lamports == 5000
+    assert quote.priority_fee_lamports is None
+    assert quote.rent_fee_lamports is None
+
+
+def test_the_daily_cap_and_the_interval_bound_jupiter_calls() -> None:
+    script = _Script(_body("order.json"), _body("build.json"))
+    client = httpx.Client(transport=httpx.MockTransport(script.handler))
+    venue = JupiterVenue(
+        client,
+        api_key=None,
+        sleep=script.sleeps.append,
+        clock=lambda: 0.0,
+        min_interval=1.0,
+        daily_limit=1,
+    )
+    venue.quote(_request(), now=_NOW)
+    with pytest.raises(VenueRejected, match="quote_cap"):
+        venue.quote(_request(), now=_NOW)
+    assert len(script.requests) == 1
+    spaced = JupiterVenue(
+        httpx.Client(transport=httpx.MockTransport(script.handler)),
+        api_key=None,
+        sleep=script.sleeps.append,
+        clock=lambda: 0.0,
+        min_interval=1.0,
+        daily_limit=10,
+    )
+    quote = spaced.quote(_request(), now=_NOW)
+    spaced.build(quote, taker=_TAKER, now=_NOW, block_height=_HEIGHT)
+    assert script.sleeps == [1.0]
 
 
 def test_a_bad_address_fails_before_a_request() -> None:
