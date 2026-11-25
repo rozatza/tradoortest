@@ -83,6 +83,31 @@ class _Calls:
         raise VenueExecuteDisabled("execute_disabled")
 
 
+class _Slow:
+    """A venue whose quote sleeps. The tick must not wait for it."""
+
+    def __init__(self) -> None:
+        self.thread_name = ""
+        self.tick_seconds = 0.0
+        self.executed = 0
+
+    def quote(self, request: QuoteRequest, *, now: int) -> VenueQuote:
+        import threading
+        import time
+
+        self.thread_name = threading.current_thread().name
+        time.sleep(1.5)
+        raise VenueRejected("slow")
+
+    def build(self, quote: VenueQuote, **_kwargs: object) -> object:
+        del quote
+        raise VenueRejected("slow")
+
+    def execute(self, transaction: object = None) -> None:
+        self.executed += 1
+        raise VenueExecuteDisabled("execute_disabled")
+
+
 def test_shadow_flag_is_exact_and_the_live_flags_stay_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SHADOW_QUOTES_ENABLED", raising=False)
     monkeypatch.delenv("SHADOW_BUILD_ENABLED", raising=False)
@@ -175,10 +200,11 @@ def test_build_mismatch_is_counted_and_not_sent(
     monkeypatch.setenv("SHADOW_TAKER", _TAKER)
     monkeypatch.setenv("SHADOW_SLIPPAGE_BPS", "75")
     venue = _Calls(fail_build=True)
-    ran = _run(tmp_path, venue=venue)
+    ran = _run(tmp_path, venue=venue, rpc=_Height(10))
     assert venue.executed == 0
     assert len(venue.builds) == 1
     assert venue.builds[0][1] == _TAKER
+    assert venue.builds[0][3] == 10
     assert venue.builds[0][4] == 75
     shadow = ran["page"]
     assert shadow["mode"] == "shadow"
@@ -189,6 +215,65 @@ def test_build_mismatch_is_counted_and_not_sent(
     assert shadow["quotes"][0]["build_status"] == "amount_mismatch"
     assert shadow["quotes"][0]["slippage_bps"] == 75
     assert "transaction" not in shadow["quotes"][0]
+
+
+def test_shadow_build_ignores_the_quote_block_height(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHADOW_QUOTES_ENABLED", "1")
+    monkeypatch.setenv("SHADOW_BUILD_ENABLED", "1")
+    monkeypatch.setenv("SHADOW_TAKER", _TAKER)
+    monkeypatch.delenv("SOLANA_RPC_URL", raising=False)
+    venue = _Calls()
+    ran = _run(tmp_path, venue=venue)
+    assert venue.builds == []
+    assert ran["page"]["quotes"][0]["build_status"] == "skipped"
+    assert ran["page"]["quotes"][0]["error_code"] == "missing_block_height"
+    assert venue.quotes[0] is not None
+
+
+def test_a_slow_venue_does_not_block_the_scheduler_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    from app.paper.shadow_queue import ShadowQueue
+
+    monkeypatch.setenv("SHADOW_QUOTES_ENABLED", "1")
+    clock = {"now": _T}
+    venue = _Slow()
+    _client, strategies, bars, _venue = _world_broker(tmp_path, clock, venue)
+    queue = ShadowQueue(timeout=0.2, backlog=2)
+    try:
+        bars.upsert([_bar(_T, 100, high=101, low=99)], user_id=LOCAL_USER_ID)
+        clock["now"] = _T + _STEP + _GRACE
+        broker = PaperBroker(
+            bars,
+            now=lambda: clock["now"],
+            shadow_venue=venue,
+            shadow_queue=queue,
+        )
+
+        def run() -> None:
+            threading.current_thread().name = "live-bar-scheduler"
+            started = time.monotonic()
+            broker.tick()
+            venue.tick_seconds = time.monotonic() - started
+
+        thread = threading.Thread(target=run, name="live-bar-scheduler")
+        thread.start()
+        thread.join(1.0)
+        assert not thread.is_alive()
+        assert venue.tick_seconds < 0.75
+        assert broker._shadow_queue.flush(1.0) is True
+        assert venue.thread_name == "shadow-quotes"
+        assert venue.thread_name != "live-bar-scheduler"
+        rows = bars.list_paper_shadow(user_id=LOCAL_USER_ID)
+        assert rows[-1][19] == "quote_timeout"
+    finally:
+        bars.close()
+        strategies.close()
 
 
 def test_shadow_rows_purge_at_24_hours_and_the_book_stays(
@@ -263,11 +348,23 @@ def test_a_backward_clock_does_not_reset_the_cap(tmp_path: Path) -> None:
         store.close()
 
 
-def _run(path: Path, venue: _Calls | None = None) -> dict[str, object]:
+class _Height:
+    """Chain height. This is not the quote's lastValidBlockHeight."""
+
+    def __init__(self, height: int) -> None:
+        self._height = height
+
+    def block_height(self) -> int:
+        return self._height
+
+
+def _run(
+    path: Path, venue: _Calls | None = None, rpc: _Height | None = None
+) -> dict[str, object]:
     clock = {"now": _T}
     client, strategies, bars, broker_venue = _world_broker(path, clock, venue)
     try:
-        _tick(bars, clock, broker_venue)
+        _tick(bars, clock, broker_venue, rpc)
         strategy_id = client.get("/paper").json()["strategies"][0]["strategy_id"]
         wallet = bars.paper_wallet(user_id=LOCAL_USER_ID, strategy_id=strategy_id, version=1)
         position = bars.paper_positions(
@@ -292,11 +389,16 @@ def _world_broker(path: Path, clock: dict[str, int], venue: _Calls | None):
     return client, strategies, bars, venue
 
 
-def _tick(bars, clock: dict[str, int], venue: _Calls | None = None) -> None:
-    broker = PaperBroker(bars, now=lambda: clock["now"], shadow_venue=venue)
+def _tick(
+    bars, clock: dict[str, int], venue: _Calls | None = None, rpc: object | None = None
+) -> None:
+    broker = PaperBroker(
+        bars, now=lambda: clock["now"], shadow_venue=venue, chain_rpc=rpc
+    )
     bars.upsert([_bar(_T, 100, high=101, low=99)], user_id=LOCAL_USER_ID)
     clock["now"] = _T + _STEP + _GRACE
     broker.tick()
+    broker.flush_shadow()
 
 
 def _strategy_id(bars) -> str:

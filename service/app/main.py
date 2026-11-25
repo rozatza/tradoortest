@@ -12,6 +12,8 @@ from app.jobs.routes import error_response, router
 from app.live.scheduler import PaperScheduler, live_feed_enabled
 from app.ohlcv.routes import router as ohlcv_router
 from app.paper.routes import router as paper_router
+from app.risk.bind import require_loopback
+from app.risk.routes import router as live_router
 from app.strategies.routes import router as strategies_router
 from app.strategies.store import StrategyStore
 from app.tools.routes import router as tools_router
@@ -28,6 +30,7 @@ def create_app(
     live_enabled: bool | None = None,
 ) -> FastAPI:
     """Build the app. The live scheduler is off unless ``live`` or the env flag is set."""
+    require_loopback()
     enabled = live_feed_enabled() if live_enabled is None else live_enabled
     scheduler = live
     if scheduler is None and enabled:
@@ -58,6 +61,7 @@ def create_app(
     application.include_router(ohlcv_router)
     application.include_router(strategies_router)
     application.include_router(paper_router)
+    application.include_router(live_router)
     application.include_router(tools_router)
     application.include_router(agent_router)
 

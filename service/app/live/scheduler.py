@@ -53,6 +53,7 @@ from app.ohlcv.errors import SourceError
 from app.ohlcv.registry import BY_SYMBOL
 from app.ohlcv.store import MAX_CACHE_TTL_SECONDS, SqliteBarStore
 from app.paper.broker import PaperBroker
+from app.risk.gate import LiveGate
 from app.runner import (
     BarDecision,
     BookView,
@@ -148,6 +149,7 @@ class PaperScheduler:
         self._stop = threading.Event() if stop_event is None else stop_event
         self._thread: threading.Thread | None = None
         self._closed = False
+        self.live_gate = LiveGate()
 
     def register(self, strategy_id: str, version: int, document: Mapping[str, Any]) -> None:
         """Persist one version. The same document again is a no-op."""
@@ -174,6 +176,7 @@ class PaperScheduler:
         fetch does not tick the broker. Failed mints are held so the broker
         does not move its cursor past a bar the feed did not store.
         """
+        self.live_gate.note(now=float(self._now()), interval=self._pause())
         with self._lock:
             now = int(self._now())
             strategies = self._load()
@@ -197,6 +200,10 @@ class PaperScheduler:
             if self._stop.is_set():
                 return
             self._broker.tick(hold=frozenset(errors))
+
+    def live_orders_for(self, bars: Sequence[object]) -> tuple[object, ...]:
+        """Live orders for this tick. Missed bars are not caught up."""
+        return self.live_gate.consider(bars)
 
     def start(self) -> None:
         """Start the worker thread. A second call while it is alive does nothing."""
