@@ -15,6 +15,8 @@ export default function PaperPage() {
           <a href="/">Author workspace</a>
           {" · "}
           <a href="/shadow">Shadow quotes</a>
+          {" · "}
+          <a href="/live">Manual confirm</a>
         </p>
       </header>
       <PaperDashboard />

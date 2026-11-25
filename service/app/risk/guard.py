@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import struct
 
+from app.risk.fees import FeeLines, split_lamport_drop
 from app.risk.limits import DEFAULT_LIMITS, RiskLimits
 from app.risk.programs import (
     ALLOWED_PROGRAMS,
@@ -32,6 +33,7 @@ from app.risk.programs import (
     TOKEN_TRANSFER,
     TOKEN_TRANSFER_CHECKED,
 )
+from app.risk.route_ix import decode_jupiter_route
 from app.risk.rpc import ChainRpc, Simulation
 from app.venue.address import address_bytes
 from app.venue.errors import VenueError
@@ -40,11 +42,16 @@ from app.venue.types import AccountRole, DecodedInstruction, UnsignedTransaction
 
 
 class GuardDecision:
-    """A rejected transaction is not resized and not signed."""
+    """A rejected transaction is not resized and not signed.
 
-    def __init__(self, accepted: bool, code: str) -> None:
+    ``fees`` is set only when the simulation's wallet lamport drop was
+    split into network, priority, and rent. It is not a client number.
+    """
+
+    def __init__(self, accepted: bool, code: str, fees: FeeLines | None = None) -> None:
         self.accepted = accepted
         self.code = code
+        self.fees = fees
 
     def __repr__(self) -> str:
         return f"GuardDecision({self.accepted!r}, {self.code!r})"
@@ -84,6 +91,9 @@ def guard_unsigned(
     decoded = _decoded_transfer_amount(instructions)
     if decoded is not None and decoded != quoted_in:
         return GuardDecision(False, "amount_mismatch")
+    route_code = _route_terms(instructions, quoted_in, quoted_minimum, chosen)
+    if route_code is not None:
+        return GuardDecision(False, route_code)
     if rpc is None:
         return GuardDecision(False, "missing_rpc")
     try:
@@ -257,6 +267,40 @@ def _token(
     return "instruction"
 
 
+def _route_terms(
+    instructions: tuple[DecodedInstruction, ...],
+    quoted_in: int,
+    quoted_minimum: int,
+    limits: RiskLimits,
+) -> str | None:
+    """Refuse a Jupiter route whose min-out or slippage is outside the cap.
+
+    A transaction with no Jupiter instruction is left to the simulation.
+    One that names Jupiter must decode. Minimum-out ``0`` is refused
+    even when the slippage field would also fail.
+    """
+    routes = [item for item in instructions if item.program_id == JUPITER_V6_PROGRAM]
+    if not routes:
+        return None
+    if len(routes) != 1:
+        return "route_undecoded"
+    decoded = decode_jupiter_route(routes[0].data)
+    if isinstance(decoded, str):
+        return decoded
+    if decoded is None:
+        return "route_undecoded"
+    if decoded.min_out <= 0:
+        return "min_out"
+    if decoded.in_amount != quoted_in:
+        return "amount_mismatch"
+    if decoded.slippage_bps > limits.max_slippage_bps:
+        return "slippage"
+    floor = decoded.quoted_out - decoded.quoted_out * limits.max_slippage_bps // 10_000
+    if decoded.min_out < floor or decoded.min_out < quoted_minimum:
+        return "min_out"
+    return None
+
+
 def _decoded_transfer_amount(instructions: tuple[DecodedInstruction, ...]) -> int | None:
     """Sum outer token transfers. ``None`` when the swap is not that shape.
 
@@ -372,9 +416,31 @@ def _simulated(
     if lamports_after[wallet] <= 0:
         return GuardDecision(False, "per_tx_fee")
     drop = lamports_before[wallet] - lamports_after[wallet]
-    if drop > limits.max_fee_lamports:
+    if drop < 0 or drop > limits.max_fee_lamports:
         return GuardDecision(False, "per_tx_fee")
-    return GuardDecision(True, "ok")
+    rent = _rent(simulation, wallet)
+    if rent is None:
+        return GuardDecision(False, "per_tx_fee")
+    fees = split_lamport_drop(drop, rent=rent, signatures=1)
+    if fees is None or fees.total_lamports() != drop:
+        return GuardDecision(False, "per_tx_fee")
+    return GuardDecision(True, "ok", fees)
+
+
+def _rent(simulation: Simulation, wallet: str) -> int | None:
+    """Lamports other accounts gained. Those are rent, not the fee."""
+    before = dict(simulation.lamports_before)
+    after = dict(simulation.lamports_after)
+    gained = 0
+    for account, end in after.items():
+        if account == wallet:
+            continue
+        start = before.get(account, 0)
+        if end < 0 or start < 0:
+            return None
+        if end > start:
+            gained += end - start
+    return gained
 
 
 def _created_authority(

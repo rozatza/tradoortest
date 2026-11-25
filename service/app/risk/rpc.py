@@ -15,10 +15,11 @@ from typing import Protocol
 
 import httpx
 
-from app.risk.programs import KNOWN_PROGRAMS
+from app.risk.programs import KNOWN_PROGRAMS, TOKEN_PROGRAM
 from app.venue.address import encode
 from app.venue.checks import require_block_height
 from app.venue.errors import VenueError
+from app.venue.flags import live_trading_enabled
 
 _LOOKUP_META = 56
 _ACTIVE_SLOT = (1 << 64) - 1
@@ -68,7 +69,12 @@ class Simulation:
 
 
 class ChainRpc(Protocol):
-    """Block height, lookup tables, and simulation. No submit method."""
+    """Block height, accounts, simulation, and a gated submit.
+
+    ``send`` is the only submit. ``HttpChainRpc.send`` posts only when
+    ``LIVE_TRADING_ENABLED`` is exactly ``1``. Tests use ``MockChainRpc``,
+    which records the call and does not open a socket.
+    """
 
     def block_height(self) -> int:
         """The chain's current block height. Not a quote field."""
@@ -76,8 +82,26 @@ class ChainRpc(Protocol):
     def lookup_table(self, address: str) -> LookupTable | None:
         """The on-chain table, or None when the account is missing."""
 
-    def simulate(self, transaction: bytes, accounts: Sequence[str]) -> Simulation:
-        """Pre-sign simulation. ``sigVerify`` stays false."""
+    def account(self, address: str) -> tuple[int, bytes] | None:
+        """Lamports and data, or None when the account is missing."""
+
+    def holdings(self, owner: str) -> tuple[tuple[str, str, int], ...]:
+        """``(account, mint, amount)`` for classic token accounts of ``owner``."""
+
+    def simulate(
+        self,
+        transaction: bytes,
+        accounts: Sequence[str],
+        *,
+        sig_verify: bool = False,
+    ) -> Simulation:
+        """Simulation. ``sig_verify`` asks the chain to check the signature."""
+
+    def send(self, transaction: bytes) -> str:
+        """Submit a signed transaction. Returns the signature string."""
+
+    def confirm(self, signature: str) -> str:
+        """``confirmed``, ``failed``, or ``unknown``."""
 
 
 def chain_block_height(rpc: ChainRpc) -> int:
@@ -124,11 +148,22 @@ class MockChainRpc:
         height: int,
         tables: dict[str, LookupTable] | None = None,
         simulation: Simulation | None = None,
+        accounts: dict[str, tuple[int, bytes]] | None = None,
+        holdings: tuple[tuple[str, str, int], ...] = (),
+        signature_ok: bool = True,
+        confirm_status: str = "confirmed",
+        signature: str = "mock-signature",
     ) -> None:
         self._height = height
         self._tables = {} if tables is None else tables
         self._simulation = simulation
+        self._accounts = {} if accounts is None else accounts
+        self._holdings = holdings
+        self.signature_ok = signature_ok
+        self.confirm_status = confirm_status
+        self.signature = signature
         self.calls: list[object] = []
+        self.sent: list[bytes] = []
 
     def block_height(self) -> int:
         self.calls.append("block_height")
@@ -138,16 +173,53 @@ class MockChainRpc:
         self.calls.append(("lookup", address))
         return self._tables.get(address)
 
-    def simulate(self, transaction: bytes, accounts: Sequence[str]) -> Simulation:
-        self.calls.append("simulate")
+    def account(self, address: str) -> tuple[int, bytes] | None:
+        self.calls.append(("account", address))
+        return self._accounts.get(address)
+
+    def holdings(self, owner: str) -> tuple[tuple[str, str, int], ...]:
+        self.calls.append(("holdings", owner))
+        return self._holdings
+
+    def simulate(
+        self,
+        transaction: bytes,
+        accounts: Sequence[str],
+        *,
+        sig_verify: bool = False,
+    ) -> Simulation:
+        self.calls.append(("simulate", sig_verify))
         del transaction, accounts
         if self._simulation is None:
             raise RpcError("no_simulation")
+        if sig_verify and not self.signature_ok:
+            return Simulation(
+                "bad_signature",
+                self._simulation.deltas,
+                self._simulation.authorities_before,
+                self._simulation.authorities_after,
+                self._simulation.lamports_before,
+                self._simulation.lamports_after,
+            )
         return self._simulation
+
+    def send(self, transaction: bytes) -> str:
+        self.calls.append("send")
+        self.sent.append(bytes(transaction))
+        return self.signature
+
+    def confirm(self, signature: str) -> str:
+        self.calls.append(("confirm", signature))
+        return self.confirm_status
 
 
 class HttpChainRpc:
-    """JSON-RPC over the existing HTTP client. No send, no signature."""
+    """JSON-RPC over the existing HTTP client.
+
+    ``send`` posts ``sendTransaction`` only when live trading is exactly
+    on. ``_call`` still refuses that method, so a simulation helper cannot
+    submit by asking for it.
+    """
 
     def __init__(self, url: str, client: httpx.Client | None = None) -> None:
         self._url = url
@@ -172,7 +244,45 @@ class HttpChainRpc:
         active, addresses = parse_lookup_table(info[1])
         return LookupTable(address, active, addresses)
 
-    def simulate(self, transaction: bytes, accounts: Sequence[str]) -> Simulation:
+    def account(self, address: str) -> tuple[int, bytes] | None:
+        return self._account(address)
+
+    def holdings(self, owner: str) -> tuple[tuple[str, str, int], ...]:
+        payload = self._call(
+            "getTokenAccountsByOwner",
+            [
+                owner,
+                {"programId": TOKEN_PROGRAM},
+                {"encoding": "base64", "commitment": "confirmed"},
+            ],
+        )
+        if not isinstance(payload, dict):
+            raise RpcError("bad_account")
+        rows = payload.get("value")
+        if not isinstance(rows, list):
+            raise RpcError("bad_account")
+        found: list[tuple[str, str, int]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RpcError("bad_account")
+            pubkey = row.get("pubkey")
+            account = row.get("account")
+            if not isinstance(pubkey, str) or not isinstance(account, dict):
+                raise RpcError("bad_account")
+            _lamports, data = _account_value(account)
+            token = _token_amount(data)
+            if token is None or token.owner != owner:
+                continue
+            found.append((pubkey, token.mint, token.amount))
+        return tuple(found)
+
+    def simulate(
+        self,
+        transaction: bytes,
+        accounts: Sequence[str],
+        *,
+        sig_verify: bool = False,
+    ) -> Simulation:
         wanted = tuple(accounts)
         before = [self._account(item) for item in wanted]
         encoded = base64.b64encode(transaction).decode("ascii")
@@ -182,8 +292,8 @@ class HttpChainRpc:
                 encoded,
                 {
                     "encoding": "base64",
-                    "sigVerify": False,
-                    "replaceRecentBlockhash": True,
+                    "sigVerify": bool(sig_verify),
+                    "replaceRecentBlockhash": not sig_verify,
                     "commitment": "confirmed",
                     "accounts": {"encoding": "base64", "addresses": list(wanted)},
                 },
@@ -200,6 +310,45 @@ class HttpChainRpc:
         if not isinstance(after_rows, list) or len(after_rows) != len(wanted):
             raise RpcError("bad_simulation")
         return _simulation_from(wanted, before, after_rows, err_text)
+
+    def send(self, transaction: bytes) -> str:
+        """Submit only when live trading is exactly ``1``. Otherwise closed."""
+        if not live_trading_enabled():
+            raise RpcError("trading_disabled")
+        if not isinstance(transaction, bytes | bytearray) or not transaction:
+            raise RpcError("bad_transaction")
+        encoded = base64.b64encode(bytes(transaction)).decode("ascii")
+        result = self._post(
+            "sendTransaction",
+            [encoded, {"encoding": "base64", "skipPreflight": False}],
+        )
+        if not isinstance(result, str) or result == "" or len(result) > 128:
+            raise RpcError("bad_signature")
+        return result
+
+    def confirm(self, signature: str) -> str:
+        if not isinstance(signature, str) or signature == "" or len(signature) > 128:
+            raise RpcError("bad_signature")
+        payload = self._call(
+            "getSignatureStatuses",
+            [[signature], {"searchTransactionHistory": False}],
+        )
+        if not isinstance(payload, dict):
+            raise RpcError("bad_signature")
+        value = payload.get("value")
+        if not isinstance(value, list) or len(value) != 1:
+            raise RpcError("bad_signature")
+        row = value[0]
+        if row is None:
+            return "unknown"
+        if not isinstance(row, dict):
+            raise RpcError("bad_signature")
+        if row.get("err") is not None:
+            return "failed"
+        status = row.get("confirmationStatus")
+        if status in ("confirmed", "finalized"):
+            return "confirmed"
+        return "unknown"
 
     def _account(self, address: str) -> tuple[int, bytes] | None:
         payload = self._call(
@@ -218,6 +367,9 @@ class HttpChainRpc:
     def _call(self, method: str, params: list[object]) -> object:
         if method == "sendTransaction":
             raise RpcError("send_disabled")
+        return self._post(method, params)
+
+    def _post(self, method: str, params: list[object]) -> object:
         self.methods.append(method)
         client = self._http()
         try:

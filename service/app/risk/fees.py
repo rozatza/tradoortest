@@ -90,6 +90,34 @@ def set_day_clock(clock: Callable[[], int] | None) -> None:
     _clock = time.time if clock is None else clock
 
 
+_BASE_FEE_LAMPORTS = 5_000
+
+
+def split_lamport_drop(drop: int, *, rent: int, signatures: int) -> FeeLines | None:
+    """Split a wallet lamport drop into network, priority, and rent.
+
+    The three lines add up to ``drop``. Rent is the lamports that other
+    accounts gained. The network line is the base fee, and whatever is
+    left is the priority fee. A negative or an over-large rent is refused.
+    """
+    if isinstance(drop, bool) or isinstance(rent, bool) or isinstance(signatures, bool):
+        return None
+    if not isinstance(drop, int) or not isinstance(rent, int) or not isinstance(signatures, int):
+        return None
+    if drop < 0 or rent < 0 or signatures < 1 or rent > drop:
+        return None
+    rest = drop - rent
+    network = _BASE_FEE_LAMPORTS * signatures
+    if network > rest:
+        network = rest
+        priority = 0
+    else:
+        priority = rest - network
+    if network + priority + rent != drop:
+        return None
+    return FeeLines(network, priority, rent)
+
+
 def add_fees(ledger: DayLedger, fees: FeeLines) -> DayLedger:
     """Add the three lines and the venue fee. Does not touch strategy P&L."""
     venue = fees.venue_fee_amount or 0
