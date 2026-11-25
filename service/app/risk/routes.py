@@ -29,7 +29,7 @@ router = APIRouter()
 class SubmitIn(BaseModel):
     """One live check. Extra fields are rejected.
 
-    ``day`` is ignored. The ledger day is the server's UTC date.
+    The ledger day is the server's UTC date. The body does not carry one.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -57,7 +57,6 @@ class SubmitIn(BaseModel):
     wallet_value_usd: str
     out_amount: int
     minimum_out_amount: int
-    day: str | None = None
     input_mint: str | None = None
     output_mint: str | None = None
     in_amount: int = 0
@@ -99,6 +98,11 @@ async def flatten(request: Request, body: SubmitIn) -> JSONResponse:
         return _forbidden()
     if body.action != "flatten" or body.side != "sell":
         return JSONResponse(status_code=422, content={"error": {"code": "bad_side"}})
+    if _negative_fee_body(body):
+        return JSONResponse(
+            status_code=422,
+            content={"accepted": False, "code": "per_tx_fee", "sent": False, "resized": False},
+        )
     store = _day_store(request)
     if isinstance(store, JSONResponse):
         return store
@@ -132,6 +136,11 @@ async def submit(request: Request, body: SubmitIn) -> JSONResponse:
         return JSONResponse(
             status_code=409,
             content={"accepted": False, "code": "killed", "sent": False},
+        )
+    if _negative_fee_body(body):
+        return JSONResponse(
+            status_code=422,
+            content={"accepted": False, "code": "per_tx_fee", "sent": False, "resized": False},
         )
     store = _day_store(request)
     if isinstance(store, JSONResponse):
@@ -262,12 +271,18 @@ def _day_store(request: Request) -> SqliteBarStore | JSONResponse:
         )
 
 
+def _negative_fee_body(body: SubmitIn) -> bool:
+    parts = (body.network_fee_lamports, body.priority_fee_lamports, body.rent_lamports)
+    return any(isinstance(part, bool) or not isinstance(part, int) or part < 0 for part in parts)
+
+
 def _decimal(text: str) -> Decimal | None:
+    """A finite decimal. A negative number is rejected here, before it is booked."""
     try:
         number = Decimal(text)
     except Exception:
         return None
-    if not number.is_finite():
+    if not number.is_finite() or number < 0:
         return None
     return number
 

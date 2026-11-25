@@ -214,8 +214,9 @@ def _token(
     if discriminator == TOKEN_SYNC_NATIVE:
         return None
     if discriminator in (TOKEN_TRANSFER, TOKEN_TRANSFER_CHECKED):
-        dest = 1
-        authority = 3 if discriminator == TOKEN_TRANSFER_CHECKED else 2
+        checked = discriminator == TOKEN_TRANSFER_CHECKED
+        dest = 2 if checked else 1
+        authority = 3 if checked else 2
         if len(accounts) <= authority:
             return "instruction"
         if accounts[authority].pubkey != wallet:
@@ -224,8 +225,9 @@ def _token(
             return "destination"
         return None
     if discriminator in (TOKEN_APPROVE, TOKEN_APPROVE_CHECKED):
-        delegate = 1
-        owner = 3 if discriminator == TOKEN_APPROVE_CHECKED else 2
+        checked = discriminator == TOKEN_APPROVE_CHECKED
+        delegate = 2 if checked else 1
+        owner = 3 if checked else 2
         if len(accounts) <= owner:
             return "instruction"
         if accounts[owner].pubkey != wallet or accounts[delegate].pubkey not in owned:
@@ -325,7 +327,7 @@ def _simulated(
         return GuardDecision(False, "amount_unverified")
     if input_mint == "" or output_mint == "" or input_mint == output_mint:
         return GuardDecision(False, "mint_mismatch")
-    if simulation.owner_changed:
+    if simulation.owner_changed or simulation.controls_changed:
         return GuardDecision(False, "authority_change")
     before = {item.account: item for item in simulation.authorities_before}
     after = {item.account: item for item in simulation.authorities_after}
@@ -337,6 +339,8 @@ def _simulated(
         freeze_changed = left.freeze_authority != right.freeze_authority
         if mint_changed or freeze_changed:
             return GuardDecision(False, "authority_change")
+    if any(account != wallet for account in simulation.closed):
+        return GuardDecision(False, "account_closed")
     deltas = {item.account: item for item in simulation.deltas}
     spent = deltas.get(input_account)
     received = deltas.get(output_account)
@@ -358,10 +362,13 @@ def _simulated(
         return GuardDecision(False, "amount_mismatch")
     lamports_before = dict(simulation.lamports_before)
     lamports_after = dict(simulation.lamports_after)
-    if wallet in lamports_before and wallet in lamports_after:
-        drop = lamports_before[wallet] - lamports_after[wallet]
-        if drop > limits.max_fee_lamports:
-            return GuardDecision(False, "per_tx_fee")
+    if wallet not in lamports_before or wallet not in lamports_after:
+        return GuardDecision(False, "per_tx_fee")
+    if lamports_after[wallet] <= 0:
+        return GuardDecision(False, "per_tx_fee")
+    drop = lamports_before[wallet] - lamports_after[wallet]
+    if drop > limits.max_fee_lamports:
+        return GuardDecision(False, "per_tx_fee")
     return GuardDecision(True, "ok")
 
 

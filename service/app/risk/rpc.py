@@ -61,6 +61,8 @@ class Simulation:
     lamports_after: tuple[tuple[str, int], ...]
     owner_changed: tuple[str, ...] = ()
     unparsed: tuple[str, ...] = ()
+    controls_changed: tuple[str, ...] = ()
+    closed: tuple[str, ...] = ()
 
 
 class ChainRpc(Protocol):
@@ -279,20 +281,21 @@ def _simulation_from(
     lamports_after: list[tuple[str, int]] = []
     owner_changed: list[str] = []
     unparsed: list[str] = []
+    controls_changed: list[str] = []
+    closed: list[str] = []
     for address, prior, row in zip(accounts, before, after_rows, strict=True):
         if address in KNOWN_PROGRAMS:
             continue
         if prior is not None:
             lamports_before.append((address, prior[0]))
-            if classify_account(prior[1]) == "unparsed":
-                unparsed.append(address)
+            _note_unparsed(address, prior[1], unparsed)
         if row is None:
+            if prior is not None:
+                closed.append(address)
             continue
         lamports, data = _account_value(row)
         lamports_after.append((address, lamports))
-        kind = classify_account(data)
-        if kind == "unparsed" and address not in unparsed:
-            unparsed.append(address)
+        _note_unparsed(address, data, unparsed)
         if prior is None or address in unparsed:
             continue
         prior_auth = _mint_authorities(prior[1])
@@ -302,18 +305,21 @@ def _simulation_from(
             authorities_after.append(AuthorityView(address, next_auth[0], next_auth[1]))
         prior_token = _token_amount(prior[1])
         next_token = _token_amount(data)
-        if prior_token is not None and next_token is not None:
-            if prior_token[1] != next_token[1]:
-                owner_changed.append(address)
-            deltas.append(
-                TokenDelta(
-                    address,
-                    prior_token[0],
-                    prior_token[1],
-                    prior_token[2],
-                    next_token[2],
-                )
+        if prior_token is None or next_token is None:
+            continue
+        if prior_token.owner != next_token.owner:
+            owner_changed.append(address)
+        if _controls_differ(prior_token, next_token):
+            controls_changed.append(address)
+        deltas.append(
+            TokenDelta(
+                address,
+                prior_token.mint,
+                prior_token.owner,
+                prior_token.amount,
+                next_token.amount,
             )
+        )
     return Simulation(
         err,
         tuple(deltas),
@@ -323,6 +329,8 @@ def _simulation_from(
         tuple(lamports_after),
         tuple(owner_changed),
         tuple(unparsed),
+        tuple(controls_changed),
+        tuple(closed),
     )
 
 
@@ -333,11 +341,61 @@ def _mint_authorities(data: bytes) -> tuple[bytes, bytes] | None:
     return data[0:36], data[46:82]
 
 
-def _token_amount(data: bytes) -> tuple[str, str, int] | None:
-    """Mint, owner, and amount from a 165-byte token account."""
+@dataclass(frozen=True, slots=True)
+class TokenView:
+    """Classic token account. Delegate and close authority are part of the check."""
+
+    mint: str
+    owner: str
+    amount: int
+    delegate: bytes
+    delegated_amount: int
+    close_authority: bytes
+
+
+def _note_unparsed(address: str, data: bytes, found: list[str]) -> None:
+    if address in found:
+        return
+    if classify_account(data) == "unparsed":
+        found.append(address)
+        return
+    if len(data) == 165 and _token_amount(data) is None:
+        found.append(address)
+
+
+def _controls_differ(left: TokenView, right: TokenView) -> bool:
+    if left.delegate != right.delegate or left.close_authority != right.close_authority:
+        return True
+    return left.delegated_amount != right.delegated_amount
+
+
+def _option_key(data: bytes, tag_at: int) -> bytes | None:
+    """A COption pubkey. ``b""`` when the tag is 0. None when the tag is neither."""
+    tag = int.from_bytes(data[tag_at : tag_at + 4], "little")
+    if tag == 0:
+        return b""
+    if tag == 1:
+        return bytes(data[tag_at + 4 : tag_at + 36])
+    return None
+
+
+def _token_amount(data: bytes) -> TokenView | None:
+    """Mint, owner, amount, delegate, delegated amount, and close authority.
+
+    A 165-byte account with a delegate or close-authority tag other than
+    0 or 1 is not parsed. The caller treats that as unverified.
+    """
     if len(data) != 165:
         return None
-    mint = encode(data[0:32])
-    owner = encode(data[32:64])
-    amount = int.from_bytes(data[64:72], "little")
-    return mint, owner, amount
+    delegate = _option_key(data, 72)
+    close_authority = _option_key(data, 129)
+    if delegate is None or close_authority is None:
+        return None
+    return TokenView(
+        encode(data[0:32]),
+        encode(data[32:64]),
+        int.from_bytes(data[64:72], "little"),
+        delegate,
+        int.from_bytes(data[121:129], "little"),
+        close_authority,
+    )

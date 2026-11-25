@@ -24,7 +24,7 @@ from app.ohlcv.store import SqliteBarStore
 from app.risk.access import host_allowed, origin_allowed
 from app.risk.bind import require_loopback
 from app.risk.control import apply_kill
-from app.risk.engine import LiveOrder, evaluate, startup_refuses_wallet
+from app.risk.engine import LiveOrder, _book, evaluate, startup_refuses_wallet
 from app.risk.fees import (
     DayLedger,
     FeeLines,
@@ -84,8 +84,10 @@ from app.risk.programs import (
     JUPITER_V6_PROGRAM,
     SYSTEM_PROGRAM,
     TOKEN_2022_PROGRAM,
+    TOKEN_APPROVE_CHECKED,
     TOKEN_CLOSE,
     TOKEN_PROGRAM,
+    TOKEN_TRANSFER_CHECKED,
 )
 from app.risk.rpc import (
     AuthorityView,
@@ -94,6 +96,7 @@ from app.risk.rpc import (
     MockChainRpc,
     Simulation,
     TokenDelta,
+    _simulation_from,
     classify_account,
     default_rpc,
     parse_lookup_table,
@@ -937,7 +940,6 @@ def _body(**overrides: object) -> dict[str, object]:
         "wallet_value_usd": "20",
         "out_amount": 10_000,
         "minimum_out_amount": 9_950,
-        "day": _DAY,
     }
     body.update(overrides)
     return body
@@ -972,10 +974,12 @@ def test_a_future_day_cannot_reset_a_halted_ledger(
     client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
     headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
     try:
-        future = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        future = client.post("/live/submit", json=_body(), headers=headers)
         assert future.status_code == 422
         assert future.json()["accepted"] is False
         assert future.json()["code"] == "daily_halt"
+        dated = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        assert dated.status_code == 422
         row = store.read_live_day()
         assert row is not None
         assert row[0] == _DAY
@@ -991,7 +995,7 @@ def test_a_future_day_cannot_reset_a_halted_ledger(
         booked = SqliteBarStore(tmp_path / "booked.sqlite")
         save_day(DayLedger(_DAY, notional_usd=Decimal("2.50")), booked)
         app.state.live_day_store = booked
-        missed = client.post("/live/submit", json=_body(day="2026-11-26"), headers=headers)
+        missed = client.post("/live/submit", json=_body(), headers=headers)
         assert missed.status_code == 422
         assert missed.json()["code"] == "missing_transaction"
         kept = booked.read_live_day()
@@ -1108,6 +1112,211 @@ def test_a_wrong_mint_or_token2022_account_is_rejected() -> None:
     assert _guard(built, MockChainRpc(height=1, simulation=mint_2022)).code == "amount_unverified"
     assert _guard(built, MockChainRpc(height=1, simulation=token_2022)).code == "amount_unverified"
     assert _parsed(200, TOKEN_PROGRAM).unparsed == ()
+
+
+def _token_bytes(
+    mint: str,
+    owner: str,
+    amount: int,
+    *,
+    delegate: str | None = None,
+    delegated: int = 0,
+    close: str | None = None,
+) -> bytes:
+    raw = bytearray(165)
+    raw[0:32] = address_bytes(mint)
+    raw[32:64] = address_bytes(owner)
+    raw[64:72] = amount.to_bytes(8, "little")
+    if delegate is not None:
+        raw[72:76] = (1).to_bytes(4, "little")
+        raw[76:108] = address_bytes(delegate)
+        raw[121:129] = delegated.to_bytes(8, "little")
+    raw[108] = 1
+    if close is not None:
+        raw[129:133] = (1).to_bytes(4, "little")
+        raw[133:165] = address_bytes(close)
+    return bytes(raw)
+
+
+def _rpc_row(lamports: int, data: bytes) -> dict[str, object]:
+    encoded = base64.b64encode(data).decode("ascii")
+    return {"lamports": lamports, "data": [encoded, "base64"]}
+
+
+def _parsed_sim(
+    extra_before: list[tuple[str, tuple[int, bytes]]],
+    extra_after: list[object],
+    *,
+    wallet_after: int | None = 995_000,
+    input_amount: int = 4_000,
+    output_amount: int = 1_900,
+    input_delegate: str | None = None,
+    input_delegated: int = 0,
+    output_close: str | None = None,
+) -> Simulation:
+    accounts = (_WALLET, _POOL, _TABLE) + tuple(item[0] for item in extra_before)
+    before: list[tuple[int, bytes] | None] = [
+        (1_000_000, b""),
+        (2_039_280, _token_bytes(SOL_MINT, _WALLET, 5_000)),
+        (2_039_280, _token_bytes(_USDC, _WALLET, 0)),
+    ]
+    before.extend(item[1] for item in extra_before)
+    wallet_row = None if wallet_after is None else _rpc_row(wallet_after, b"")
+    after: list[object] = [
+        wallet_row,
+        _rpc_row(
+            2_039_280,
+            _token_bytes(
+                SOL_MINT,
+                _WALLET,
+                input_amount,
+                delegate=input_delegate,
+                delegated=input_delegated,
+            ),
+        ),
+        _rpc_row(
+            2_039_280,
+            _token_bytes(_USDC, _WALLET, output_amount, close=output_close),
+        ),
+    ]
+    after.extend(extra_after)
+    return _simulation_from(accounts, before, after, None)
+
+
+def _decide(simulation: Simulation) -> object:
+    return _guard(_assemble(_swap()), MockChainRpc(height=10, simulation=simulation))
+
+
+def test_a_closed_wallet_account_is_rejected() -> None:
+    assert _decide(_parsed_sim([], [])).accepted is True
+    held = (500_000_000 + 2_039_280, _token_bytes(SOL_MINT, _WALLET, 500_000_000))
+    closed = _parsed_sim([(_OTHER, held)], [None])
+    assert _decide(closed).code == "account_closed"
+
+
+def test_a_drained_wallet_fails_the_fee_check() -> None:
+    gone = _parsed_sim([], [], wallet_after=None)
+    assert _decide(gone).code == "per_tx_fee"
+    drained = _parsed_sim([], [], wallet_after=0)
+    assert _decide(drained).code == "per_tx_fee"
+
+
+def test_a_delegate_or_close_authority_change_is_rejected() -> None:
+    approved = _parsed_sim(
+        [],
+        [],
+        input_delegate=_OTHER,
+        input_delegated=4_000,
+        output_close=_OTHER,
+    )
+    assert _decide(approved).code == "authority_change"
+    delegated_only = _parsed_sim([], [], input_delegate=_OTHER, input_delegated=4_000)
+    assert _decide(delegated_only).code == "authority_change"
+    close_only = _parsed_sim([], [], output_close=_OTHER)
+    assert _decide(close_only).code == "authority_change"
+    bumped = bytearray(_token_bytes(SOL_MINT, _WALLET, 4_000))
+    bumped[121:129] = (4_000).to_bytes(8, "little")
+    accounts = (_WALLET, _POOL, _TABLE)
+    before = [
+        (1_000_000, b""),
+        (2_039_280, _token_bytes(SOL_MINT, _WALLET, 5_000)),
+        (2_039_280, _token_bytes(_USDC, _WALLET, 0)),
+    ]
+    after = [
+        _rpc_row(995_000, b""),
+        _rpc_row(2_039_280, bytes(bumped)),
+        _rpc_row(2_039_280, _token_bytes(_USDC, _WALLET, 1_900)),
+    ]
+    changed = _simulation_from(accounts, before, after, None)
+    assert _decide(changed).code == "authority_change"
+
+
+def test_a_negative_notional_does_not_rewind_the_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day = DayLedger(_DAY, notional_usd=Decimal("9.99"))
+    booked = evaluate(_order(notional_usd=Decimal("-100")), day, today=_DAY)
+    assert booked.accepted is False
+    assert booked.code == "bad_notional"
+    assert booked.ledger.notional_usd == Decimal("9.99")
+    zero = evaluate(_order(notional_usd=Decimal("0")), day, today=_DAY)
+    assert zero.code == "bad_notional"
+    assert zero.ledger.notional_usd == Decimal("9.99")
+    assert _book(_order(notional_usd=Decimal("-100")), day).notional_usd == Decimal("9.99")
+    fee = evaluate(_order(fees=FeeLines(-1, 0, 0)), empty_day(_DAY), today=_DAY)
+    assert fee.code == "per_tx_fee"
+    assert fee.ledger.notional_usd == Decimal("0")
+    poisoned = FeeLines(5_000, 0, 0, venue_fee_amount=-1)
+    venue = evaluate(_order(fees=poisoned), empty_day(_DAY), today=_DAY)
+    assert venue.code == "per_tx_fee"
+    assert venue.ledger.network_lamports == 0
+    path = tmp_path / "kill"
+    path.write_bytes(b"0")
+    monkeypatch.setenv("LIVE_KILL_FILE", str(path))
+    monkeypatch.setenv("LIVE_CONTROL_TOKEN", "test")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    _freeze(_DAY)
+    store = SqliteBarStore(tmp_path / "day.sqlite")
+    save_day(day, store)
+    app = create_app()
+    app.state.live_day_store = store
+    client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234))
+    headers = {"origin": "http://127.0.0.1", "x-live-token": "test"}
+    try:
+        negative = client.post("/live/submit", json=_body(notional_usd="-100"), headers=headers)
+        assert negative.status_code == 422
+        assert negative.json()["code"] == "missing_mark"
+        charged = client.post(
+            "/live/submit",
+            json=_body(network_fee_lamports=-1),
+            headers=headers,
+        )
+        assert charged.status_code == 422
+        assert charged.json()["code"] == "per_tx_fee"
+        row = store.read_live_day()
+        assert row is not None
+        assert Decimal(str(row[1])) == Decimal("9.99")
+    finally:
+        store.close()
+
+
+def test_checked_token_indexes_point_past_the_mint() -> None:
+    own = (
+        AccountRole(_POOL, False, True),
+        AccountRole(SOL_MINT, False, False),
+        AccountRole(_TABLE, False, True),
+        AccountRole(_WALLET, True, False),
+    )
+    amount = (1_000).to_bytes(8, "little") + bytes([9])
+    data = bytes([TOKEN_TRANSFER_CHECKED]) + amount
+    moved = _assemble(_swap(DecodedInstruction(TOKEN_PROGRAM, own, data)))
+    assert _guard(moved, MockChainRpc(height=10, simulation=_sim())).accepted is True
+    stolen_accounts = (
+        AccountRole(_POOL, False, True),
+        AccountRole(SOL_MINT, False, False),
+        AccountRole(_OTHER, False, True),
+        AccountRole(_WALLET, True, False),
+    )
+    stolen = _assemble(
+        _swap(
+            DecodedInstruction(
+                TOKEN_PROGRAM,
+                stolen_accounts,
+                bytes([TOKEN_TRANSFER_CHECKED]) + amount,
+            )
+        )
+    )
+    assert _guard(stolen, MockChainRpc(height=1)).code == "destination"
+    approved = _assemble(
+        _swap(
+            DecodedInstruction(
+                TOKEN_PROGRAM,
+                stolen_accounts,
+                bytes([TOKEN_APPROVE_CHECKED]) + amount,
+            )
+        )
+    )
+    assert _guard(approved, MockChainRpc(height=1)).code == "destination"
 
 
 def test_shadow_backlog_refuses_extra_work_without_waiting() -> None:

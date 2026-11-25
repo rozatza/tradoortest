@@ -193,6 +193,8 @@ def _mark(order: LiveOrder, _ledger: DayLedger, _limits: RiskLimits) -> str | No
 def _notional(order: LiveOrder, ledger: DayLedger, limits: RiskLimits) -> str | None:
     if order.notional_usd is None:
         return "missing_mark"
+    if order.notional_usd <= 0:
+        return "bad_notional"
     if order.notional_usd > limits.per_trade_usd:
         return "per_trade"
     if ledger.notional_usd + order.notional_usd > limits.daily_notional_usd:
@@ -296,8 +298,7 @@ def _fees(order: LiveOrder, ledger: DayLedger, limits: RiskLimits) -> str | None
     fees = order.fees
     if fees is None:
         return "missing_fee"
-    parts = (fees.network_lamports, fees.priority_lamports, fees.rent_lamports)
-    if any(isinstance(part, bool) or not isinstance(part, int) or part < 0 for part in parts):
+    if _negative_fee(fees):
         return "per_tx_fee"
     total = fees.total_lamports()
     if total > limits.max_fee_lamports:
@@ -318,11 +319,33 @@ def _ceiling(order: LiveOrder, _ledger: DayLedger, limits: RiskLimits) -> str | 
 
 
 def _book(order: LiveOrder, ledger: DayLedger) -> DayLedger:
-    notional = Decimal("0") if order.notional_usd is None else order.notional_usd
+    """Add a positive notional. Zero and negative are not applied."""
+    notional = order.notional_usd
+    if notional is not None and notional <= 0:
+        return ledger
+    if notional is None:
+        notional = Decimal("0")
     if order.fees is None:
         return replace(ledger, notional_usd=ledger.notional_usd + notional)
+    if _negative_fee(order.fees):
+        return ledger
     booked = add_fees(ledger, order.fees)
     return replace(booked, notional_usd=booked.notional_usd + notional)
+
+
+def _negative_fee(fees: FeeLines) -> bool:
+    parts = (
+        fees.network_lamports,
+        fees.priority_lamports,
+        fees.rent_lamports,
+        fees.venue_fee_amount,
+    )
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, bool) or not isinstance(part, int) or part < 0:
+            return True
+    return False
 
 
 def _implied_bps(out_amount: int, minimum_out: int) -> int | None:
