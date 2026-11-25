@@ -102,6 +102,7 @@ def observe_shadow(
     document: Mapping[str, Any],
     now: int,
     venue: object | None = None,
+    chain_rpc: object | None = None,
 ) -> None:
     """Quote fills that do not yet have a shadow row. The paper book is not written.
 
@@ -129,6 +130,7 @@ def observe_shadow(
                 fill=fill,
                 now=now,
                 slippage=slippage,
+                chain_rpc=chain_rpc,
             )
         except Exception as exc:
             logger.warning(
@@ -185,6 +187,7 @@ def _one(
     fill: tuple[object, ...],
     now: int,
     slippage: int,
+    chain_rpc: object | None = None,
 ) -> None:
     fill_id, open_time, asset_id, side, qty, notional = fill
     base = {
@@ -244,7 +247,7 @@ def _one(
     base["network_fee_lamports"] = quote.network_fee_lamports
     base["priority_fee_lamports"] = quote.priority_fee_lamports
     base["rent_lamports"] = quote.rent_fee_lamports
-    _maybe_build(store, venue, quote, base, now=now, slippage=slippage)
+    _maybe_build(store, venue, quote, base, now=now, slippage=slippage, chain_rpc=chain_rpc)
     store.insert_paper_shadow(base)
 
 
@@ -256,12 +259,14 @@ def _maybe_build(
     *,
     now: int,
     slippage: int,
+    chain_rpc: object | None = None,
 ) -> None:
     if not shadow_build_enabled():
         base["build_status"] = "not_requested"
         return
     taker = _taker()
-    height = getattr(getattr(quote, "expiry", None), "last_valid_block_height", None)
+    # The quote's lastValidBlockHeight is the venue expiry, not the chain tip.
+    height = _chain_height(chain_rpc)
     if taker is None:
         base["build_status"] = "skipped"
         base["error_code"] = "no_taker"
@@ -356,6 +361,19 @@ def _plain(text: str) -> str:
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
+
+
+def _chain_height(chain_rpc: object | None) -> int | None:
+    """Block height from an RPC interface. A quote field is not accepted."""
+    from app.risk.rpc import chain_block_height, default_rpc
+
+    rpc = chain_rpc if chain_rpc is not None else default_rpc()
+    if rpc is None:
+        return None
+    try:
+        return chain_block_height(rpc)
+    except Exception:
+        return None
 
 
 def _taker() -> str | None:

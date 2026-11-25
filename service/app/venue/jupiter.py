@@ -201,6 +201,8 @@ class JupiterVenue:
             now,
         )
         parsed = parse_build(payload)
+        if parsed.route_label != quote.route_label:
+            raise VenueRejected("route_mismatch")
         if current > parsed.last_valid_block_height:
             raise VenueExpired("quote_expired")
         require_build_matches(
@@ -235,7 +237,26 @@ class JupiterVenue:
         for attempt in range(_ATTEMPTS):
             self._pace.acquire(now)
             try:
-                response = self._http().get(url, params=params, headers=self._headers())
+                with self._http().stream(
+                    "GET", url, params=params, headers=self._headers()
+                ) as response:
+                    last_status = response.status_code
+                    if response.status_code == 429 or response.status_code >= 500:
+                        if attempt == _ATTEMPTS - 1:
+                            code = response.status_code
+                            raise VenueTransportError(f"Jupiter returned HTTP {code}")
+                        delay = self._delay(backoff, response, response.status_code)
+                        self._pause(delay)
+                        backoff = min(backoff * 2, 120.0)
+                        continue
+                    if response.status_code != 200:
+                        code = response.status_code
+                        raise VenueTransportError(f"Jupiter returned HTTP {code}")
+                    content = self._read_capped(response)
+            except VenueSchemaError:
+                raise
+            except VenueTransportError:
+                raise
             except httpx.TimeoutException:
                 if attempt == _ATTEMPTS - 1:
                     raise VenueTransportError("Jupiter request timed out") from None
@@ -250,22 +271,20 @@ class JupiterVenue:
                 continue
             except httpx.HTTPError:
                 raise VenueTransportError("Jupiter request failed") from None
-            last_status = response.status_code
-            if response.status_code == 429 or response.status_code >= 500:
-                if attempt == _ATTEMPTS - 1:
-                    raise VenueTransportError(f"Jupiter returned HTTP {response.status_code}")
-                self._pause(self._delay(backoff, response, response.status_code))
-                backoff = min(backoff * 2, 120.0)
-                continue
-            if response.status_code != 200:
-                raise VenueTransportError(f"Jupiter returned HTTP {response.status_code}")
-            if len(response.content) > MAX_RESPONSE_BYTES:
-                raise VenueSchemaError("response_too_large")
-            payload = loads(response.content)
+            payload = loads(content)
             if not isinstance(payload, dict):
                 raise VenueSchemaError("bad_object")
             return payload
         raise VenueTransportError(f"Jupiter returned HTTP {last_status}")
+
+    def _read_capped(self, response: httpx.Response) -> bytes:
+        """Stop once the body exceeds the cap. The rest is not stored."""
+        buf = bytearray()
+        for chunk in response.iter_bytes():
+            if len(buf) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise VenueSchemaError("response_too_large")
+            buf.extend(chunk)
+        return bytes(buf)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}

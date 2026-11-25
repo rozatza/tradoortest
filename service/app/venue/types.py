@@ -124,6 +124,11 @@ class UnsignedTransaction:
     ``account_keys`` is the full list: static keys, then writable loaded
     addresses, then readonly loaded addresses. ``fee_payer`` is
     ``account_keys[0]``.
+
+    ``quote_in_amount``, ``quote_out_amount``, and
+    ``quote_minimum_out_amount`` are copied from the quote. They are not
+    decoded from the instruction bytes. The pre-sign guard ignores them
+    and checks a simulation balance delta instead.
     """
 
     transaction: bytes
@@ -135,9 +140,9 @@ class UnsignedTransaction:
     lookup_tables: tuple[ResolvedLookupTable, ...]
     input_mint: str
     output_mint: str
-    in_amount: int
-    out_amount: int
-    minimum_out_amount: int
+    quote_in_amount: int
+    quote_out_amount: int
+    quote_minimum_out_amount: int
     last_valid_block_height: int
     transaction_version: int
 

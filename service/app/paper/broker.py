@@ -156,6 +156,8 @@ class PaperBroker:
         now: Callable[[], int] | None = None,
         user_id: str = LOCAL_USER_ID,
         shadow_venue: object | None = None,
+        chain_rpc: object | None = None,
+        shadow_queue: object | None = None,
     ) -> None:
         self._store = store
         self._now = (lambda: int(time.time())) if now is None else now
@@ -166,6 +168,8 @@ class PaperBroker:
         self._stepped: dict[tuple[str, int], int | None] = {}
         self._hold: frozenset[tuple[str, str]] = frozenset()
         self._shadow_venue = shadow_venue
+        self._chain_rpc = chain_rpc
+        self._shadow_queue = shadow_queue
 
     def tick(self, *, hold: Collection[tuple[str, str]] | None = None) -> None:
         """Fill new closed bars for every registration. Decisions are not read.
@@ -390,6 +394,12 @@ class PaperBroker:
         self._origin[key] = chosen
         return chosen
 
+    def flush_shadow(self, timeout: float = 5.0) -> None:
+        """Wait for shadow jobs this broker queued. A tick does not call this."""
+        queue = self._shadow_queue
+        if queue is not None:
+            queue.flush(timeout)  # type: ignore[attr-defined]
+
     def _observe_shadow(
         self,
         strategy_id: str,
@@ -397,25 +407,44 @@ class PaperBroker:
         document: Mapping[str, Any],
         now: int,
     ) -> None:
-        """Quote the fill that was just committed. A failure does not change it."""
+        """Enqueue the quote. The tick does not wait on the venue."""
         try:
-            from app.paper.shadow import observe_shadow
+            from app.paper.shadow import shadow_quotes_enabled
+            from app.paper.shadow_queue import ShadowJob, record_backlog
 
-            observe_shadow(
-                self._store,
+            if not shadow_quotes_enabled():
+                return
+            job = ShadowJob(
+                store=self._store,
                 user_id=self._user_id,
                 strategy_id=strategy_id,
                 version=version,
                 document=document,
                 now=now,
                 venue=self._shadow_venue,
+                chain_rpc=self._chain_rpc,
             )
+            if not self._queue().submit(job):
+                record_backlog(
+                    self._store,
+                    user_id=self._user_id,
+                    strategy_id=strategy_id,
+                    version=version,
+                    now=now,
+                )
         except Exception:
             logger.warning(
                 "shadow quote failed strategy_id=%s version=%s",
                 strategy_id,
                 version,
             )
+
+    def _queue(self) -> Any:
+        if self._shadow_queue is None:
+            from app.paper.shadow_queue import ShadowQueue
+
+            self._shadow_queue = ShadowQueue()
+        return self._shadow_queue
 
     def _load_book(
         self, strategy_id: str, version: int, costs: _Costs

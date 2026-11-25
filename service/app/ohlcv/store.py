@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from decimal import Decimal
 from functools import wraps
 from pathlib import Path
 from typing import Protocol
@@ -304,6 +305,18 @@ CREATE TABLE IF NOT EXISTS shadow_budget (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     day_key INTEGER NOT NULL,
     calls INTEGER NOT NULL
+);
+-- Live day caps. UTC day key. No price and no payload. The purge skips it.
+CREATE TABLE IF NOT EXISTS live_day (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    day_key TEXT NOT NULL,
+    notional_usd TEXT NOT NULL,
+    realized_loss_usd TEXT NOT NULL,
+    network_lamports INTEGER NOT NULL,
+    priority_lamports INTEGER NOT NULL,
+    rent_lamports INTEGER NOT NULL,
+    venue_fee_amount INTEGER NOT NULL,
+    halted INTEGER NOT NULL
 );
 """
 
@@ -1815,6 +1828,52 @@ class SqliteBarStore:
             return True
 
     @_serialized
+    def read_live_day(self) -> tuple[object, ...] | None:
+        """The live day cap, or None before the first save. Not purged."""
+        row = self._conn.execute(
+            """
+            SELECT day_key, notional_usd, realized_loss_usd,
+                   network_lamports, priority_lamports, rent_lamports,
+                   venue_fee_amount, halted
+            FROM live_day WHERE id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return tuple(row)
+
+    @_serialized
+    def write_live_day(self, row: tuple[object, ...]) -> None:
+        """Replace the one live-day row. No price column and no payload."""
+        if len(row) != 8:
+            raise StoreError("bad_ledger")
+        day_key = _live_day_key(row[0])
+        notional = _live_money(row[1])
+        loss = _live_money(row[2])
+        lamports = tuple(_live_lamports(item) for item in row[3:7])
+        halted = _live_flag(row[7])
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO live_day (
+                    id, day_key, notional_usd, realized_loss_usd,
+                    network_lamports, priority_lamports, rent_lamports,
+                    venue_fee_amount, halted
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    day_key = excluded.day_key,
+                    notional_usd = excluded.notional_usd,
+                    realized_loss_usd = excluded.realized_loss_usd,
+                    network_lamports = excluded.network_lamports,
+                    priority_lamports = excluded.priority_lamports,
+                    rent_lamports = excluded.rent_lamports,
+                    venue_fee_amount = excluded.venue_fee_amount,
+                    halted = excluded.halted
+                """,
+                (day_key, notional, loss, *lamports, halted),
+            )
+
+    @_serialized
     def paper_fills(
         self, *, user_id: str, strategy_id: str, version: int
     ) -> list[tuple[object, ...]]:
@@ -2571,6 +2630,43 @@ class SqliteBarStore:
 def _owner(user_id: str) -> None:
     if not isinstance(user_id, str) or user_id == "":
         raise StoreError("user_id is required")
+
+
+def _live_day_key(value: object) -> str:
+    if not isinstance(value, str) or len(value) != 10:
+        raise StoreError("bad_ledger")
+    year, month, day = value[:4], value[5:7], value[8:]
+    if value[4] != "-" or value[7] != "-" or not (year + month + day).isdigit():
+        raise StoreError("bad_ledger")
+    return value
+
+
+def _live_money(value: object) -> str:
+    if not isinstance(value, str) or value == "" or len(value) > 64:
+        raise StoreError("bad_ledger")
+    if any(char in value for char in "\n\r\x00"):
+        raise StoreError("bad_ledger")
+    try:
+        number = Decimal(value)
+    except Exception:
+        raise StoreError("bad_ledger") from None
+    if not number.is_finite() or number < 0:
+        raise StoreError("bad_ledger")
+    return format(number, "f")
+
+
+def _live_lamports(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StoreError("bad_ledger")
+    return value
+
+
+def _live_flag(value: object) -> int:
+    if value is True or value == 1:
+        return 1
+    if value is False or value == 0:
+        return 0
+    raise StoreError("bad_ledger")
 
 
 def _paper_detail(body: Mapping[str, object]) -> str:

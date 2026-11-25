@@ -113,6 +113,8 @@ That read does not halt the strategy. `history_before_origin` is not a status. T
 
 `SHADOW_SLIPPAGE_BPS` is the `slippageBps` query parameter sent on both `/order` and `/build`. Blank keeps 50. That number is the request parameter. It is not the P4-04 risk cap.
 
+Shadow quotes run on a `shadow-quotes` thread, not on the scheduler thread. Each call has a timeout (`SHADOW_QUOTE_TIMEOUT_SECONDS`, default 2) and the queue has a backlog (`SHADOW_QUOTE_BACKLOG`, default 4). A slow venue does not hold the tick. A timed-out call cannot be preempted. It does not block the tick or the next queued call, and the number of those abandoned calls is capped by the backlog. An unsigned shadow build takes its block height from the chain RPC (`SOLANA_RPC_URL`), not from the quote's `lastValidBlockHeight`. With no RPC the build is skipped.
+
 Jupiter calls wait at least `JUPITER_MIN_INTERVAL_SECONDS` (default 1 second) between attempts and stop after `JUPITER_DAILY_CAP` attempts (default 1000) on a calendar day. The day key moves forward only. HTTP 429 and HTTP 5xx still use the bounded backoff, at most five attempts. The shadow runner also reserves one stored call per quote and per build, with the same daily cap, so a restart does not start the count over.
 
 The row keeps quoted output, price impact, route label, router, quote latency, and three fee lines: network fee (`signatureFeeLamports`), priority fee, and token-account rent. Those three are not added to strategy P&L. A provider body, a transaction, an API key, and a signature are not stored. `paper_shadow.stored_at` is purged at 86400 seconds with the fills and the events. The wallet, the position, the cursor, and the origin are not.

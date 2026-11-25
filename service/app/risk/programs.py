@@ -1,0 +1,58 @@
+"""Outer program ids a live swap is allowed to name.
+
+Inner DEX calls are CPIs. They are not in the message's program ids.
+Simulation is what checks their balance and authority effects.
+"""
+
+from __future__ import annotations
+
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+ADDRESS_LOOKUP_PROGRAM = "AddressLookupTab1e1111111111111111111111111"
+
+ALLOWED_PROGRAMS = frozenset(
+    {
+        SYSTEM_PROGRAM,
+        COMPUTE_BUDGET_PROGRAM,
+        TOKEN_PROGRAM,
+        ASSOCIATED_TOKEN_PROGRAM,
+        JUPITER_V6_PROGRAM,
+    }
+)
+
+# Named so a program account is not treated as an unparsed mint.
+# Token-2022 is not an allowed outer program. Its mint and token
+# accounts fail closed until they are parsed.
+KNOWN_PROGRAMS = ALLOWED_PROGRAMS | frozenset({TOKEN_2022_PROGRAM, ADDRESS_LOOKUP_PROGRAM})
+
+TOKEN_PROGRAMS = frozenset({TOKEN_PROGRAM, TOKEN_2022_PROGRAM})
+
+# SPL token discriminators that may appear as outer instructions.
+TOKEN_TRANSFER = 3
+TOKEN_APPROVE = 4
+TOKEN_SET_AUTHORITY = 6
+TOKEN_CLOSE = 9
+TOKEN_TRANSFER_CHECKED = 12
+TOKEN_APPROVE_CHECKED = 13
+TOKEN_SYNC_NATIVE = 17
+TOKEN_ALLOWED = frozenset(
+    {
+        TOKEN_TRANSFER,
+        TOKEN_APPROVE,
+        TOKEN_SET_AUTHORITY,
+        TOKEN_CLOSE,
+        TOKEN_TRANSFER_CHECKED,
+        TOKEN_APPROVE_CHECKED,
+        TOKEN_SYNC_NATIVE,
+    }
+)
+
+SYSTEM_TRANSFER = 2
+SYSTEM_ADVANCE_NONCE = 4
+
+CU_LIMIT = 2
+CU_PRICE = 3

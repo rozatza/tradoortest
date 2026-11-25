@@ -32,6 +32,7 @@ from app.venue.pin import (
     JUPITER_BUILD_PATH,
     JUPITER_EXECUTE_PATH,
     JUPITER_ORDER_PATH,
+    MAX_RESPONSE_BYTES,
     QUOTE_TTL_SECONDS,
 )
 from app.venue.types import (
@@ -166,9 +167,9 @@ def _assert_guard(built: UnsignedTransaction) -> None:
     assert built.lookup_tables[0].address == _TABLE
     assert built.lookup_tables[0].writable_indexes == (1,)
     assert built.lookup_tables[0].readonly_indexes == (0,)
-    assert built.in_amount == _AMOUNT
-    assert built.out_amount == _OUT
-    assert built.minimum_out_amount == _MINIMUM
+    assert built.quote_in_amount == _AMOUNT
+    assert built.quote_out_amount == _OUT
+    assert built.quote_minimum_out_amount == _MINIMUM
     assert built.input_mint == _SOL
     assert built.output_mint == _USDC
     assert built.last_valid_block_height == _HEIGHT
@@ -519,6 +520,26 @@ def test_the_daily_cap_and_the_interval_bound_jupiter_calls() -> None:
     quote = spaced.quote(_request(), now=_NOW)
     spaced.build(quote, taker=_TAKER, now=_NOW, block_height=_HEIGHT)
     assert script.sleeps == [1.0]
+
+
+def test_a_response_over_the_cap_is_rejected_while_it_streams() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * (MAX_RESPONSE_BYTES + 1))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    venue = JupiterVenue(client, api_key=None, sleep=lambda _delay: None)
+    with pytest.raises(VenueSchemaError, match="response_too_large"):
+        venue.quote(_request(), now=_NOW)
+
+
+def test_build_rejects_a_route_label_that_disagrees_with_the_quote() -> None:
+    build = deepcopy(_body("build.json"))
+    build["routePlan"][0]["swapInfo"]["label"] = "Other"
+    script = _Script(_body("order.json"), build)
+    venue = script.venue()
+    quote = venue.quote(_request(), now=_NOW)
+    with pytest.raises(VenueRejected, match="route_mismatch"):
+        venue.build(quote, taker=_TAKER, now=_NOW, block_height=_HEIGHT)
 
 
 def test_a_bad_address_fails_before_a_request() -> None:

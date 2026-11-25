@@ -89,9 +89,9 @@ def assemble_unsigned(
         lookup_tables=decoded[4],
         input_mint=quote.input_mint,
         output_mint=quote.output_mint,
-        in_amount=quote.in_amount,
-        out_amount=quote.out_amount,
-        minimum_out_amount=quote.minimum_out_amount,
+        quote_in_amount=quote.in_amount,
+        quote_out_amount=quote.out_amount,
+        quote_minimum_out_amount=quote.minimum_out_amount,
         last_valid_block_height=last_valid_block_height,
         transaction_version=0,
     )
