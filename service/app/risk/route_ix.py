@@ -260,32 +260,43 @@ def decode_jupiter_route(data: bytes) -> RouteTerms | str | None:
         return "exact_out"
     if disc in _LEDGER:
         return "token_ledger"
-    if disc in (_ROUTE_V2, _SHARED_V2):
+    if disc == _ROUTE_V2:
+        return _prefix(raw, "route_v2", fees=True)
+    if disc == _SHARED_V2:
         return _prefix(raw, "route_v2")
-    if disc in (_ROUTE, _SHARED):
+    if disc == _ROUTE:
+        return _suffix(raw, "route", fees=True)
+    if disc == _SHARED:
         return _suffix(raw, "route")
     return None
 
 
-def _prefix(data: bytes, kind: str) -> RouteTerms | str:
+def _prefix(data: bytes, kind: str, *, fees: bool = False) -> RouteTerms | str:
     if len(data) < 30:
         return "route_undecoded"
     in_amount = int.from_bytes(data[8:16], "little")
     quoted = int.from_bytes(data[16:24], "little")
     slippage = int.from_bytes(data[24:26], "little")
+    if fees:
+        platform = int.from_bytes(data[26:28], "little")
+        positive = int.from_bytes(data[28:30], "little")
+        if platform != 0 or positive != 0:
+            return "platform_fee"
     pos = _plan(data, 30, version=2)
     if pos is None or pos != len(data):
         return "route_undecoded"
     return _terms(kind, in_amount, quoted, slippage)
 
 
-def _suffix(data: bytes, kind: str) -> RouteTerms | str:
+def _suffix(data: bytes, kind: str, *, fees: bool = False) -> RouteTerms | str:
     pos = _plan(data, 8, version=1)
     if pos is None or pos + 19 != len(data):
         return "route_undecoded"
     in_amount = int.from_bytes(data[pos : pos + 8], "little")
     quoted = int.from_bytes(data[pos + 8 : pos + 16], "little")
     slippage = int.from_bytes(data[pos + 16 : pos + 18], "little")
+    if fees and data[pos + 18] != 0:
+        return "platform_fee"
     return _terms(kind, in_amount, quoted, slippage)
 
 

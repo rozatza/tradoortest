@@ -341,15 +341,47 @@ async function forward(
 
 const LIVE_PATHS = new Set(["/live/prepare", "/live/confirm", "/live/flatten"]);
 const MAX_LIVE_BODY_BYTES = 8_192;
+const LIVE_ORIGIN_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
 /**
- * Forward one live control call. The browser does not supply the token or
- * the Origin. Both are set here, and the token is not copied into the
- * response.
+ * Browser Origin for a live POST. Loopback only. A missing or cross-site
+ * Origin is refused before the control token is read onto a request.
+ */
+export function liveOriginAllowed(value: string | null): boolean {
+  if (value === null || value === "") {
+    return false;
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return false;
+  }
+  if (url.pathname !== "/" && url.pathname !== "") {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return false;
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return LIVE_ORIGIN_HOSTS.has(host);
+}
+
+/**
+ * Forward one live control call. The browser does not supply the token.
+ * A cross-site Origin is rejected before the token is attached. An
+ * allowlisted Origin is replaced with the loopback origin the service
+ * expects, and the token is not copied into the response.
  */
 export async function forwardLive(path: string, request: Request): Promise<Response> {
   if (!LIVE_PATHS.has(path)) {
     return jsonError(404, "not_found", "that live route is not proxied");
+  }
+  if (!liveOriginAllowed(request.headers.get("origin"))) {
+    return jsonError(403, "control_forbidden", "cross-site live control is refused");
   }
   const token = process.env.LIVE_CONTROL_TOKEN;
   if (typeof token !== "string" || token === "" || /[\u0000-\u001f\u007f]/.test(token)) {

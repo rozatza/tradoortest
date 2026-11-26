@@ -52,11 +52,14 @@ def _reset(monkeypatch: pytest.MonkeyPatch) -> None:
     pending_book().reset()
     reset_guarded()
     monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.delenv("LIVE_SIGNER", raising=False)
+    monkeypatch.delenv("LIVE_SIGNER_KEY_FILE", raising=False)
     monkeypatch.delenv("LIVE_KILL_FILE", raising=False)
     monkeypatch.delenv("LIVE_KILL", raising=False)
     monkeypatch.delenv("LIVE_CONTROL_TOKEN", raising=False)
     monkeypatch.delenv("LIVE_WALLET_PUBKEY", raising=False)
     monkeypatch.delenv("SOLANA_RPC_URL", raising=False)
+    monkeypatch.delenv("HOST", raising=False)
 
 
 def test_route_v2_and_route_v1_decode_min_out_and_slippage() -> None:
@@ -76,6 +79,15 @@ def test_route_v2_and_route_v1_decode_min_out_and_slippage() -> None:
     zero = decode_jupiter_route(encode_route_v2(in_amount=100, quoted_out=100, slippage_bps=10_000))
     assert zero is not None and not isinstance(zero, str)
     assert zero.min_out == 0
+    charged = bytearray(encode_route_v2(in_amount=_IN, quoted_out=_OUT, slippage_bps=50))
+    charged[26:28] = (1).to_bytes(2, "little")
+    assert decode_jupiter_route(bytes(charged)) == "platform_fee"
+    positive = bytearray(encode_route_v2(in_amount=_IN, quoted_out=_OUT, slippage_bps=50))
+    positive[28:30] = (1).to_bytes(2, "little")
+    assert decode_jupiter_route(bytes(positive)) == "platform_fee"
+    v1_fee = bytearray(encode_route_v1(in_amount=1_000, quoted_out=2_000, slippage_bps=50))
+    v1_fee[-1] = 1
+    assert decode_jupiter_route(bytes(v1_fee)) == "platform_fee"
 
 
 def test_server_derives_notional_fees_authorities_sell_route_and_positions(
@@ -738,13 +750,14 @@ def _open(
     quoted_out: int | None = None,
     marks: dict[str, Decimal] | None = None,
     kill_path: Path | None = None,
+    wallet: str = _WALLET,
 ) -> tuple[TestClient, MockChainRpc, SqliteBarStore]:
     path = kill_path if kill_path is not None else tmp_path / f"{name}-kill"
     path.write_bytes(b"0")
     monkeypatch.setenv("LIVE_KILL_FILE", str(path))
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
     monkeypatch.setenv("LIVE_CONTROL_TOKEN", "test")
-    monkeypatch.setenv("LIVE_WALLET_PUBKEY", _WALLET)
+    monkeypatch.setenv("LIVE_WALLET_PUBKEY", wallet)
     _freeze()
     reset_guarded()
     pending_book().reset()
@@ -760,6 +773,7 @@ def _open(
         drop=drop,
         rent=rent,
         side=side,
+        wallet=wallet,
     )
     quoted = out_amount if quoted_out is None else quoted_out
     desk = _desk(
@@ -846,6 +860,7 @@ def _rpc(
     drop: int = 1_006_000,
     rent: int = 1_000_000,
     side: str = "buy",
+    wallet: str = _WALLET,
 ) -> MockChainRpc:
     if side == "buy":
         spent_mint, received_mint = USDC_MINT, output_mint
@@ -856,11 +871,11 @@ def _rpc(
     token_before = in_amount + out_amount + 1_000
     lamport_before_wallet = max(5_000_000, drop + 1)
     deltas = (
-        TokenDelta(spent_account, spent_mint, _WALLET, token_before, token_before - in_amount),
-        TokenDelta(received_account, received_mint, _WALLET, 0, out_amount),
+        TokenDelta(spent_account, spent_mint, wallet, token_before, token_before - in_amount),
+        TokenDelta(received_account, received_mint, wallet, 0, out_amount),
     )
-    lamport_before = [(_WALLET, lamport_before_wallet)]
-    lamport_after = [(_WALLET, lamport_before_wallet - drop)]
+    lamport_before = [(wallet, lamport_before_wallet)]
+    lamport_after = [(wallet, lamport_before_wallet - drop)]
     if rent:
         lamport_before.append((_RENT, 0))
         lamport_after.append((_RENT, rent))
@@ -877,7 +892,7 @@ def _rpc(
             tuple(lamport_after),
         ),
         accounts={
-            _WALLET: (wallet_lamports, b""),
+            wallet: (wallet_lamports, b""),
             SOL_MINT: (1, bytes(mint)),
             output_mint: (1, bytes(mint)),
         },

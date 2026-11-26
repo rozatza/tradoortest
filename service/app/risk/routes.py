@@ -1,9 +1,10 @@
-"""Loopback routes for kill, flatten, and manual confirm.
+"""Loopback routes for kill, flatten, manual confirm, and the auto signer.
 
-Prepare builds an unsigned transaction and returns it for the browser
+Prepare builds an unsigned transaction and returns it for a browser
 wallet. Confirm submits only after the signed bytes match the guarded
-message. Neither route holds a key. ``apply_flatten`` stays imported so
-the kill path can be shown not to call it.
+message. ``POST /live/auto`` signs that guarded message when the signer
+is armed. The browser proxy does not forward that path. ``apply_flatten``
+stays imported so the kill path can be shown not to call it.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from app.risk.access import ControlRejected, require_control
 from app.risk.control import KillPersistError, apply_flatten, apply_kill
 from app.risk.gate import LiveGate
 from app.risk.pending import pending_book
-from app.risk.signer import Intent, LiveContext, confirm_trade, prepare_trade
+from app.risk.signer import Intent, LiveContext, auto_trade, confirm_trade, prepare_trade
 from app.risk.wallet import configured_wallet
 from app.venue.address import require_address
 from app.venue.errors import VenueError
@@ -132,7 +133,60 @@ async def confirm(request: Request, body: ConfirmIn) -> JSONResponse:
     return JSONResponse(status_code=step.status, content=step.body)
 
 
+@router.post("/live/auto")
+async def auto(request: Request, body: IntentIn) -> JSONResponse:
+    """Sign one guarded swap from the local trading wallet.
+
+    The Next proxy does not forward this path. The control token, the
+    loopback host, and an allowlisted Origin are still required.
+    """
+    try:
+        require_control(request)
+    except ControlRejected:
+        return _forbidden()
+    flattened = body.action == "flatten"
+    if flattened and body.side != "sell":
+        return JSONResponse(
+            status_code=422,
+            content={"accepted": False, "code": "bad_side", "sent": False, "resized": False},
+        )
+    opened = _open_intent(request, body, flattened=flattened)
+    if isinstance(opened, JSONResponse):
+        return opened
+    intent, store = opened
+    step = auto_trade(
+        intent,
+        context=_context(request),
+        gate=_gate(request),
+        wallet=configured_wallet(),
+        store=store,
+        flattened=flattened,
+    )
+    return JSONResponse(status_code=step.status, content=step.body)
+
+
 def _prepare(request: Request, body: IntentIn, *, flattened: bool) -> JSONResponse:
+    opened = _open_intent(request, body, flattened=flattened)
+    if isinstance(opened, JSONResponse):
+        return opened
+    intent, store = opened
+    step = prepare_trade(
+        intent,
+        context=_context(request),
+        gate=_gate(request),
+        wallet=configured_wallet(),
+        store=store,
+        flattened=flattened,
+    )
+    return JSONResponse(status_code=step.status, content=step.body)
+
+
+def _open_intent(
+    request: Request,
+    body: IntentIn,
+    *,
+    flattened: bool,
+) -> tuple[Intent, object] | JSONResponse:
     try:
         mint = require_address(body.mint)
     except VenueError:
@@ -154,15 +208,7 @@ def _prepare(request: Request, body: IntentIn, *, flattened: bool) -> JSONRespon
     store = _day_store(request)
     if isinstance(store, JSONResponse):
         return store
-    step = prepare_trade(
-        Intent(body.side, body.action, mint, body.amount),
-        context=_context(request),
-        gate=_gate(request),
-        wallet=configured_wallet(),
-        store=store,
-        flattened=flattened,
-    )
-    return JSONResponse(status_code=step.status, content=step.body)
+    return Intent(body.side, body.action, mint, body.amount), store
 
 
 def _context(request: Request) -> LiveContext | None:
