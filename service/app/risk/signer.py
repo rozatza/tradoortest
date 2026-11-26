@@ -1,24 +1,29 @@
-"""Manual-confirm signing flow. The server never signs.
+"""Manual confirm, and the internal auto signer.
 
 Prepare builds an unsigned swap, derives every risk input from the
 quote, the decoded route, and a simulation, and holds the message
 until it expires. Confirm checks the signed bytes against that message,
 re-reads the chain height and the kill file, and only then submits.
 
-Guarded messages are single-use. The bytes live in memory. They are
-not written to sqlite and they are not logged.
+The auto signer signs that same held message and then calls confirm.
+It does not sign any other bytes. Guarded messages are single-use.
+The bytes live in memory. They are not written to sqlite and they are
+not logged.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import secrets
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 
+from app.risk.bind import require_loopback
+from app.risk.custody import SignerClosed, bind_guarded_lookup, load_signer, sign_guarded
 from app.risk.engine import LiveOrder, evaluate
 from app.risk.fees import FeeLines, record_realized_loss, save_day, server_day, take_day
 from app.risk.gate import LiveGate
@@ -283,6 +288,89 @@ def prepare_trade(
                 out_amount=received.after - received.before,
             ),
         },
+    )
+
+
+_LOAD_CODES = frozenset(
+    {
+        "dead_man",
+        "killed",
+        "signer_disabled",
+        "signer_key_length",
+        "signer_key_malformed",
+        "signer_key_unreadable",
+        "signer_pubkey_mismatch",
+        "signer_unconfigured",
+        "trading_disabled",
+        "wallet_unconfigured",
+    }
+)
+
+
+def auto_trade(
+    intent: Intent,
+    *,
+    context: LiveContext | None,
+    gate: LiveGate,
+    wallet: str | None,
+    store: object | None,
+    limits: RiskLimits | None = None,
+    flattened: bool = False,
+) -> Step:
+    """Prepare, sign the guarded message, then confirm.
+
+    Signing runs only when ``LIVE_SIGNER`` is ``local`` and live trading
+    is exactly ``1``. The signature is the one ``sign_guarded`` produces
+    for the stored message. Submit is ``confirm_trade``, which books the
+    day before send.
+    """
+    if not live_trading_enabled():
+        return _step(409, "trading_disabled", flattened=flattened)
+    if os.environ.get("LIVE_SIGNER") != "local":
+        return _step(409, "signer_disabled", flattened=flattened)
+    try:
+        require_loopback()
+    except RuntimeError:
+        return _step(409, "signer_disabled", flattened=flattened)
+    prepared = prepare_trade(
+        intent,
+        context=context,
+        gate=gate,
+        wallet=wallet,
+        store=store,
+        limits=limits,
+        flattened=flattened,
+    )
+    if prepared.status != 200:
+        return prepared
+    pending_raw = prepared.body.get("pending_id")
+    if isinstance(pending_raw, bool) or not isinstance(pending_raw, int):
+        return _step(422, "unknown_pending", flattened=flattened)
+    pending_id = pending_raw
+    item = _book.peek(pending_id)
+    if item is None:
+        return _step(422, "unguarded", flattened=flattened)
+    try:
+        held = load_signer()
+        if kill_halted():
+            raise SignerClosed("killed")
+        if gate.dead_man and intent.action != "flatten":
+            raise SignerClosed("dead_man")
+        signature = sign_guarded(held, pending_id, item.message)
+    except SignerClosed as exc:
+        _consume(pending_id)
+        status = 409 if exc.code in _LOAD_CODES else 422
+        return _step(status, exc.code, flattened=flattened)
+    signed = b"\x01" + signature + item.message
+    encoded = base64.b64encode(signed).decode("ascii")
+    return confirm_trade(
+        pending_id,
+        encoded,
+        context=context,
+        gate=gate,
+        wallet=wallet,
+        store=store,
+        limits=limits,
     )
 
 
@@ -696,6 +784,16 @@ def _still_pending(pending_id: int) -> bool:
 def _consume(pending_id: int) -> None:
     pending_book().finish(pending_id, "consumed")
     _book.take(pending_id)
+
+
+def _guarded_record(pending_id: int) -> tuple[bytes, str] | None:
+    item = _book.peek(pending_id)
+    if item is None or item.pending_id != pending_id or not _still_pending(pending_id):
+        return None
+    return item.message, item.message_hash
+
+
+bind_guarded_lookup(_guarded_record)
 
 
 def _decode_signed(value: str) -> bytes | None:

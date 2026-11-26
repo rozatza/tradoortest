@@ -1,8 +1,8 @@
 """Configured trading wallet. A public address only.
 
-The process never loads a keypair, a seed, or a secret file. The
-environment holds the pubkey the user will sign with. A missing or
-malformed value fails closed.
+``LIVE_WALLET_PUBKEY`` is the address this process may trade. The auto
+signer compares a derived public key with this value. This module does
+not read the seed file. A missing or malformed value fails closed.
 """
 
 from __future__ import annotations

@@ -68,15 +68,22 @@ This phase has one local user. Option A is that user's manual path.
 
 A separate trading wallet, automatic, internal only. CoS, the operator of the machine that runs this process, generates the keypair on that box as part of P4-06. The user funds that wallet. The bot may sign on its own, and only inside the limits below.
 
-The secret is loaded from the OS keychain or from an encrypted file outside the repo, pointed at by an environment variable. Startup of this signer requires all of the following:
+The secret is a file outside the repo. `LIVE_SIGNER_KEY_FILE` is the path and nothing else: the seed is not an environment value. The file is exactly 32 raw bytes, the Ed25519 seed `Ed25519PrivateKey.from_private_bytes` accepts. It is not JSON, not base58, not a trailing newline, and not a 64-byte Solana keypair (seed plus public key). A Solana CLI file has to be reduced to those 32 bytes outside the repo. Mode `0600` is the operator's job. The process derives the public key and requires it to equal `LIVE_WALLET_PUBKEY`.
+
+The signer runs only when both of these are exact:
 
 - `LIVE_TRADING_ENABLED=1`
 - `LIVE_SIGNER=local`
-- the marked wallet value is at or under the wallet ceiling
-- the process is bound to loopback
-- the local auth token is configured
 
-Any other combination refuses to start. The signer does not sign and does not send.
+Unset, blank, and every other value leave the signer off. The rest of the process still starts, so paper and the other routes stay up. A missing path, an unreadable file, a length other than 32, a seed the library rejects, or a derived public key that does not match disables the signer. The HTTP body is a short code. It does not contain the seed, and neither do logs, sqlite, or exception text. The holder redacts `repr` and `str`.
+
+Every auto order still goes through prepare's guard and the risk engine: server-derived inputs, the configured wallet, the output-mint allowlist, the dead-man flag, the mark, the min-out floor against the simulated gain, and the kill file read again immediately before send. The signature is only over the message that guard stored. Altered or unknown bytes are refused and are not signed. Confirm then byte-matches that same message, books the day, and only then submits. A failed send or a crash after the booking leaves the day row in place.
+
+The wallet ceiling is that same risk check. Above $25, or when the mark cannot be computed, the order is refused and nothing is signed. This build does not exit the process on that check.
+
+`POST /live/auto` is the in-process path. It requires the loopback host, an allowlisted Origin, and `LIVE_CONTROL_TOKEN`, the same as the other live routes. The Next proxy does not forward `/live/auto`. On `/api/live/prepare`, `/api/live/flatten`, and `/api/live/confirm` the proxy rejects a browser Origin that is not loopback before it attaches the control token.
+
+The seed file is not passphrase-wrapped. Rotation is a new file plus a new `LIVE_WALLET_PUBKEY`, then a restart. Backup stays outside the repo. There is no export route. Flatten, when the operator asks for it, uses this same guarded signer. The signer does not sign an arbitrary message, only the guarded swap. The operator should disable core dumps on the box (`ulimit -c 0`). The bytes passed into the signature library are a copy this process cannot wipe; the buffer it owns is cleared after the load.
 
 Option B is not offered to anyone else. There is no second user, no signup, and no path that signs for another person.
 
@@ -151,6 +158,8 @@ These are config defaults. P4-04 implements them as the pure checks. P4-09 shows
 | Allowlist | SOL, JUP, JTO, BONK, WIF | A buy of any other asset is rejected. |
 | Wallet ceiling | $25 | Auto-signer startup refuses when the marked value is above $25, or when the mark cannot be computed. |
 | `LIVE_TRADING_ENABLED` | off | The only on value is `1`. Unset, blank, or any other value is off. |
+| `LIVE_SIGNER` | off | The only on value is `local`. Signing also requires `LIVE_TRADING_ENABLED=1`. |
+| `LIVE_SIGNER_KEY_FILE` | unset | Path to a 32-byte seed file outside the repo. No value in the repo. |
 
 The allowlist symbols are the OHLCV registry majors (`docs/ohlcv.md`, `docs/live-feed.md`). USDC is a sell-route quote target, not an entry on the allowlist. A position is one held asset on the trading wallet. A second strategy cannot open an asset that is already open.
 
@@ -168,7 +177,7 @@ Further gates. The numbers live in `app.risk.limits` and are the checks P4-04 ru
 - A stale-data check. No order when the latest closed bar is older than 2 bars, or when the bar and the quote disagree by more than 1 percent.
 - The allowlist does not skip the authority, liquidity, age, or sell-route checks. A major that fails one of them is not buyable until that check's rule is changed in P4-04.
 
-The wallet ceiling is checked again at the start of each tick. Above the ceiling, new buys halt. A scheduled sell of an already open long still uses the normal lifecycle, so a position can be closed and the wallet can shrink. That running behavior is this design's reading of a rule whose required statement is the startup refusal. P4-04 owns the shared check. P4-06 refuses to start the auto signer above the ceiling.
+The wallet ceiling is checked again at the start of each tick. Above the ceiling, new buys halt. A scheduled sell of an already open long still uses the normal lifecycle, so a position can be closed and the wallet can shrink. That running behavior is this design's reading of a rule whose required statement is the startup refusal. P4-04 owns the shared check. P4-06 refuses the auto-sign order above the ceiling. The process keeps running.
 
 ### Kill switch
 
@@ -201,7 +210,7 @@ P4-04 accounts for them as separate values. P4-07 reads the paid amounts from th
 
 CoS generates the trading keypair on the CoS box during P4-06. That is the only place the keypair is created. The user funds the wallet. The secret lives only in the OS keychain or in an encrypted file outside the repo, on that same box, and it is loaded only by the localhost-bound runtime.
 
-The secret never goes into the repo, a log line, sqlite, an error message, or CI. A signature, a public address, a mint, and an amount may be stored. The secret, the seed, the keypair bytes, a signed transaction blob, a venue API key, and the local auth token may not.
+The secret never goes into the repo, a log line, sqlite, an error message, or CI. A signature, a public address, a mint, and an amount may be stored. The secret, the seed, the signing-key bytes, a signed transaction blob, a venue API key, and the local auth token may not. The seed file format is the 32-byte raw file under `LIVE_SIGNER_KEY_FILE`, described with Option B above. CI does not set that variable and does not have the file.
 
 The public address is configured as data the process is allowed to hold. The doc and the repo use a placeholder such as `<PUBKEY>` if an example is required. They do not contain a real trading address.
 
@@ -277,7 +286,7 @@ Tasks land in this order: P4-01, P4-02, P4-03, P4-04, then P4-05 and P4-06 in ei
 | P4-03 | ROZ-110 | Quote-only shadow mode beside the paper fill. | Real quotes through the interface, no sign and no send. Bounded venue retries. Quote rows purge at 24 hours. Fixes ROZ-107 C-R1 and leaves `LIVE_FEED_ENABLED` default-off. |
 | P4-04 | ROZ-111 | The risk engine and the kill switch. No signer. | The limit table, slippage and impact caps, token gates, the stale-data gate, the wallet-ceiling check, `LIVE_TRADING_ENABLED` defaulting off, `POST /live/kill`, the dead-man halt, and fee/rent amounts kept separate from strategy P&L. Merge gate for both signers. |
 | P4-05 | ROZ-114 | Option A, the manual-confirm signer. | The server builds an unsigned transaction and confirms on-chain. It never sees a key. Pending trades expire after one bar. The risk engine still runs. Blocked on P4-04. |
-| P4-06 | ROZ-112 | Option B, the own-wallet auto signer. Internal only. | CoS generates the keypair on the CoS box. Loopback bind, local auth token, `LIVE_SIGNER=local`, and the startup ceiling refusal. The secret stays out of the repo, logs, sqlite, errors, and CI. Blocked on P4-04. |
+| P4-06 | ROZ-112 | Option B, the own-wallet auto signer. Internal only. | CoS generates the seed outside the repo. Loopback bind, local auth token, `LIVE_SIGNER=local`, and the risk-engine ceiling refusal. The secret stays out of the repo, logs, sqlite, errors, and CI. Blocked on P4-04. |
 | P4-07 | ROZ-113 | Send, confirm, and reconcile. | Priority fee and a configurable compute budget when we land the transaction ourselves. Idempotency, bounded retries, stuck and unknown transactions, chain balance changes as the fill, halt on mismatch, no auto-flatten. |
 | P4-08 | ROZ-115 | The durable ledger of the user's own transactions. | Signature, mints, amounts, fee lines, and timestamp from those own transactions. Fee lines stored separately. Bars and marks still purge at 24 hours. Option 1 kept for live positions. |
 | P4-09 | ROZ-116 | Live dashboard and alerts. | Live next to paper, limits used today, the kill control, last reconcile status, alerts on halt, reject, or mismatch. Fee and rent lines shown apart from strategy P&L. The kill control does not flatten. |

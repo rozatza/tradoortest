@@ -1437,5 +1437,8 @@ def test_legacy_engine_and_runner_core_are_unchanged() -> None:
     assert "import solders" not in text
     assert "import nacl" not in text
     assert "Keypair" not in text
-    assert "ed25519" not in text
+    for path in risk.rglob("*.py"):
+        if path.name == "custody.py":
+            continue
+        assert "ed25519" not in path.read_text(encoding="utf-8")
     assert process_halted() is False
